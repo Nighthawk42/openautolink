@@ -42,6 +42,11 @@
       "drivingWhPerKm": 170,
       "maxChargeKw": 55
     },
+    "Chevrolet|C121|2027": {
+      "displayName": "Bolt",
+      "drivingWhPerKm": 175,
+      "maxChargeKw": 150
+    },
     "Chevrolet|C234|2024": {
       "displayName": "Blazer EV",
       "drivingWhPerKm": 241,
