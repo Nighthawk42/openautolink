@@ -55,7 +55,7 @@ Repository **variables** (Settings → Secrets and variables → Actions → Var
 | `APP_ID` | `moe.nighthawk.openautolink` (permanent once uploaded) |
 | `UPLOAD_KEY_ALIAS` | `upload` |
 | `UPLOAD_CERT_SHA256` | Upload certificate SHA-256 fingerprint. The build fails if the AAB signer differs |
-| `PLAY_TRACK` | *(optional)* Track for automatic uploads. Default `internal`; use `automotive:internal` if Play Console put the app on a dedicated Android Automotive OS track |
+| `PLAY_TRACK` | *(optional)* Track for automatic uploads. Default `internal`. This app uses `automotive:qa`: automotive-only bundles must go to the dedicated Android Automotive OS track, whose internal testing track is named `qa` in the Play API |
 | `OAL_SOURCE_REPO` | *(optional)* `owner/repo` to build tags from instead of upstream |
 
 Repository **secrets**:

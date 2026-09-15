@@ -22,7 +22,7 @@ on:
         type: boolean
         default: true
       track:
-        description: Play testing track (internal, alpha, beta, or a form-factor track like automotive:internal)
+        description: Play testing track (internal, alpha, beta, or a form-factor track like automotive:qa)
         required: false
         type: string
         default: internal
@@ -102,8 +102,8 @@ jobs:
 
           [[ "$APP_ID" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]] || fail "repository variable APP_ID is missing or invalid: '$APP_ID'"
           [ "$APP_ID" != "com.openautolink.app" ] || fail "APP_ID must not be upstream's com.openautolink.app"
-          # Form-factor tracks (e.g. automotive:internal) are allowed; production is not.
-          [[ "$TRACK" =~ ^((automotive|wear|tv):)?(internal|alpha|beta)$ ]] \
+          # Form-factor tracks (e.g. automotive:qa) are allowed; production is not.
+          [[ "$TRACK" =~ ^((automotive|wear|tv):)?(internal|qa|alpha|beta)$ ]] \
             || fail "track must be internal, alpha, or beta, optionally prefixed like automotive: (got '$TRACK')"
 
           [ "$HAS_KEYSTORE" = true ] || fail "secret UPLOAD_KEYSTORE_BASE64 is not set"
