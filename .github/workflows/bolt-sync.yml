@@ -1,0 +1,126 @@
+name: Bolt upstream sync
+
+# Daily: merge mossyhub/openautolink main into this fork, keep upstream's own
+# workflows disabled here, and build the latest upstream release tag for the car
+# if this fork has not published a car-<tag> release for it yet.
+#
+# Setup, secrets, and recovery: bolt/README.md
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: bolt-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    env:
+      # Fine-grained PAT on this fork: Contents, Workflows, Actions, Issues (read/write).
+      # GITHUB_TOKEN cannot push upstream commits that touch .github/workflows.
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      REPO: ${{ github.repository }}
+      UPSTREAM_REPO: mossyhub/openautolink
+    steps:
+      - name: Require SYNC_TOKEN
+        run: |
+          [ -n "$GH_TOKEN" ] || { echo "::error::secret SYNC_TOKEN is not set (see bolt/README.md)"; exit 1; }
+
+      # Upstream workflows fail or publish into a fork (native-deps from the wrong
+      # repo, GHCR pushes, fork-build without a versionCode). Disable them before
+      # the merge push can trigger them, and again after for newly added ones.
+      - name: Disable upstream workflows
+        run: &disable |
+          set -euo pipefail
+          gh api "repos/$REPO/actions/workflows?per_page=100" --jq '
+            .workflows[]
+            | select(.state == "active")
+            | select(.path | startswith(".github/workflows/"))
+            | select(.path | startswith(".github/workflows/bolt-") | not)
+            | "\(.id)\t\(.path)"' |
+          while IFS=$'\t' read -r id path; do
+            gh api -X PUT "repos/$REPO/actions/workflows/$id/disable"
+            echo "Disabled $path"
+          done
+
+      - name: Merge upstream main
+        run: |
+          set -uo pipefail
+          title="Upstream merge conflict"
+          if result="$(gh api -X POST "repos/$REPO/merge-upstream" -f branch=main 2>&1)"; then
+            summary="$(jq -r '"\(.merge_type): \(.message)"' <<<"$result")"
+            echo "$summary"
+            { echo "### Upstream sync"; echo; echo "$summary"; } >> "$GITHUB_STEP_SUMMARY"
+            open="$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+            if [ -n "$open" ]; then
+              gh issue close "$open" -R "$REPO" --comment "Resolved: $summary" || true
+            fi
+            exit 0
+          fi
+
+          echo "$result" >&2
+          if grep -qi conflict <<<"$result"; then
+            body="The scheduled sync could not merge \`$UPSTREAM_REPO\` main into \`main\` automatically.
+
+          Resolve locally, then push:
+
+          \`\`\`
+          git fetch upstream
+          git checkout main && git pull
+          git merge upstream/main
+          # fix conflicts (fork-only files are .github/workflows/bolt-*.yml and bolt/)
+          git push origin main
+          \`\`\`
+
+          Run: $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID"
+            open="$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)"
+            if [ -n "$open" ]; then
+              gh issue comment "$open" -R "$REPO" --body "Still conflicting: $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" || true
+            else
+              gh issue create -R "$REPO" --title "$title" --body "$body" || true
+            fi
+          fi
+          echo "::error::merge-upstream failed"
+          exit 1
+
+      - name: Disable newly merged upstream workflows
+        run: *disable
+
+      - name: Find unbuilt upstream release
+        id: release
+        run: |
+          set -euo pipefail
+          tag="$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)"
+          if ! [[ "$tag" =~ ^v0\.1\.[0-9]+$ ]]; then
+            echo "::error::latest upstream release '$tag' is not v0.1.N; the versionCode scheme needs a deliberate decision (bolt/README.md)"
+            exit 1
+          fi
+          draft="$(gh release view "car-$tag" -R "$REPO" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          if [ "$draft" = "false" ]; then
+            echo "car-$tag already published; nothing to build"
+            echo "Latest upstream release \`$tag\` is already built." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "Building car app for upstream \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  car:
+    needs: sync
+    if: needs.sync.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/bolt-car-release.yml
+    with:
+      tag: ${{ needs.sync.outputs.tag }}
+      upload: true
+      track: ${{ vars.PLAY_TRACK || 'internal' }}
+    secrets: inherit

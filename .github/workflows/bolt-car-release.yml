@@ -1,0 +1,370 @@
+name: Bolt car release
+
+# Builds one upstream OpenAutoLink release tag as this fork's own Play app,
+# signs it with the fork's upload key, and uploads it to a Play testing track.
+#
+# Reuses upstream's digest-pinned AAB builder image (builder/build-in-container.sh)
+# with the same container isolation as build-aab.sh: the Gradle build never sees
+# the key, and signing runs with networking disabled.
+#
+# Setup, secrets, and recovery: bolt/README.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream release tag to build (e.g. v0.1.497)
+        required: true
+        type: string
+      upload:
+        description: Upload to Google Play (off = build and create a draft fork release only)
+        required: false
+        type: boolean
+        default: true
+      track:
+        description: Play testing track (internal, alpha, beta, or a form-factor track like automotive:internal)
+        required: false
+        type: string
+        default: internal
+      version_code:
+        description: Override versionCode (default is the tag's PATCH number)
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      upload:
+        required: false
+        type: boolean
+        default: true
+      track:
+        required: false
+        type: string
+        default: internal
+      version_code:
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  car:
+    name: Car ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: car-release
+      cancel-in-progress: false
+    env:
+      TAG: ${{ inputs.tag }}
+      UPLOAD: ${{ inputs.upload }}
+      TRACK: ${{ inputs.track }}
+      VERSION_CODE_OVERRIDE: ${{ inputs.version_code }}
+      APP_ID: ${{ vars.APP_ID }}
+      KEY_ALIAS: ${{ vars.UPLOAD_KEY_ALIAS || 'upload' }}
+      EXPECTED_CERT_SHA256: ${{ vars.UPLOAD_CERT_SHA256 }}
+      SOURCE_REPO: ${{ vars.OAL_SOURCE_REPO || 'mossyhub/openautolink' }}
+      UPSTREAM_REPO: mossyhub/openautolink
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Validate inputs and derive version
+        id: meta
+        env:
+          HAS_KEYSTORE: ${{ secrets.UPLOAD_KEYSTORE_BASE64 != '' }}
+          HAS_STORE_PASSWORD: ${{ secrets.UPLOAD_STORE_PASSWORD != '' }}
+          HAS_PLAY_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || fail "tag '$TAG' is not vMAJOR.MINOR.PATCH"
+          major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+
+          # versionCode is the tag's PATCH number (v0.1.497 -> 497), the same
+          # scheme upstream uses for its own Play app. It only holds on 0.1.x:
+          # a 0.2.0 tag would yield versionCode 0 and regress below Play.
+          if [ -n "$VERSION_CODE_OVERRIDE" ]; then
+            [[ "$VERSION_CODE_OVERRIDE" =~ ^[1-9][0-9]{0,9}$ ]] && [ "$VERSION_CODE_OVERRIDE" -lt 2100000000 ] \
+              || fail "version_code must be a positive integer below 2100000000"
+            code="$VERSION_CODE_OVERRIDE"
+          else
+            [ "$major.$minor" = "0.1" ] \
+              || fail "tag '$TAG' leaves the 0.1.x line, so versionCode=PATCH could regress below Play's current value. Choose the new numbering deliberately (rerun with version_code) and update bolt/README.md."
+            [ "$patch" -ge 1 ] || fail "tag '$TAG' has PATCH 0, which is not a valid versionCode"
+            code="$patch"
+          fi
+
+          [[ "$APP_ID" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]] || fail "repository variable APP_ID is missing or invalid: '$APP_ID'"
+          [ "$APP_ID" != "com.openautolink.app" ] || fail "APP_ID must not be upstream's com.openautolink.app"
+          # Form-factor tracks (e.g. automotive:internal) are allowed; production is not.
+          [[ "$TRACK" =~ ^((automotive|wear|tv):)?(internal|alpha|beta)$ ]] \
+            || fail "track must be internal, alpha, or beta, optionally prefixed like automotive: (got '$TRACK')"
+
+          [ "$HAS_KEYSTORE" = true ] || fail "secret UPLOAD_KEYSTORE_BASE64 is not set"
+          [ "$HAS_STORE_PASSWORD" = true ] || fail "secret UPLOAD_STORE_PASSWORD is not set"
+          if [ "$UPLOAD" = true ] && [ "$HAS_PLAY_JSON" != true ]; then
+            fail "secret PLAY_SERVICE_ACCOUNT_JSON is required when upload is on"
+          fi
+
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "name=0.1.$code" >> "$GITHUB_OUTPUT"
+          echo "WS=$RUNNER_TEMP/oal" >> "$GITHUB_ENV"
+          echo "Building $APP_ID $TAG as versionName 0.1.$code, versionCode $code"
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The builder image is read from build-aab.sh at the tag being built, so
+      # the toolchain always matches that tag's Gradle verification metadata.
+      - name: Resolve builder image
+        id: image
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/$SOURCE_REPO/$TAG"
+          image="$(curl -fsSL "$base/build-aab.sh" \
+            | sed -n -E 's/^OAL_BUILDER_IMAGE="\$\{OAL_BUILDER_IMAGE:-([^}]+)\}"$/\1/p' | head -n1)"
+          [[ "$image" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::could not read a digest-pinned builder image from $SOURCE_REPO@$TAG build-aab.sh"; exit 1; }
+          gradle_key="$(for f in gradle/libs.versions.toml gradle/verification-metadata.xml gradle/wrapper/gradle-wrapper.properties; do
+            curl -fsSL "$base/$f"
+          done | sha256sum | cut -c1-16)"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "gradle_key=$gradle_key" >> "$GITHUB_OUTPUT"
+          docker pull "$image"
+
+      - name: Prepare workspace and signing material
+        env:
+          UPLOAD_KEYSTORE_BASE64: ${{ secrets.UPLOAD_KEYSTORE_BASE64 }}
+          UPLOAD_STORE_PASSWORD: ${{ secrets.UPLOAD_STORE_PASSWORD }}
+          UPLOAD_KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$WS/config" "$WS/secrets" "$WS/cache/gradle" "$WS/staging" "$WS/output" "$WS/home"
+          chmod 700 "$WS" "$WS/config" "$WS/secrets"
+          printf '%s' "$UPLOAD_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > "$WS/secrets/upload-key.jks"
+          printf '%s\n' "$UPLOAD_STORE_PASSWORD" > "$WS/secrets/keystore-password"
+          printf '%s\n' "${UPLOAD_KEY_PASSWORD:-$UPLOAD_STORE_PASSWORD}" > "$WS/secrets/key-password"
+          chmod 600 "$WS"/secrets/*
+
+      - name: Restore Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/oal/cache/gradle
+          key: oal-gradle-${{ runner.os }}-${{ steps.image.outputs.gradle_key }}
+          restore-keys: |
+            oal-gradle-${{ runner.os }}-
+
+      # prepare-key only validates here: the keystore already exists, so it opens
+      # it with the stored password and alias and fails fast before the long build.
+      - name: Check upload key
+        run: |
+          docker run --rm --init \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/workspace/home \
+            --env OAL_SIGNER_NAME=unused \
+            --env OAL_COUNTRY=US \
+            --env OAL_KEY_ALIAS="$KEY_ALIAS" \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --volume "$WS/config:/workspace/config:ro" \
+            --volume "$WS/secrets:/workspace/secrets:ro" \
+            --volume "$WS/home:/workspace/home" \
+            "$IMAGE" prepare-key
+
+      - name: Build unsigned bundle
+        env:
+          CODE: ${{ steps.meta.outputs.code }}
+        run: |
+          docker run --rm --init \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/workspace/home \
+            --env GRADLE_USER_HOME=/workspace/cache/gradle \
+            --env OAL_APP_ID="$APP_ID" \
+            --env OAL_START_VERSION_CODE="$((CODE - 1))" \
+            --env OAL_REPO_URL="https://github.com/$SOURCE_REPO.git" \
+            --env OAL_REF="$TAG" \
+            --tmpfs /workspace/secrets:rw,noexec,nosuid,size=1m \
+            --volume "$WS:/workspace" \
+            "$IMAGE" build-unsigned
+
+      - name: Sign and verify bundle
+        run: |
+          docker run --rm --init \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env OAL_KEY_ALIAS="$KEY_ALIAS" \
+            --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --tmpfs /workspace/cache:rw,noexec,nosuid,size=16m \
+            --volume "$WS/config:/workspace/config" \
+            --volume "$WS/secrets:/workspace/secrets:ro" \
+            --volume "$WS/staging:/workspace/staging:ro" \
+            --volume "$WS/output:/workspace/output" \
+            "$IMAGE" sign
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          if [ -n "${WS:-}" ] && [ -d "$WS/secrets" ]; then
+            find "$WS/secrets" -type f -exec shred -u {} +
+            rm -rf "$WS/secrets"
+          fi
+
+      - name: Check build identity
+        id: verify
+        env:
+          CODE: ${{ steps.meta.outputs.code }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          meta="$WS/output/latest.json"
+          [ -s "$meta" ] || fail "builder produced no metadata"
+          jq -e --arg id "$APP_ID" --argjson code "$CODE" --arg name "$NAME" \
+            '.applicationId == $id and .versionCode == $code and .versionName == $name' "$meta" >/dev/null \
+            || { cat "$meta"; fail "built AAB does not match $APP_ID $NAME ($CODE)"; }
+
+          cert="$(jq -er .signingCertificateSha256 "$meta")"
+          if [ -n "$EXPECTED_CERT_SHA256" ]; then
+            norm() { tr -d ': \r\n' | tr '[:lower:]' '[:upper:]'; }
+            [ "$(printf '%s' "$cert" | norm)" = "$(printf '%s' "$EXPECTED_CERT_SHA256" | norm)" ] \
+              || fail "AAB signer $cert does not match repository variable UPLOAD_CERT_SHA256"
+          fi
+
+          aab="$WS/output/$(jq -er .artifact "$meta")"
+          [ -s "$aab" ] || fail "signed AAB is missing: $aab"
+          mapping="$WS/source/app/build/outputs/mapping/release/mapping.txt"
+          [ -f "$mapping" ] || mapping=""
+          {
+            echo "aab=$aab"
+            echo "meta=${aab%.aab}.json"
+            echo "mapping=$mapping"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### $APP_ID $NAME ($CODE)"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream tag | [\`$TAG\`](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG) |"
+            echo "| Source | \`$SOURCE_REPO@$(jq -r .sourceCommit "$meta")\` |"
+            echo "| Builder image | \`$IMAGE\` |"
+            echo "| Signer SHA-256 | \`$cert\` |"
+            echo "| AAB SHA-256 | \`$(cut -d' ' -f1 "$aab.sha256")\` |"
+            echo "| Play upload | $([ "$UPLOAD" = true ] && echo "track \`$TRACK\`" || echo "skipped (dry run)") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Independent of the releases API, so a transient GitHub error in the
+      # record step can never lose a signed build.
+      - name: Save AAB as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: car-${{ inputs.tag }}
+          path: |
+            ${{ steps.verify.outputs.aab }}
+            ${{ steps.verify.outputs.aab }}.sha256
+            ${{ steps.verify.outputs.meta }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Write Play release notes
+        if: inputs.upload
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/whatsnew"
+          BODY="$(gh release view "$TAG" -R "$UPSTREAM_REPO" --json body --jq .body 2>/dev/null || true)" \
+          python3 - "$RUNNER_TEMP/whatsnew/whatsnew-en-US" <<'PY'
+          import os, re, sys
+          tag = os.environ["TAG"]
+          body = os.environ.get("BODY", "")
+          text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body)
+          text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+          text = re.sub(r"[`*>#]+", "", text)
+          text = re.sub(r"\n{3,}", "\n\n", text).strip()
+          text = f"OpenAutoLink {tag}\n{text}" if text else f"OpenAutoLink {tag}"
+          if len(text) > 500:
+              text = text[:497].rstrip() + "..."
+          with open(sys.argv[1], "w", encoding="utf-8") as f:
+              f.write(text + "\n")
+          PY
+          cat "$RUNNER_TEMP/whatsnew/whatsnew-en-US"
+
+      - name: Upload to Google Play
+        if: inputs.upload
+        uses: r0adkll/upload-google-play@e738b9dd8f2476ea806d921b64aacd24f34515a5 # v1.1.5
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ vars.APP_ID }}
+          releaseFiles: ${{ steps.verify.outputs.aab }}
+          track: ${{ inputs.track }}
+          status: completed
+          whatsNewDirectory: ${{ runner.temp }}/whatsnew
+          mappingFile: ${{ steps.verify.outputs.mapping }}
+
+      # The published car-<tag> release is the marker bolt-sync checks before
+      # building a tag. Dry runs create a draft, so the tag is retried later.
+      - name: Record fork release
+        env:
+          AAB: ${{ steps.verify.outputs.aab }}
+          META: ${{ steps.verify.outputs.meta }}
+          CODE: ${{ steps.meta.outputs.code }}
+          NAME: ${{ steps.meta.outputs.name }}
+        run: |
+          set -euo pipefail
+          rel="car-$TAG"
+          notes="$RUNNER_TEMP/release-notes.md"
+          if [ "$UPLOAD" = true ]; then
+            state="Uploaded to the Play \`$TRACK\` track."
+          else
+            state="Not uploaded to Play (dry run). Publish this release once the AAB has been uploaded by hand."
+          fi
+          cat > "$notes" <<EOF
+          Car app build of upstream [\`$TAG\`](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG).
+
+          | | |
+          |---|---|
+          | Application ID | \`$APP_ID\` |
+          | Version | $NAME ($CODE) |
+          | Source commit | \`$(jq -r .sourceCommit "$META")\` |
+          | Signer SHA-256 | \`$(jq -r .signingCertificateSha256 "$META")\` |
+
+          $state
+
+          Phone: install the matching upstream companion,
+          [openautolink-companion-$TAG.apk](https://github.com/$UPSTREAM_REPO/releases/download/$TAG/openautolink-companion-$TAG.apk).
+          EOF
+
+          # The releases API returns transient 5xx errors; retry each call.
+          retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "::warning::attempt $attempt failed: $*"
+              sleep $((attempt * 10))
+            done
+            return 1
+          }
+
+          # Always create or update as a draft first, attach assets, and only
+          # then publish, so a published car-<tag> always carries its AAB.
+          if ! gh release view "$rel" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            retry gh release create "$rel" -R "$GITHUB_REPOSITORY" --draft --title "Car $TAG" --notes-file "$notes"
+          fi
+          retry gh release edit "$rel" -R "$GITHUB_REPOSITORY" --notes-file "$notes"
+          for f in "$AAB" "$AAB.sha256" "$META"; do
+            retry gh release upload "$rel" "$f" -R "$GITHUB_REPOSITORY" --clobber
+          done
+          if [ "$UPLOAD" = true ]; then
+            retry gh release edit "$rel" -R "$GITHUB_REPOSITORY" --draft=false
+          fi
