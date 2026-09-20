@@ -1,6 +1,16 @@
 ﻿# EV Energy Model Reverse Engineering
 
-## Status: WORKING — ACCURATE (verified on emulator + real car)
+## Status: Historical reconstruction — arrival accuracy not established
+
+The original tests below established current SOC display and the presence of
+arrival forecasts, not their accuracy over completed routes. A later external
+versus internal schema audit found that several reconstructed names and field
+types below are incorrect: the three consumption slots correspond to road-load
+coefficients; reserve, regeneration, configuration and power labels are not safe
+implementation guidance. This document retains historical findings, not a current
+wire contract. See [the external-model contract audit](research/ev-external-model-contract.md)
+before changing the sender. Exact coefficient units and conversion to battery
+energy remain a release gate; do not infer a universal multiplier from one car.
 
 EV routing with battery-on-arrival estimates is fully functional via the AA protocol.
 When connected to an EV with VHAL data, the bridge sends a VehicleEnergyModel protobuf
@@ -9,8 +19,8 @@ battery percentage remaining at each destination in search results and during na
 
 **Verified:**
 - April 2026 on AAOS emulator: Maps shows battery estimates
-- April 2026 on real Chevrolet Blazer EV (C234 2024): Maps shows **accurate** battery
-  estimates matching the car's actual SOC. Car VHAL provides EV_BATTERY_LEVEL,
+- April 2026 on real Chevrolet Blazer EV (C234 2024): Maps shows **current battery**
+  readings matching the car's SOC; this does not validate arrival predictions. Car VHAL provides EV_BATTERY_LEVEL,
   INFO_EV_BATTERY_CAPACITY, RANGE_REMAINING — all subscribed and reading live values.
 
 ### How It Works
