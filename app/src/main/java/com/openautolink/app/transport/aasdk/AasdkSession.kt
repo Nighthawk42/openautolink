@@ -76,6 +76,7 @@ class AasdkSession(
 
     // -- Output flows (consumed by SessionManager) --
 
+    val evTelemetryToken: String = java.util.UUID.randomUUID().toString()
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
@@ -1100,6 +1101,8 @@ class AasdkSession(
     }
 
     override fun onNavigationStatus(status: Int) {
+        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.event(evTelemetryToken, "navigation_status", mapOf("status" to status))
+        if (status == 3) com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken, null, reroute = true)
         scope.launch {
             com.openautolink.app.diagnostics.DiagnosticLog.i("nav", "Status: $status (${if (status == 1) "ACTIVE" else "INACTIVE"})")
             if (status != 1) { // not ACTIVE
@@ -1323,6 +1326,7 @@ class AasdkSession(
     }
 
     override fun onNativeLog(level: Int, tag: String, message: String) {
+        if (tag == "vem") com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.nativeModel(evTelemetryToken, tag, message)
         when (level) {
             0 -> com.openautolink.app.diagnostics.DiagnosticLog.d(tag, message)
             2 -> com.openautolink.app.diagnostics.DiagnosticLog.w(tag, message)

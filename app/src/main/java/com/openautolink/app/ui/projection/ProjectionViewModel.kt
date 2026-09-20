@@ -2182,6 +2182,9 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
         val path = writer.start(requireRemovable) ?: return false
         fileLogWriter = writer
         DiagnosticLog.fileLogWriter = writer
+        java.io.File(path).parentFile?.let {
+            com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.enable(it)
+        }
         _fileLoggingActive.value = true
         _fileLoggingPath.value = path
         // Write existing ring buffer entries so we have context
@@ -2204,6 +2207,7 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
 
     /** Internal stop helper — must be called under [fileLogToggleLock]. */
     private fun stopFileLoggingLocked() {
+        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.disable()
         logcatCapture?.stop()
         logcatCapture = null
         fileLogWriter?.stop()
@@ -2521,6 +2525,7 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
         videoStatsJob?.cancel()
         audioStatsJob?.cancel()
         // Stop file logging if active
+        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.disable()
         logcatCapture?.stop()
         fileLogWriter?.stop()
         DiagnosticLog.fileLogWriter = null
