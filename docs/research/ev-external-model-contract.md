@@ -5,9 +5,11 @@
 This is an **offline, standard-library Python wire inspector** and an independent
 synthetic fixture suite. It describes a reviewed subset of the external Vehicle
 Energy Model received by Maps, not OAL's reconstructed internal-model-shaped
-`.proto`. It does not encode, send, patch or install a model. Stage A changes no
-production native/Kotlin code, submodule, tuning preference, learned state or
-transmitted bytes. It does not activate the dormant learning path.
+`.proto`. The inspector does not encode, send, patch or install a model.
+The accompanying native diagnostics capture the existing serialized VEM and
+sampled send outcomes without changing model construction or transmitted bytes.
+Neither changes submodules, tuning preferences or learned state, and neither
+activates the dormant learning path.
 
 Passing these tests means the local inspector agrees with manually specified
 source-derived wire fixtures. **Google's decoder was not executed.** This does not

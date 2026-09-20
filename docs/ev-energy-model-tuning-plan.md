@@ -293,30 +293,30 @@ vem: level=53900Wh cap=85660Wh range=283000m charge=0W [tuning=ON drv=manual:165
 
 ---
 
-## Phase 4 ï¿½ Ambient-Temperature Compensation (planned)
+## Phase 4 — Ambient-Temperature Compensation (planned)
 
 **Status:** PLANNED. Default ON for both built-in (Derived / Multiplier / Manual / Learned / EPA) and Custom modes, with a single toggle to disable.
 
 ### Why we can do this well for GM EVs
 
-GM blocks all HVAC properties (no AC compressor power, fan, setpoint, heater draw, seat heaters, defrost) ï¿½ same restriction Google Maps faces on AAOS. But we **can** read `ENV_OUTSIDE_TEMPERATURE` (already subscribed in `VehicleDataForwarderImpl.kt`), and we know the GM Ultium battery + Blazer EV / Lyriq / Hummer EV / Equinox EV / Silverado EV chemistry well enough to publish a defensible curve.
+GM blocks all HVAC properties (no AC compressor power, fan, setpoint, heater draw, seat heaters, defrost) — same restriction Google Maps faces on AAOS. But we **can** read `ENV_OUTSIDE_TEMPERATURE` (already subscribed in `VehicleDataForwarderImpl.kt`), and we know the GM Ultium battery + Blazer EV / Lyriq / Hummer EV / Equinox EV / Silverado EV chemistry well enough to publish a defensible curve.
 
 ### What native AAOS Google Maps almost certainly does (educated reconstruction)
 
-From the decompiled VEM schema (`efficiency.normal[]`, `thermal.thermal_capacity`, `preconditioning_power_kW`, `consumption.auxiliary.rate`) Maps holds a temperature-vs-Wh/km efficiency curve per vehicle. It does **not** read live HVAC either ï¿½ it relies on:
+From the decompiled VEM schema (`efficiency.normal[]`, `thermal.thermal_capacity`, `preconditioning_power_kW`, `consumption.auxiliary.rate`) Maps holds a temperature-vs-Wh/km efficiency curve per vehicle. It does **not** read live HVAC either — it relies on:
 1. `ENV_OUTSIDE_TEMPERATURE` (or route-segment weather from Google's own backend).
 2. Static profile efficiency curves (per make/model/year).
-3. Speed ï¿½ aero (covered by `consumption.aerodynamic.rate`).
+3. Speed × aero (covered by `consumption.aerodynamic.rate`).
 
-A single ambient-temp efficiency multiplier captures most of what Maps does ï¿½ the rest (per-segment weather, wind, sun load) is server-side and unreachable for us.
+A single ambient-temp efficiency multiplier captures most of what Maps does — the rest (per-segment weather, wind, sun load) is server-side and unreachable for us.
 
 ### GM Ultium thermal curve (initial coefficients)
 
 Source: GM published EPA test data + InsideEVs / Out of Spec Reviews real-world cold/hot tests for Blazer EV, Lyriq, Hummer EV, Equinox EV. All Ultium-pack vehicles share roughly the same curve because they share the cell chemistry, pack thermal mass, and cabin-heat strategy (heat pump on Blazer/Equinox/Lyriq 2024+, resistive on Hummer/Silverado).
 
-Reference temperature: **20 ï¿½C (68 ï¿½F)** = 1.00ï¿½ multiplier.
+Reference temperature: **20 °C (68 °F)** = 1.00× multiplier.
 
-| Ambient ï¿½C | Multiplier | Notes |
+| Ambient °C | Multiplier | Notes |
 |---|---|---|
 | -20 | 1.55 | severe cold; battery heater + cabin heater both running |
 | -10 | 1.35 | cold; heat pump struggling on Blazer/Equinox |
@@ -329,7 +329,7 @@ Reference temperature: **20 ï¿½C (68 ï¿½F)** = 1.00ï¿½ multiplier.
 
 Linear interpolation between rows. Clamp to [1.00, 1.60].
 
-Resistive-heat vehicles (Hummer EV, Silverado EV before 2025) get a steeper cold curve ï¿½ bake into a per-vehicle override in `ev_profiles.json`:
+Resistive-heat vehicles (Hummer EV, Silverado EV before 2025) get a steeper cold curve — bake into a per-vehicle override in `ev_profiles.json`:
 `json
 "GMC|Hummer EV|2024": { "wh_per_km": 290, "max_charge_kw": 350, "thermal_curve": "resistive" }
 `
@@ -340,7 +340,7 @@ Two named curves shipped: `"heatpump"` (default) and `"resistive"`.
 The multiplier is applied to the **final `consumption.driving.rate`** sent to Maps:
 
 `
-effectiveWhPerKm = baseWhPerKm ï¿½ thermalMultiplier(ambientTempC)
+effectiveWhPerKm = baseWhPerKm × thermalMultiplier(ambientTempC)
 `
 
 Where `baseWhPerKm` is whichever the user picked: Derived / Manual / Multiplier / Learned / EPA. So thermal compensation stacks cleanly on top of every existing mode.
@@ -349,13 +349,13 @@ Where `baseWhPerKm` is whichever the user picked: Derived / Manual / Multiplier 
 
 In `EvEnergyModelScreen.kt`:
 
-1. New section **"Ambient temperature compensation"** under the master tuning toggle but **above** the driving-mode picker ï¿½ it applies regardless of mode.
-2. Toggle: *Adjust for outside temperature (recommended)* ï¿½ default **ON**.
+1. New section **"Ambient temperature compensation"** under the master tuning toggle but **above** the driving-mode picker — it applies regardless of mode.
+2. Toggle: *Adjust for outside temperature (recommended)* — default **ON**.
 3. When ON, show:
-   - Live readout: `Outside: 4 ï¿½C ? +18 % (ï¿½ 1.18)`
+   - Live readout: `Outside: 4 °C ? +18 % (× 1.18)`
    - Curve preset dropdown: `GM Ultium (heat pump)` / `GM Ultium (resistive heat)` / `Custom`
-4. When `Custom` is selected, expose six sliders for the multipliers at -20 / 0 / 20 / 30 / 40 / 45 ï¿½C (other points interpolated). Reset-to-default button.
-5. When `ENV_OUTSIDE_TEMPERATURE` is unavailable, show `Outside: unknown ï¿½ compensation disabled` and skip the multiplier (no fallback guess).
+4. When `Custom` is selected, expose six sliders for the multipliers at -20 / 0 / 20 / 30 / 40 / 45 °C (other points interpolated). Reset-to-default button.
+5. When `ENV_OUTSIDE_TEMPERATURE` is unavailable, show `Outside: unknown — compensation disabled` and skip the multiplier (no fallback guess).
 
 ### Data model additions to `AppPreferences`
 
@@ -371,10 +371,10 @@ const val DEFAULT_EV_THERMAL_CUSTOM_JSON  = ""
 
 ### Plumbing
 
-Compute the multiplier in Kotlin (single source of truth), apply to the Wh/km value passed into the existing JNI call. **No JNI signature change required** ï¿½ we already pass `drivingWhPerKm` as a float; we just multiply it before passing.
+Compute the multiplier in Kotlin (single source of truth), apply to the Wh/km value passed into the existing JNI call. **No JNI signature change required** — we already pass `drivingWhPerKm` as a float; we just multiply it before passing.
 
 `kotlin
-// SessionManager.kt ï¿½ inside the energy-model send path
+// SessionManager.kt — inside the energy-model send path
 val baseWhPerKm = computeBaseWhPerKm(prefs, vd, learned)         // existing
 val thermalMult = if (prefs.evThermalCompEnabled) {
     EvThermalCurve.multiplierFor(vd.ambientTempC, curve = prefs.evThermalCurvePreset)
@@ -391,30 +391,30 @@ New helper file:
 
 Extend the existing `vem:` log line:
 `
-vem: level=53900Wh cap=85660Wh range=283000m chg=0W [drv=learned:165 ambient=4ï¿½C therm=heatpumpï¿½1.14 ? eff=188 aux=2.0 aero=0.36 res=5% chg=150kW]
+vem: level=53900Wh cap=85660Wh range=283000m chg=0W [drv=learned:165 ambient=4°C therm=heatpump×1.14 ? eff=188 aux=2.0 aero=0.36 res=5% chg=150kW]
 `
 
 ### Acceptance test
 
 1. Toggle OFF (or unsupported vehicle) ? behavior identical to today, log shows `therm=off`.
-2. Toggle ON, simulate `ENV_OUTSIDE_TEMPERATURE = 0` and Learned base 165 Wh/km ? effective ï¿½ 198 Wh/km; "Send Now" updates Maps within ~3 s.
-3. Switch preset to `resistive` at -10 ï¿½C ? multiplier rises (= 1.45ï¿½) vs heatpump (~1.35ï¿½).
+2. Toggle ON, simulate `ENV_OUTSIDE_TEMPERATURE = 0` and Learned base 165 Wh/km ? effective ˜ 198 Wh/km; "Send Now" updates Maps within ~3 s.
+3. Switch preset to `resistive` at -10 °C ? multiplier rises (= 1.45×) vs heatpump (~1.35×).
 4. Custom curve with all multipliers = 1.00 ? effective rate equals base rate at every temperature.
 5. Persists across car-off / reconnect; no thrash on temperature jitter (compensation re-applied at each VEM send, not stored separately).
 
 ### Why ON by default
 
-Cold-weather range loss is the single biggest reason native AAOS Maps shows a different arrival % than ours. A reasonable compensation curve closes most of the gap with no user action and is genuinely beneficial ï¿½ and the toggle is right there for users who'd rather see the raw model.
+Cold-weather range loss is the single biggest reason native AAOS Maps shows a different arrival % than ours. A reasonable compensation curve closes most of the gap with no user action and is genuinely beneficial — and the toggle is right there for users who'd rather see the raw model.
 
 ---
 
-## Phase 5 ï¿½ Companion Weather Enrichment (planned)
+## Phase 5 — Companion Weather Enrichment (planned)
 
-**Status:** PLANNED. Builds on Phase 4. Default ON when companion is connected; gracefully no-ops when offline. Runs entirely on the phone ï¿½ head unit needs no internet.
+**Status:** PLANNED. Builds on Phase 4. Default ON when companion is connected; gracefully no-ops when offline. Runs entirely on the phone — head unit needs no internet.
 
 ### Why this exists
 
-Phase 4 compensates for outside temperature using `ENV_OUTSIDE_TEMPERATURE` (current value, no forecast, no wind, no elevation). That closes most of the gap with native AAOS Maps but not all of it. Maps' server-side enrichment includes per-route-segment weather, wind, and elevation ï¿½ data we already have a path for, because the phone-side **companion app** has reliable internet, GPS, and access to the active nav route via `INavigationState` callbacks.
+Phase 4 compensates for outside temperature using `ENV_OUTSIDE_TEMPERATURE` (current value, no forecast, no wind, no elevation). That closes most of the gap with native AAOS Maps but not all of it. Maps' server-side enrichment includes per-route-segment weather, wind, and elevation — data we already have a path for, because the phone-side **companion app** has reliable internet, GPS, and access to the active nav route via `INavigationState` callbacks.
 
 This phase pushes that enrichment from the companion to the car over the existing control channel, with no new permissions and no head-unit network calls.
 
@@ -422,12 +422,12 @@ This phase pushes that enrichment from the companion to the car over the existin
 
 Maps' static VEM profile (`efficiency.normal[]`, `thermal.thermal_capacity`) is paired server-side with:
 
-1. **Current weather at vehicle location** ï¿½ for live consumption baseline.
-2. **Per-segment forecast along the route** ï¿½ temp, wind direction, precipitation, sun load.
-3. **Elevation profile** ï¿½ climbs cost ~3 kWh per 1 000 m gained; descents recover much less due to regen limits.
-4. **Wind relative to heading** ï¿½ 10 m/s headwind ï¿½ +10ï¿½15 % at highway speed.
+1. **Current weather at vehicle location** — for live consumption baseline.
+2. **Per-segment forecast along the route** — temp, wind direction, precipitation, sun load.
+3. **Elevation profile** — climbs cost ~3 kWh per 1 000 m gained; descents recover much less due to regen limits.
+4. **Wind relative to heading** — 10 m/s headwind ˜ +10–15 % at highway speed.
 
-Maps does **not** read live HVAC (same restriction we hit) ï¿½ it relies on these signals + the static profile.
+Maps does **not** read live HVAC (same restriction we hit) — it relies on these signals + the static profile.
 
 ### What the companion can fetch trivially
 
@@ -441,7 +441,7 @@ Maps does **not** read live HVAC (same restriction we hit) ï¿½ it relies on thes
 
 US-only fallback if Open-Meteo TOS becomes an issue: **NOAA NWS API** (free, no key).
 
-### Wire format ï¿½ new control message
+### Wire format — new control message
 
 Add to `app/src/main/java/com/openautolink/app/transport/ControlMessage.kt` (and the companion side):
 
@@ -466,7 +466,7 @@ data class RouteSample(
 Triggers (companion ? car):
 - Every **5 min** while session is connected and on highway speeds.
 - **Immediately** when companion observes a new `INavigationState` route.
-- **Immediately** when ambient delta > 3 ï¿½C from last send.
+- **Immediately** when ambient delta > 3 °C from last send.
 - Nothing when no nav is active and ambient hasn't moved (idle in driveway).
 
 ### How the car uses it
@@ -474,7 +474,7 @@ Triggers (companion ? car):
 1. **Phase 4 thermal compensation** prefers `WeatherEnrichment.ambientTempC` over VHAL `ENV_OUTSIDE_TEMPERATURE` when present and < 30 min old. Falls back to VHAL ? falls back to disabled.
 2. **New: route-aware effective Wh/km.** When `routeSamples` is present, the car app computes a route-weighted average:
    `
-   effectiveRate = S (sample.weight ï¿½ baseRate ï¿½ thermal(sample.tempC) ï¿½ windPenalty(sample.headwindKph) ï¿½ elevationPenalty(sample.elevationGainSinceLastM)) / S weight
+   effectiveRate = S (sample.weight × baseRate × thermal(sample.tempC) × windPenalty(sample.headwindKph) × elevationPenalty(sample.elevationGainSinceLastM)) / S weight
    `
    This single weighted average is what we send as `consumption.driving.rate`. Maps' own routing math then scales it across the route correctly.
 3. **Wind penalty** (along-route headwind):
@@ -502,18 +502,18 @@ New file: `companion/src/main/java/com/openautolink/companion/weather/WeatherEnr
 - Caches last response so transient cellular drops don't blank out the readout.
 - Open-Meteo URL pattern (free, no key):
   `https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,wind_speed_10m,wind_direction_10m,precipitation,cloud_cover&hourly=temperature_2m,wind_speed_10m,wind_direction_10m&forecast_hours=2`
-  `https://api.open-meteo.com/v1/elevation?latitude={lat1,lat2,ï¿½}&longitude={lon1,lon2,ï¿½}`
+  `https://api.open-meteo.com/v1/elevation?latitude={lat1,lat2,…}&longitude={lon1,lon2,…}`
 - All logic in the companion. The car app only deserializes and forwards into the existing energy-model pipeline.
 
 ### UI changes
 
 In `EvEnergyModelScreen.kt` (car app), under the existing "Ambient temperature compensation" section:
 
-1. Read-only readout: `Weather (companion): 4 ï¿½C, wind 12 kph @ 270ï¿½, route +180 m climb` ï¿½ or `Weather (companion): unavailable ï¿½ using ENV_OUTSIDE_TEMPERATURE` ï¿½ or `Weather: VHAL only`.
-2. Sub-toggle: **Route-aware enrichment (companion)** ï¿½ default ON. Off = ignore `routeSamples`, still use current `ambientTempC`.
-3. No sliders for wind/elevation curves ï¿½ they're hardcoded in v1; can graduate to `Custom` later if anyone asks.
+1. Read-only readout: `Weather (companion): 4 °C, wind 12 kph @ 270°, route +180 m climb` — or `Weather (companion): unavailable — using ENV_OUTSIDE_TEMPERATURE` — or `Weather: VHAL only`.
+2. Sub-toggle: **Route-aware enrichment (companion)** — default ON. Off = ignore `routeSamples`, still use current `ambientTempC`.
+3. No sliders for wind/elevation curves — they're hardcoded in v1; can graduate to `Custom` later if anyone asks.
 
-In the companion app settings (already has its own settings screen): a single toggle **"Send weather to car"** (default ON) and a small "last fetched: ï¿½" diagnostic line.
+In the companion app settings (already has its own settings screen): a single toggle **"Send weather to car"** (default ON) and a small "last fetched: …" diagnostic line.
 
 ### Data model additions
 
@@ -535,11 +535,11 @@ Companion preferences (mirror in companion's own DataStore): `COMPANION_WEATHER_
 
 ### Risks / caveats
 
-- **Open-Meteo TOS** ï¿½ free for personal/non-commercial; OpenAutoLink is open source / non-commercial. Confirm before shipping. Fall-back: NOAA NWS API (US-only, also free, no key) selectable in companion settings.
-- **Stale data** ï¿½ car ignores enrichment > 30 min old; throttle prevents thrash.
-- **Companion offline** ï¿½ gracefully no-ops; `EvThermalCurve` uses VHAL data instead.
-- **Battery / data on phone** ï¿½ ~1 KB per Open-Meteo response, max 12 fetches/hr highway = ~12 KB/hr. Negligible.
-- **Coordinate precision** ï¿½ round to 0.1ï¿½ (~11 km) to maximize Open-Meteo cache hits and minimize tracking footprint.
+- **Open-Meteo TOS** — free for personal/non-commercial; OpenAutoLink is open source / non-commercial. Confirm before shipping. Fall-back: NOAA NWS API (US-only, also free, no key) selectable in companion settings.
+- **Stale data** — car ignores enrichment > 30 min old; throttle prevents thrash.
+- **Companion offline** — gracefully no-ops; `EvThermalCurve` uses VHAL data instead.
+- **Battery / data on phone** — ~1 KB per Open-Meteo response, max 12 fetches/hr highway = ~12 KB/hr. Negligible.
+- **Coordinate precision** — round to 0.1° (~11 km) to maximize Open-Meteo cache hits and minimize tracking footprint.
 
 ### Plumbing summary (no JNI changes)
 
@@ -551,14 +551,14 @@ Companion preferences (mirror in companion's own DataStore): `COMPANION_WEATHER_
 [car app] EvThermalCurve.multiplierFor(...) reads weather first, VHAL temp second
 [car app] computeRouteAwareWhPerKm(...) consumes routeSamples when present
                                           ?
-[car app] sendEnergyModel(... effectiveWhPerKm ...) ï¿½ existing JNI signature unchanged
+[car app] sendEnergyModel(... effectiveWhPerKm ...) — existing JNI signature unchanged
 `
 
 ### Acceptance test
 
 1. Companion offline / disabled ? car uses Phase 4 VHAL-temp compensation; log shows `weather=none`.
 2. Companion online, idle (no nav) ? car uses `WeatherEnrichment.ambientTempC` for thermal compensation; log shows `weather=current`.
-3. Companion online, nav active ? car uses route-weighted average; log shows `weather=route(N samples) eff=ï¿½ therm=ï¿½ wind=ï¿½ elev=ï¿½`.
+3. Companion online, nav active ? car uses route-weighted average; log shows `weather=route(N samples) eff=… therm=… wind=… elev=…`.
 4. Companion connection drops mid-drive ? car keeps using last enrichment for 30 min, then falls back to VHAL.
 5. Toggle `EV_WEATHER_ROUTE_AWARE_ENABLED` off ? only `ambientTempC` is used; `routeSamples` ignored.
 6. Toggle `EV_WEATHER_ENRICHMENT_ENABLED` off ? companion-supplied weather ignored entirely; behavior identical to Phase 4 alone.
@@ -581,25 +581,25 @@ These are diminishing-returns. Phase 5 is the realistic ceiling for a third-part
 
 ---
 
-## Phase 6 ï¿½ Phone Ambient Sensor as HVAC Proxy (planned)
+## Phase 6 — Phone Ambient Sensor as HVAC Proxy (planned)
 
 **Status:** PLANNED. Educated guess. Default OFF until validated. Toggleable + tweakable from the car app.
 
 ### The premise
 
-GM blocks every HVAC property on AAOS ï¿½ we cannot read AC compressor draw, fan level, cabin setpoint, heater current, seat heaters, or defrost. But we **can** infer how hard the cabin HVAC is working by comparing two temperatures:
+GM blocks every HVAC property on AAOS — we cannot read AC compressor draw, fan level, cabin setpoint, heater current, seat heaters, or defrost. But we **can** infer how hard the cabin HVAC is working by comparing two temperatures:
 
-- **Outside ambient** ï¿½ from companion-fetched weather (Phase 5) or VHAL `ENV_OUTSIDE_TEMPERATURE`.
-- **Cabin temperature proxy** ï¿½ from the phone's `Sensor.TYPE_AMBIENT_TEMPERATURE` reported by the companion.
+- **Outside ambient** — from companion-fetched weather (Phase 5) or VHAL `ENV_OUTSIDE_TEMPERATURE`.
+- **Cabin temperature proxy** — from the phone's `Sensor.TYPE_AMBIENT_TEMPERATURE` reported by the companion.
 
 If the phone is sitting in the cabin (it always is, when paired via OAL), and the phone's reading is consistently warmer or cooler than outside, the delta is roughly the cabin?outside gradient that HVAC is actively maintaining. Bigger gradient = more HVAC work = higher Wh/km.
 
 ### Why this is *educated* and not exact
 
-1. **Sensor availability.** `TYPE_AMBIENT_TEMPERATURE` exists on a minority of Android phones. Pixel 7/8/9, Galaxy S24 Ultra (some), older Galaxy Note series ï¿½ yes. OnePlus 13 (our reference test phone) ï¿½ no, only `TYPE_TEMPERATURE` (deprecated, returns CPU temp). We must probe at companion startup and gracefully no-op when absent.
+1. **Sensor availability.** `TYPE_AMBIENT_TEMPERATURE` exists on a minority of Android phones. Pixel 7/8/9, Galaxy S24 Ultra (some), older Galaxy Note series — yes. OnePlus 13 (our reference test phone) — no, only `TYPE_TEMPERATURE` (deprecated, returns CPU temp). We must probe at companion startup and gracefully no-op when absent.
 2. **Self-heating contamination.** Even when the sensor exists, Android's reading is biased by the phone's CPU/screen heat. The bias is fairly stable when the phone is idle on a cradle but spikes during heavy use (gaming, video record). Pixels generally model and subtract self-heating before reporting; some Samsung devices do not.
-3. **Phone placement.** A phone on a sun-baked dashboard reads 60 ï¿½C; the cabin is 28 ï¿½C. We can't see placement directly. Mitigation: only trust the reading when it's *between* outside ambient and a plausible cabin range (e.g., outside 0 ï¿½C, phone 19 ï¿½C ? believable; outside 0 ï¿½C, phone 45 ï¿½C ? discard).
-4. **Steady-state assumption.** HVAC inference only makes sense after the cabin has stabilized ï¿½ the first 5 min of a cold start is HVAC working at full power but cabin temp still climbing. We need a settling window.
+3. **Phone placement.** A phone on a sun-baked dashboard reads 60 °C; the cabin is 28 °C. We can't see placement directly. Mitigation: only trust the reading when it's *between* outside ambient and a plausible cabin range (e.g., outside 0 °C, phone 19 °C ? believable; outside 0 °C, phone 45 °C ? discard).
+4. **Steady-state assumption.** HVAC inference only makes sense after the cabin has stabilized — the first 5 min of a cold start is HVAC working at full power but cabin temp still climbing. We need a settling window.
 
 So this is a **bonus signal** that improves the estimate when conditions are favorable, not a replacement for Phase 4/5.
 
@@ -608,19 +608,19 @@ So this is a **bonus signal** that improves the estimate when conditions are fav
 `
 gradient = cabinProxyC - outsideC                 // signed
 absGradient = abs(gradient)
-hvacMultiplier = 1.0 + k * absGradient            // k tunable, default 0.005 (= 0.5 % per ï¿½C)
+hvacMultiplier = 1.0 + k * absGradient            // k tunable, default 0.005 (= 0.5 % per °C)
                                                   //   clamp to [1.00, 1.30]
 `
 
 Layered on top of the Phase 4 thermal multiplier:
 `
-effective = base ï¿½ thermal(outsideC) ï¿½ hvac(absGradient)
+effective = base × thermal(outsideC) × hvac(absGradient)
 `
 
 Reasoning:
-- A 25 ï¿½C cabin?outside gradient (0 ï¿½C outside, 25 ï¿½C cabin) ? HVAC is doing real work ? ~ +12 % multiplier on top of thermal.
-- A 5 ï¿½C gradient (15 ï¿½C outside, 20 ï¿½C cabin) ? mild AC fan only ? ~ +2 %.
-- Outside == cabin ? 1.00ï¿½ (no HVAC inference, thermal already captures pure ambient effect).
+- A 25 °C cabin?outside gradient (0 °C outside, 25 °C cabin) ? HVAC is doing real work ? ~ +12 % multiplier on top of thermal.
+- A 5 °C gradient (15 °C outside, 20 °C cabin) ? mild AC fan only ? ~ +2 %.
+- Outside == cabin ? 1.00× (no HVAC inference, thermal already captures pure ambient effect).
 
 The `k = 0.005` constant is a starting guess from EPA cold-weather range tests on Ultium platform (where HVAC is the dominant variable cost above pure-ambient pack inefficiency). Exposed as a slider so users can tune.
 
@@ -630,8 +630,8 @@ The car app applies the multiplier **only when all of these hold**:
 
 1. `cabinProxyC` is between `outsideC - 5` and `outsideC + 50` (rejects sun-baked phones).
 2. `cabinProxyC` is in the plausible cabin range `[-10, 50]`.
-3. The phone reading hasn't moved more than 5 ï¿½C in the last 60 s (rejects active phone use spikes).
-4. We've been driving (`PERF_VEHICLE_SPEED` available, > 0) for at least 5 min ï¿½ settling window.
+3. The phone reading hasn't moved more than 5 °C in the last 60 s (rejects active phone use spikes).
+4. We've been driving (`PERF_VEHICLE_SPEED` available, > 0) for at least 5 min — settling window.
 5. Companion `Sensor.TYPE_AMBIENT_TEMPERATURE` is actually present on this phone.
 
 When any gate fails: `hvac multiplier = 1.0` and the readout shows `HVAC inference: skipped (reason)`.
@@ -642,15 +642,15 @@ New file: `companion/src/main/java/com/openautolink/companion/sensors/CabinTempS
 
 - Probe `Sensor.TYPE_AMBIENT_TEMPERATURE` at startup. If absent, register a flag and never claim cabin temperature again.
 - Sample every 30 s, low-pass filter (3-sample median) to reject CPU spikes.
-- Send via the existing `WeatherEnrichment` message ï¿½ adds two fields:
+- Send via the existing `WeatherEnrichment` message — adds two fields:
   `kotlin
   data class WeatherEnrichment(
       ...,
       val phoneAmbientTempC: Float? = null,        // null = sensor absent / suppressed
-      val phoneAmbientStableMs: Long = 0L          // how long it's been within ï¿½0.5 ï¿½C
+      val phoneAmbientStableMs: Long = 0L          // how long it's been within ±0.5 °C
   )
   `
-  No new wire message ï¿½ extend the Phase 5 envelope.
+  No new wire message — extend the Phase 5 envelope.
 
 The companion never makes its own decisions about HVAC inference; it just publishes the proxy reading. All policy lives in the car app.
 
@@ -658,24 +658,24 @@ The companion never makes its own decisions about HVAC inference; it just publis
 
 Per the project's "minimal companion settings" principle, all of this is configured in the car app's existing `EvEnergyModelScreen`, under a new sub-section **"HVAC inference (experimental)"**:
 
-1. Toggle: **Use phone's ambient sensor as cabin temperature proxy** ï¿½ default **OFF** until validated.
-2. Slider: **HVAC sensitivity** ï¿½ 0 % to +1.5 % per ï¿½C of gradient, default 0.5 %.
-3. Slider: **Maximum HVAC penalty** ï¿½ 0 % to +50 %, default +30 %.
+1. Toggle: **Use phone's ambient sensor as cabin temperature proxy** — default **OFF** until validated.
+2. Slider: **HVAC sensitivity** — 0 % to +1.5 % per °C of gradient, default 0.5 %.
+3. Slider: **Maximum HVAC penalty** — 0 % to +50 %, default +30 %.
 4. Read-only readout:
-   - `Phone sensor: 21.4 ï¿½C (stable 8 min)`
-   - `Outside: 4.0 ï¿½C`
-   - `Gradient: 17.4 ï¿½C ? multiplier ï¿½ 1.087`
+   - `Phone sensor: 21.4 °C (stable 8 min)`
+   - `Outside: 4.0 °C`
+   - `Gradient: 17.4 °C ? multiplier × 1.087`
    - or `Phone sensor: not available on this device`
-   - or `Inference skipped: phone moved 8 ï¿½C in last 60 s`
+   - or `Inference skipped: phone moved 8 °C in last 60 s`
 
-The companion's own settings get **only** the bare minimum: a single line under its existing "Connection" panel reading `Cabin sensor: available / not available / suppressed` so users can see that the phone is contributing ï¿½ no toggles, no sliders. If we ever need a permission flow (Android 14+ may gate body sensors; ambient temperature historically needs none, but verify), that prompt lives in the companion as a one-time banner.
+The companion's own settings get **only** the bare minimum: a single line under its existing "Connection" panel reading `Cabin sensor: available / not available / suppressed` so users can see that the phone is contributing — no toggles, no sliders. If we ever need a permission flow (Android 14+ may gate body sensors; ambient temperature historically needs none, but verify), that prompt lives in the companion as a one-time banner.
 
 ### Data model additions
 
 `AppPreferences` (car app):
 `kotlin
 val EV_HVAC_INFERENCE_ENABLED       = booleanPreferencesKey("ev_hvac_inference_enabled")
-val EV_HVAC_SENSITIVITY_X1000       = intPreferencesKey("ev_hvac_sensitivity_x1000")  // 5 = 0.5%/ï¿½C
+val EV_HVAC_SENSITIVITY_X1000       = intPreferencesKey("ev_hvac_sensitivity_x1000")  // 5 = 0.5%/°C
 val EV_HVAC_MAX_PENALTY_PCT         = intPreferencesKey("ev_hvac_max_penalty_pct")    // 30
 
 const val DEFAULT_EV_HVAC_INFERENCE_ENABLED = false
@@ -693,7 +693,7 @@ Companion preferences: none. The companion sends what it has; the car decides wh
               - reads gates
               - computes multiplier
               - returns (multiplier, status)
-[car app] effective = base ï¿½ thermal(outside) ï¿½ hvac(gradient)
+[car app] effective = base × thermal(outside) × hvac(gradient)
 `
 
 Single new helper: `app/src/main/java/com/openautolink/app/data/HvacInferenceEvaluator.kt`. No JNI changes, no new permissions.
@@ -702,17 +702,17 @@ Single new helper: `app/src/main/java/com/openautolink/app/data/HvacInferenceEva
 
 Extend the existing `vem:` log line:
 `
-vem: drv=learned:165 outside=4ï¿½C therm=ï¿½1.18 cabin=21ï¿½C(stable 8m) grad=17ï¿½C hvac=ï¿½1.09 ? eff=212
+vem: drv=learned:165 outside=4°C therm=×1.18 cabin=21°C(stable 8m) grad=17°C hvac=×1.09 ? eff=212
 `
 or
 `
-vem: drv=learned:165 outside=4ï¿½C therm=ï¿½1.18 hvac=skipped(noSensor) ? eff=195
+vem: drv=learned:165 outside=4°C therm=×1.18 hvac=skipped(noSensor) ? eff=195
 `
 
 ### Risks / caveats
 
-- **Sensor scarcity.** Most users will never see this active because their phone lacks the sensor. The feature is opt-in for that reason ï¿½ users with supported phones get a small accuracy boost; users without get nothing extra (and no error).
-- **Validation needed.** The 0.5 %/ï¿½C constant is a starting guess. Real-world testing on a Pixel + Blazer EV in cold/hot weather should refine it before we promote this past "experimental".
+- **Sensor scarcity.** Most users will never see this active because their phone lacks the sensor. The feature is opt-in for that reason — users with supported phones get a small accuracy boost; users without get nothing extra (and no error).
+- **Validation needed.** The 0.5 %/°C constant is a starting guess. Real-world testing on a Pixel + Blazer EV in cold/hot weather should refine it before we promote this past "experimental".
 - **Potential anti-feature.** If a user's phone sensor is bad (poorly calibrated, heavily contaminated by self-heating, etc.) and they turn this on, range estimates get *worse*. The OFF default and clear "experimental" labeling protect against this.
 - **No false confidence.** Readout always shows the gates' state so users can see when inference is silently disabled and why.
 
@@ -720,10 +720,10 @@ vem: drv=learned:165 outside=4ï¿½C therm=ï¿½1.18 hvac=skipped(noSensor) ? eff=19
 
 1. Phone without `TYPE_AMBIENT_TEMPERATURE` ? toggle is disabled with reason text; `effective` = thermal-only.
 2. Phone with sensor, toggle OFF ? behavior identical to Phase 4/5 alone.
-3. Toggle ON, sun-baked phone (sensor 50 ï¿½C, outside 30 ï¿½C, sun forecast clear) ? gate 1 trips ? multiplier = 1.00, readout says `skipped (sensor implausibly high)`.
-4. Toggle ON, normal driving, gradient 15 ï¿½C ? multiplier ï¿½ 1.075; user can tune via sensitivity slider.
-5. Phone usage spike (gradient jumps 8 ï¿½C in 30 s) ? gate 3 trips for 60 s ? multiplier reverts to 1.00, then re-engages once stable.
+3. Toggle ON, sun-baked phone (sensor 50 °C, outside 30 °C, sun forecast clear) ? gate 1 trips ? multiplier = 1.00, readout says `skipped (sensor implausibly high)`.
+4. Toggle ON, normal driving, gradient 15 °C ? multiplier ˜ 1.075; user can tune via sensitivity slider.
+5. Phone usage spike (gradient jumps 8 °C in 30 s) ? gate 3 trips for 60 s ? multiplier reverts to 1.00, then re-engages once stable.
 
 ### Why this stays educated, not magical
 
-Every step in this phase is an inference, not a measurement. We document that openly in the UI: the section is labeled **"experimental"**, the sensitivity is exposed, and the readout always tells users when inference is engaged vs skipped. If validation shows the model is just noise on real phones, the toggle stays OFF and the feature is a no-op ï¿½ no harm done.
+Every step in this phase is an inference, not a measurement. We document that openly in the UI: the section is labeled **"experimental"**, the sensitivity is exposed, and the readout always tells users when inference is engaged vs skipped. If validation shows the model is just noise on real phones, the toggle stays OFF and the feature is a no-op — no harm done.
