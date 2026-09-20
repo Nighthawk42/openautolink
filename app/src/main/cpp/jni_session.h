@@ -8,6 +8,7 @@
 #pragma once
 
 #include "gal_version_policy.h"
+#include "ev_model_diagnostics.h"
 
 #include <memory>
 #include <thread>
@@ -321,6 +322,7 @@ private:
     std::atomic<int> requestedGalMinor_{7};
     std::atomic<uint64_t> galEnvelopeSequence_{0};
     std::atomic<uint32_t> energyModelDiagMask_{0};
+    evdiag::Sampler energyModelSampler_; // IO-thread confined; one native-session token
 
     // Current video focus state for the main display.
     // 1 = VIDEO_FOCUS_PROJECTED (default — we always project on AAOS).
