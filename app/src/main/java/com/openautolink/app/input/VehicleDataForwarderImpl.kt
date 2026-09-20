@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.openautolink.app.diagnostics.DiagnosticLog
 import com.openautolink.app.transport.ControlMessage
+import com.openautolink.app.transport.VehiclePropertyObservation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -89,10 +90,12 @@ class VehicleDataForwarderImpl(
     private var carObject: Any? = null
     private var propertyManager: Any? = null
     private var callbackProxy: Any? = null  // ONE shared callback for all properties (app_v1 pattern)
-    private val trackedPropertyIds = mutableSetOf<Int>()  // registered property IDs for dispatch
+    private val trackedPropertyIds = ConcurrentHashMap.newKeySet<Int>()  // registered property IDs for dispatch
 
     // Latest values — updated by property callbacks, sent as batch
     private val currentValues = ConcurrentHashMap<Int, Any>()
+    // Guarded with the forwarder monitor, alongside value updates and batch snapshots.
+    private val evObservationMetadata = mutableMapOf<String, VehiclePropertyObservation>()
     private var lastSendTime = 0L
 
     // HistoryProvider polling cache (Finding F.2). Refreshed every 5s on a
@@ -597,10 +600,25 @@ class VehicleDataForwarderImpl(
     }
 
     /** Handle property change event — extracts propertyId from event (app_v1 pattern). */
+    @Synchronized
     private fun handleChangeEvent(propertyValue: Any) {
         try {
             val propertyId = propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int ?: return
             if (propertyId !in trackedPropertyIds) return
+            // Observe raw availability without filtering currentValues or changing prediction.
+            // Reflection failures are independent: a missing timestamp must not hide status.
+            val receivedElapsedMs = SystemClock.elapsedRealtime()
+            VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let { name ->
+                evObservationMetadata[name] = VehiclePropertyObservation(
+                    timestampElapsedNanos = runCatching {
+                        propertyValue.javaClass.getMethod("getTimestamp").invoke(propertyValue) as? Long
+                    }.getOrNull(),
+                    receivedElapsedMs = receivedElapsedMs,
+                    status = runCatching {
+                        propertyValue.javaClass.getMethod("getStatus").invoke(propertyValue) as? Int
+                    }.getOrNull(),
+                )
+            }
             val value = propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) ?: return
             DiagnosticLog.d("vhal", "prop 0x${propertyId.toString(16)}: $value")
 
@@ -701,6 +719,7 @@ class VehicleDataForwarderImpl(
         sendMessage(data)
     }
 
+    @Synchronized
     private fun buildVehicleData(): ControlMessage.VehicleData {
         // Resolve property IDs from VehiclePropertyIds (same runtime resolution as registration)
         fun propId(name: String): Int? = resolveIntConstant("android.car.VehiclePropertyIds", name)
@@ -828,6 +847,7 @@ class VehicleDataForwarderImpl(
             tractionControlActive = tcActive,
             evMotorPowerW = motorPowerW,
             evMotorTorqueNm = motorTorqueNm,
+            evObservationMetadata = java.util.Collections.unmodifiableMap(HashMap(evObservationMetadata)),
         )
     }
 
@@ -878,6 +898,7 @@ class VehicleDataForwarderImpl(
         else -> "none"
     }
 
+    @Synchronized
     private fun cleanup() {
         historyPollerJob?.cancel()
         historyPollerJob = null
@@ -907,6 +928,9 @@ class VehicleDataForwarderImpl(
 
         trackedPropertyIds.clear()
         currentValues.clear()
+        evObservationMetadata.clear()
+        // Do not alter retained numeric values; only retire their diagnostic observations.
+        _latestVehicleData.value = _latestVehicleData.value.copy(evObservationMetadata = emptyMap())
         callbackProxy = null
         carObject = null
         propertyManager = null
