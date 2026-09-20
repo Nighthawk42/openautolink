@@ -2118,7 +2118,12 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
      */
     fun uploadLogsNow() {
         if (_uploadState.value == LogUploadState.UPLOADING) return
+        _uploadState.value = LogUploadState.UPLOADING
         viewModelScope.launch {
+            if (!preferences.logUploadEnabled.first()) {
+                flashUpload(LogUploadState.ERROR)
+                return@launch
+            }
             val url = preferences.logUploadUrl.first()
             val token = preferences.logUploadToken.first()
             val label = preferences.logUploadDeviceLabel.first()
@@ -2127,10 +2132,17 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
                 flashUpload(LogUploadState.ERROR)
                 return@launch
             }
-            _uploadState.value = LogUploadState.UPLOADING
             val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                 LogUploader(getApplication()).upload(url, token, label)
             }
+            android.widget.Toast.makeText(
+                getApplication(),
+                when (result) {
+                    is UploadResult.Success -> "Uploaded: ${result.coverage}"
+                    is UploadResult.Failure -> "Upload failed: ${result.reason}"
+                },
+                android.widget.Toast.LENGTH_LONG
+            ).show()
             flashUpload(
                 if (result is UploadResult.Success) LogUploadState.SUCCESS
                 else LogUploadState.ERROR
