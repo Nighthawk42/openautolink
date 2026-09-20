@@ -24,7 +24,7 @@ class EpaConversionTest(unittest.TestCase):
         self.assertEqual(self.lookup('30'), {'Example|EV|2026': {'drivingWhPerKm': 186}})
 
     def test_nonfinite_and_invalid_consumption_is_ignored(self):
-        for value in ('nan', 'inf', '-inf', '0', '-1', 'invalid', ''):
+        for value in ('nan', 'inf', '-inf', '1e308', '0', '-1', 'invalid', ''):
             with self.subTest(value=value):
                 self.assertEqual(self.lookup(value), {})
 

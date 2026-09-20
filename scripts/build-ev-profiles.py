@@ -154,7 +154,10 @@ def epa_lookup(year: int) -> dict[str, dict]:
                 # EPA combE is grid-side kWh/100mi, including charging losses;
                 # this unit conversion alone does not make it battery-side or
                 # turn it into a VEM road-load coefficient.
-                wh_per_km = round(kwh_per_100mi * 1000 / (100 * 1.609344))
+                converted = kwh_per_100mi * (1000 / (100 * 1.609344))
+                if not math.isfinite(converted):
+                    continue
+                wh_per_km = round(converted)
                 key = f"{make}|{model}|{year}"
                 out[key] = {"drivingWhPerKm": wh_per_km}
                 break  # one vehicle option is enough
