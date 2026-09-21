@@ -14,6 +14,7 @@ import com.openautolink.app.cluster.ClusterNavigationState
 import com.openautolink.app.diagnostics.EvTelemetryRecorder
 import com.openautolink.app.data.AppPreferences
 import com.openautolink.app.data.EvLearnedRateEstimator
+import com.openautolink.app.data.EvLearningActivationPolicy
 import com.openautolink.app.data.EvProfilesRepository
 import com.openautolink.app.diagnostics.DiagnosticLevel
 import com.openautolink.app.diagnostics.DiagnosticLog
@@ -3373,6 +3374,30 @@ class SessionManager(
     private fun sendEnergyModelWithTuning(
         session: AasdkSession, batteryWh: Int, capacityWh: Int, rangeM: Int, chargeW: Int,
     ) {
+        val learnerReady = evLearnedEstimator?.activeSnapshot?.value?.usable == true
+        val requestedMode = when {
+            evTuningEnabled -> evDrivingMode
+            evUseEpaBaseline -> "epa-baseline"
+            else -> "derived"
+        }
+        val activation = EvLearningActivationPolicy.evaluate(
+            tuningEnabled = evTuningEnabled || evUseEpaBaseline,
+            requestedMode = requestedMode,
+            learnerReady = learnerReady,
+        )
+        DiagnosticLog.i(
+            "vem_safety",
+            "requested=${activation.requestedMode} learnerReady=${activation.learnerReady} " +
+                "wireEffective=${activation.wireEffectiveMode} safetyHolds=${activation.safetyHolds.joinToString(",")}",
+        )
+        if (!activation.wireTuningAllowed) {
+            // Production safety chokepoint: neither learned nor manually/profile-tuned
+            // coefficients may reach the external VEM until its semantics and receiver
+            // behavior have been validated. Observer/collector lifecycle is irrelevant.
+            session.sendEnergyModel(batteryWh, capacityWh, rangeM, chargeW)
+            return
+        }
+
         // EPA baseline path: master tuning OFF, but user opted in to "use EPA
         // as baseline". Apply driving Wh/km and max charge kW from the bundled
         // profile when available. All other fields stay at hardcoded defaults

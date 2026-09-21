@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -22,6 +23,9 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Phase 3' — learned driving Wh/km estimator.
@@ -49,6 +53,8 @@ class EvLearnedRateEstimator private constructor(
         val persistRetryMs: Long = 5_000L,
         val maxEntries: Int = 32,
         val maxJsonBytes: Int = 16 * 1024,
+        val commandCapacity: Int = 64,
+        val maxPersistAttempts: Int = 3,
     ) {
         init {
             require(persistDebounceMs >= 0L)
@@ -56,6 +62,8 @@ class EvLearnedRateEstimator private constructor(
             require(persistRetryMs >= 0L)
             require(maxEntries >= 0)
             require(maxJsonBytes >= 2) { "maxJsonBytes must fit an empty JSON object" }
+            require(commandCapacity > 0)
+            require(maxPersistAttempts > 0)
         }
     }
 
@@ -78,9 +86,23 @@ class EvLearnedRateEstimator private constructor(
         /** Reason the most recent tick was rejected (informational). */
         val lastTickStatus: String = "",
     ) {
-        /** True when [whPerKm] is trustworthy enough to send to Maps. */
+        /** True when the learner has enough bounded evidence to report readiness.
+         *  Wire activation is a separate safety decision. */
         val usable: Boolean get() = whPerKm in 50f..800f && sampleKm >= MIN_USABLE_KM
     }
+
+    data class RuntimeState(
+        val accepting: Boolean = true,
+        val droppedCommands: Long = 0,
+        val stateEntryCount: Int = 0,
+        val dirty: Boolean = false,
+        val persistFailures: Long = 0,
+        val retryExhausted: Boolean = false,
+    )
+
+    data class StopResult(val finalSaveSucceeded: Boolean)
+
+    class FinalSaveException(message: String) : IllegalStateException(message)
 
     companion object {
         private const val TAG = "EvLearnedRate"
@@ -92,6 +114,8 @@ class EvLearnedRateEstimator private constructor(
         // off, app was backgrounded, etc.). Prevents stale lastBatteryWh from
         // creating a giant Δ when the car turns back on.
         private const val MAX_TICK_GAP_MS = 15 * 60 * 1000L
+        internal const val MOTOR_POWER_OBSERVATION = "EV_MOTOR_POWER"
+        private const val MAX_MOTOR_OBSERVATION_AGE_MS = 10_000L
         // Throttle DataStore writes so we don't thrash on every sub-second tick.
         private const val PERSIST_DEBOUNCE_MS = 5_000L
 
@@ -126,7 +150,15 @@ class EvLearnedRateEstimator private constructor(
         ): String {
             val batteryWh = vd.evBatteryLevelWh?.toInt() ?: return "skip:noBattery"
             val speedKmh = vd.speedKmh ?: 0f
-            val charging = (vd.evChargeRateW ?: 0f) > 0f
+            val charging = vd.evChargeRateW?.let { it.isFinite() && it > 0f } == true ||
+                vd.evChargeState == 2 || vd.chargePortConnected == true
+
+            val chargingBoundary = changedWhenKnown(s.lastChargeState, vd.evChargeState) ||
+                changedWhenKnown(s.lastChargePortConnected, vd.chargePortConnected) ||
+                changedWhenKnown(s.lastChargePortOpen, vd.chargePortOpen)
+            s.lastChargeState = vd.evChargeState
+            s.lastChargePortConnected = vd.chargePortConnected
+            s.lastChargePortOpen = vd.chargePortOpen
 
             val prevElapsed = s.lastTickElapsedMs
             val prevBattery = s.lastBatteryWh
@@ -138,6 +170,10 @@ class EvLearnedRateEstimator private constructor(
             s.lastBatteryWh = batteryWh
             s.lastSpeedKmh = speedKmh
 
+            if (chargingBoundary) {
+                s.resetWindow(batteryWh)
+                return "skip:charging-boundary"
+            }
             if (charging) {
                 s.resetWindow(batteryWh)
                 return "skip:charging"
@@ -157,7 +193,7 @@ class EvLearnedRateEstimator private constructor(
             val dKm = ((prevSpeedKmh + speedKmh) / 2f).coerceAtLeast(0f) * dtH
             s.windowDistanceKm += dKm
 
-            val motorW = vd.evMotorPowerW
+            val motorW = validatedMotorPower(vd, nowElapsedMs)
             if (motorW == null) {
                 s.windowMotorPowerFullyCovered = false
             } else {
@@ -190,6 +226,21 @@ class EvLearnedRateEstimator private constructor(
 
             return "ok:$source inst=${instWhPerKm.toInt()} ema=${s.whPerKm.toInt()}"
         }
+
+        private fun <T> changedWhenKnown(previous: T?, current: T?): Boolean =
+            previous != null && current != null && previous != current
+
+        private fun validatedMotorPower(
+            vd: ControlMessage.VehicleData,
+            nowElapsedMs: Long,
+        ): Float? {
+            val value = vd.evMotorPowerW?.takeIf { it.isFinite() } ?: return null
+            val observation = vd.evObservationMetadata[MOTOR_POWER_OBSERVATION] ?: return null
+            if (observation.status != null && observation.status != 0) return null
+            val ageMs = nowElapsedMs - observation.receivedElapsedMs
+            if (ageMs !in 0L..MAX_MOTOR_OBSERVATION_AGE_MS) return null
+            return value
+        }
     }
 
     /** Mutable per-vehicle state, owned by the command actor. The volatile
@@ -201,6 +252,10 @@ class EvLearnedRateEstimator private constructor(
         @Volatile var lastBatteryWh: Int = 0       // last absolute battery (Wh)
         @Volatile var lastTickElapsedMs: Long = 0L // SystemClock.elapsedRealtime
         @Volatile var lastSpeedKmh: Float = 0f
+        internal var lastChargeState: Int? = null
+        internal var lastChargePortConnected: Boolean? = null
+        internal var lastChargePortOpen: Boolean? = null
+        internal var lastObservedSequence: Long = 0L
         internal var windowStartBatteryWh: Int = 0
         internal var windowDistanceKm: Float = 0f
         internal var windowMotorEnergyWh: Float = 0f
@@ -210,6 +265,9 @@ class EvLearnedRateEstimator private constructor(
             lastBatteryWh = 0
             lastTickElapsedMs = 0L
             lastSpeedKmh = 0f
+            lastChargeState = null
+            lastChargePortConnected = null
+            lastChargePortOpen = null
             resetWindow(0)
         }
 
@@ -226,21 +284,31 @@ class EvLearnedRateEstimator private constructor(
     @Volatile private var debouncePersist: Job? = null
     @Volatile private var maxDelayPersist: Job? = null
     @Volatile private var retryPersist: Job? = null
-    private var dirty = false
+    private val accepting = AtomicBoolean(true)
+    private val admissionInFlight = AtomicInteger(0)
+    private val droppedCommands = AtomicLong(0)
+    private val persistFailures = AtomicLong(0)
+    private val stateEntryCount = AtomicInteger(0)
+    @Volatile private var dirty = false
+    private var persistAttemptsForDirty = 0
+    @Volatile private var retryExhausted = false
     private var activeKey: String? = null
+    private var observationSequence = 0L
 
     private sealed interface Command {
         data class Tick(val data: ControlMessage.VehicleData, val elapsedMs: Long) : Command
         data class Reset(val key: String?) : Command
         data class Barrier(val done: CompletableDeferred<Unit>) : Command
-        data class Stop(val done: CompletableDeferred<Unit>) : Command
+        data class Stop(val done: CompletableDeferred<StopResult>) : Command
         data object Persist : Command
     }
 
-    private val commands = Channel<Command>(Channel.UNLIMITED)
+    private val commands = Channel<Command>(config.commandCapacity)
 
     private val _activeSnapshot = MutableStateFlow(Snapshot())
     val activeSnapshot: StateFlow<Snapshot> = _activeSnapshot.asStateFlow()
+    private val _runtimeState = MutableStateFlow(RuntimeState())
+    val runtimeState: StateFlow<RuntimeState> = _runtimeState.asStateFlow()
 
     init {
         scope.launch { runActor() }
@@ -258,8 +326,16 @@ class EvLearnedRateEstimator private constructor(
                     debouncePersist?.cancel()
                     maxDelayPersist?.cancel()
                     retryPersist?.cancel()
-                    persistNow()
-                    command.done.complete(Unit)
+                    val saved = persistNow()
+                    if (saved) dirty = false
+                    publishRuntimeState()
+                    if (saved) {
+                        command.done.complete(StopResult(finalSaveSucceeded = true))
+                    } else {
+                        command.done.completeExceptionally(
+                            FinalSaveException("final save failed with dirty learned state retained in memory"),
+                        )
+                    }
                     commands.close()
                 }
             }
@@ -299,8 +375,22 @@ class EvLearnedRateEstimator private constructor(
      * Feed one VHAL tick. No-op when the data is too thin to learn from.
      * `nowElapsedMs` should be `SystemClock.elapsedRealtime()` (monotonic).
      */
-    fun onVehicleTick(vd: ControlMessage.VehicleData, nowElapsedMs: Long) {
-        commands.trySend(Command.Tick(vd, nowElapsedMs))
+    fun onVehicleTick(vd: ControlMessage.VehicleData, nowElapsedMs: Long): Boolean {
+        if (!accepting.get()) return rejectAdmission()
+        admissionInFlight.incrementAndGet()
+        return try {
+            if (!accepting.get()) return rejectAdmission()
+            val accepted = commands.trySend(Command.Tick(vd, nowElapsedMs)).isSuccess
+            if (!accepted) rejectAdmission() else true
+        } finally {
+            admissionInFlight.decrementAndGet()
+        }
+    }
+
+    private fun rejectAdmission(): Boolean {
+        droppedCommands.incrementAndGet()
+        publishRuntimeState()
+        return false
     }
 
     private fun onVehicleTickLoaded(vd: ControlMessage.VehicleData, nowElapsedMs: Long) {
@@ -308,6 +398,7 @@ class EvLearnedRateEstimator private constructor(
         if (key == null) {
             activeKey?.let { states[it]?.resetTransient() }
             activeKey = null
+            publishRuntimeState()
             return
         }
         if (activeKey != key) {
@@ -315,13 +406,18 @@ class EvLearnedRateEstimator private constructor(
             states[key]?.resetTransient()
             activeKey = key
         }
-        val s = states.getOrPut(key) { VehicleState() }
-        val status = applyTick(s, vd, nowElapsedMs)
-        if (status.startsWith("ok:")) {
-            enforceEntryLimit()
-            markDirty()
+        if (config.maxEntries == 0) {
+            activeKey = null
+            publishRuntimeState()
+            return
         }
+        val s = states.getOrPut(key) { VehicleState() }
+        s.lastObservedSequence = ++observationSequence
+        enforceEntryLimit()
+        val status = applyTick(s, vd, nowElapsedMs)
+        if (status.startsWith("ok:")) markDirty()
         publishActive(key, s, status)
+        publishRuntimeState()
     }
 
     private fun publishActive(key: String, s: VehicleState, status: String) {
@@ -339,6 +435,18 @@ class EvLearnedRateEstimator private constructor(
         publishedStates = states.mapValues { (key, s) ->
             Snapshot(key, s.whPerKm, s.sampleKm, s.lastUpdateMs)
         }
+        stateEntryCount.set(states.size)
+    }
+
+    private fun publishRuntimeState() {
+        _runtimeState.value = RuntimeState(
+            accepting = accepting.get(),
+            droppedCommands = droppedCommands.get(),
+            stateEntryCount = stateEntryCount.get(),
+            dirty = dirty,
+            persistFailures = persistFailures.get(),
+            retryExhausted = retryExhausted,
+        )
     }
 
     /** Returns the snapshot for [key], or empty when never seen. */
@@ -360,6 +468,9 @@ class EvLearnedRateEstimator private constructor(
         debouncePersist?.cancel()
         maxDelayPersist?.cancel()
         dirty = true
+        persistAttemptsForDirty = 0
+        retryExhausted = false
+        publishRuntimeState()
         persistDirty()
         DiagnosticLog.i("ev_learned", "reset key=${key ?: "ALL"}")
     }
@@ -370,47 +481,68 @@ class EvLearnedRateEstimator private constructor(
         done.await()
     }
 
-    internal suspend fun stop() {
-        val done = CompletableDeferred<Unit>()
+    internal suspend fun stop(): StopResult {
+        check(accepting.compareAndSet(true, false)) { "estimator is already stopping" }
+        publishRuntimeState()
+        while (admissionInFlight.get() != 0) yield()
+        val done = CompletableDeferred<StopResult>()
         commands.send(Command.Stop(done))
-        done.await()
+        return done.await()
     }
 
     private fun markDirty() {
         if (!dirty) {
             dirty = true
+            persistAttemptsForDirty = 0
+            retryExhausted = false
             maxDelayPersist = scope.launch {
                 kotlinx.coroutines.delay(config.persistMaxDelayMs)
-                commands.send(Command.Persist)
+                commands.trySend(Command.Persist)
             }
+        } else if (retryExhausted) {
+            // A later vehicle mutation may open one new bounded retry cycle.
+            // There is no self-scheduling loop after exhaustion.
+            persistAttemptsForDirty = 0
+            retryExhausted = false
         }
         debouncePersist?.cancel()
         debouncePersist = scope.launch {
             kotlinx.coroutines.delay(config.persistDebounceMs)
-            commands.send(Command.Persist)
+            commands.trySend(Command.Persist)
         }
+        publishRuntimeState()
     }
 
     private suspend fun persistDirty() {
-        if (!dirty) return
+        if (!dirty || retryExhausted) return
+        persistAttemptsForDirty++
         if (persistNow()) {
             dirty = false
+            persistAttemptsForDirty = 0
+            retryExhausted = false
             debouncePersist?.cancel()
             maxDelayPersist?.cancel()
             retryPersist?.cancel()
-        } else {
+        } else if (persistAttemptsForDirty < config.maxPersistAttempts) {
             retryPersist?.cancel()
             retryPersist = scope.launch {
                 kotlinx.coroutines.delay(config.persistRetryMs)
-                commands.send(Command.Persist)
+                commands.trySend(Command.Persist)
             }
+        } else {
+            retryPersist?.cancel()
+            retryPersist = null
+            retryExhausted = true
+            OalLog.w(TAG, "persist retries exhausted; dirty state retained for a future tick or stop")
         }
+        publishRuntimeState()
     }
 
     private fun enforceEntryLimit() {
         while (states.size > config.maxEntries.coerceAtLeast(0)) {
             val victim = states.entries.minWithOrNull(
                 compareBy<Map.Entry<String, VehicleState>> { it.value.lastUpdateMs }
+                    .thenBy { it.value.lastObservedSequence }
                     .thenBy { it.key },
             ) ?: break
             states.remove(victim.key)
@@ -441,6 +573,7 @@ class EvLearnedRateEstimator private constructor(
             store.save(encoded)
             return true
         } catch (e: Exception) {
+            persistFailures.incrementAndGet()
             OalLog.w(TAG, "persist failed: ${e.message}")
             return false
         }

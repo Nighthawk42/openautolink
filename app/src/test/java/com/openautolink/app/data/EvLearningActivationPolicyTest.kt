@@ -1,6 +1,7 @@
 package com.openautolink.app.data
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -39,5 +40,20 @@ class EvLearningActivationPolicyTest {
         assertEquals("learned", result.requestedMode)
         assertEquals("existing-unlearned", result.wireEffectiveMode)
         assertEquals(setOf("tuning-disabled"), result.safetyHolds)
+    }
+
+    @Test
+    fun `all unvalidated tuning requests are held off the wire`() {
+        listOf("manual", "multiplier", "learned").forEach { requested ->
+            val result = EvLearningActivationPolicy.evaluate(
+                tuningEnabled = true,
+                requestedMode = requested,
+                learnerReady = requested == "learned",
+            )
+
+            assertFalse(result.wireTuningAllowed)
+            assertEquals("existing-unlearned", result.wireEffectiveMode)
+            assertTrue(result.safetyHolds.contains("external-model-contract-unvalidated"))
+        }
     }
 }

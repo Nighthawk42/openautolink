@@ -13,6 +13,7 @@ object EvLearningActivationPolicy {
     data class State(
         val requestedMode: String,
         val learnerReady: Boolean,
+        val wireTuningAllowed: Boolean,
         val wireEffectiveMode: String,
         val safetyHolds: Set<String>,
         val explanation: String,
@@ -27,6 +28,7 @@ object EvLearningActivationPolicy {
             return State(
                 requestedMode = requestedMode,
                 learnerReady = learnerReady,
+                wireTuningAllowed = false,
                 wireEffectiveMode = WIRE_EXISTING_UNLEARNED,
                 safetyHolds = setOf("tuning-disabled"),
                 explanation = "EV tuning is disabled; the existing unlearned wire model remains effective.",
@@ -35,10 +37,11 @@ object EvLearningActivationPolicy {
 
         val holds = linkedSetOf<String>()
         if (requestedMode == "learned" && !learnerReady) holds += "learner-not-ready"
-        if (requestedMode == "learned") holds += "external-model-contract-unvalidated"
+        holds += "external-model-contract-unvalidated"
         return State(
             requestedMode = requestedMode,
             learnerReady = learnerReady,
+            wireTuningAllowed = false,
             wireEffectiveMode = WIRE_EXISTING_UNLEARNED,
             safetyHolds = holds,
             explanation = if (requestedMode == "learned") {

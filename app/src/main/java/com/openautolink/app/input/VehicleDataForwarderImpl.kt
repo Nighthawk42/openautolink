@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.util.Log
 import com.openautolink.app.diagnostics.DiagnosticLog
+import com.openautolink.app.data.EvLearnedRateEstimator
 import com.openautolink.app.transport.ControlMessage
 import com.openautolink.app.transport.VehiclePropertyObservation
 import kotlinx.coroutines.CoroutineScope
@@ -102,6 +103,7 @@ class VehicleDataForwarderImpl(
     // dedicated coroutine; nullable when the provider is patched or returns
     // no data. The build path falls back to SOC-derived math transparently.
     @Volatile private var latestMotorPowerW: Float? = null
+    @Volatile private var latestMotorPowerObservation: VehiclePropertyObservation? = null
     @Volatile private var latestMotorTorqueNm: Float? = null
     private var historyPollerJob: kotlinx.coroutines.Job? = null
 
@@ -811,6 +813,11 @@ class VehicleDataForwarderImpl(
         // Derive driving status: in a drive gear (not P/N/Unknown)
         val driving = gearInt != null && gearInt !in listOf(0, 1, 4)
 
+        val observations = HashMap(evObservationMetadata)
+        latestMotorPowerObservation?.let {
+            observations.putAll(mapOf(EvLearnedRateEstimator.MOTOR_POWER_OBSERVATION to it))
+        }
+
         return ControlMessage.VehicleData(
             speedKmh = speed,
             gear = gear,
@@ -854,7 +861,7 @@ class VehicleDataForwarderImpl(
             tractionControlActive = tcActive,
             evMotorPowerW = motorPowerW,
             evMotorTorqueNm = motorTorqueNm,
-            evObservationMetadata = java.util.Collections.unmodifiableMap(HashMap(evObservationMetadata)),
+            evObservationMetadata = java.util.Collections.unmodifiableMap(observations),
         )
     }
 
@@ -873,11 +880,18 @@ class VehicleDataForwarderImpl(
             while (true) {
                 try {
                     latestMotorPowerW = com.openautolink.app.data.GmHistoryProviderRepository
-                        .latestMotorPowerW(context)
+                        .latestMotorPowerW(context)?.takeIf { it.isFinite() }
+                    latestMotorPowerObservation = VehiclePropertyObservation(
+                        timestampElapsedNanos = null,
+                        receivedElapsedMs = SystemClock.elapsedRealtime(),
+                        status = 0,
+                        source = "history-provider",
+                    ).takeIf { latestMotorPowerW != null }
                     latestMotorTorqueNm = com.openautolink.app.data.GmHistoryProviderRepository
                         .latestMotorTorqueNm(context)
                 } catch (_: Throwable) {
                     latestMotorPowerW = null
+                    latestMotorPowerObservation = null
                     latestMotorTorqueNm = null
                 }
                 kotlinx.coroutines.delay(5_000L)
@@ -911,6 +925,7 @@ class VehicleDataForwarderImpl(
         historyPollerJob?.cancel()
         historyPollerJob = null
         latestMotorPowerW = null
+        latestMotorPowerObservation = null
         latestMotorTorqueNm = null
 
         val pm = propertyManager
