@@ -1,5 +1,14 @@
 # EV range estimates
 
+> **Accuracy limitation:** Current battery reporting and arrival prediction are
+> separate. An audit found that saved EV tuning settings are not bound to the
+> active direct-AA session, so selecting Learned does not prove learning is
+> running. It also found incorrect meanings in the reconstructed energy-model
+> fields. The modes below describe the intended UI behavior, not verified active
+> calibration. Do not compensate with a guessed multiplier or rely on these
+> estimates to decide whether a charging stop is safe. Use the vehicle's native
+> range/charging guidance. See [the external-model contract audit](research/ev-external-model-contract.md).
+
 OpenAutoLink forwards vehicle energy information through Android Auto's standard vehicle energy model. Google Maps can then display battery-aware destination estimates and charging information using data from the car rather than treating the phone as disconnected from the vehicle.
 
 Native AAOS Google Maps has private, factory-tuned vehicle profiles that third-party apps cannot read. OpenAutoLink builds the next-best model from accessible VHAL data plus a bundled vehicle profile database.

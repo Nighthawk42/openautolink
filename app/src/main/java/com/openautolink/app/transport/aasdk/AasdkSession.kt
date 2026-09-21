@@ -76,6 +76,55 @@ class AasdkSession(
 
     // -- Output flows (consumed by SessionManager) --
 
+    @Volatile var evTelemetryToken: String = java.util.UUID.randomUUID().toString()
+        private set
+    private val evReceiptLock = Any()
+    fun beginEvTelemetryGeneration() = synchronized(evReceiptLock) {
+        evTelemetryToken = java.util.UUID.randomUUID().toString()
+    }
+    private fun telemetryCallback(): AasdkSessionCallback {
+        val owner = evTelemetryToken
+        return object : AasdkSessionCallback by this {
+            override fun onSessionStopped(reason: String) {
+                synchronized(evReceiptLock) {
+                    if (owner == evTelemetryToken) {
+                        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.gap(owner, "phone_disconnected")
+                    }
+                }
+                this@AasdkSession.onSessionStopped(reason)
+            }
+            override fun onNavigationStatus(status: Int) {
+                synchronized(evReceiptLock) {
+                    if (owner == evTelemetryToken) this@AasdkSession.onNavigationStatus(status)
+                }
+            }
+            override fun onNavigationTurn(maneuver: String, road: String, iconPng: ByteArray?) {
+                synchronized(evReceiptLock) {
+                    if (owner == evTelemetryToken) this@AasdkSession.onNavigationTurn(maneuver, road, iconPng)
+                }
+            }
+            override fun onNavigationDistance(distanceMeters: Int, etaSeconds: Int, displayDistance: String?, displayUnit: String?) {
+                synchronized(evReceiptLock) {
+                    if (owner == evTelemetryToken) this@AasdkSession.onNavigationDistance(distanceMeters, etaSeconds, displayDistance, displayUnit)
+                }
+            }
+            override fun onNavigationFullState(maneuver: String?, road: String?, iconPng: ByteArray?, distanceMeters: Int, etaSeconds: Int, displayDistance: String?, displayUnit: String?, lanes: String?, cue: String?, roundaboutExitNumber: Int, currentRoad: String?, destination: String?, etaFormatted: String?, timeToArrivalSeconds: Long, destDistanceMeters: Int, destDistDisplay: String?, destDistUnit: String?) {
+                synchronized(evReceiptLock) {
+                    if (owner == evTelemetryToken) this@AasdkSession.onNavigationFullState(maneuver, road, iconPng, distanceMeters, etaSeconds, displayDistance, displayUnit, lanes, cue, roundaboutExitNumber, currentRoad, destination, etaFormatted, timeToArrivalSeconds, destDistanceMeters, destDistDisplay, destDistUnit)
+                }
+            }
+            override fun onVehicleEnergyForecast(nextStopDistanceMeters: Int, nextStopArrivalEnergyWh: Int, nextStopTimeSeconds: Int, distanceToEmptyMeters: Int, distanceToEmptyEnergyWh: Int, distanceToEmptyTimeSeconds: Int, forecastQuality: Int, minimumDepartureEnergyWh: Int, maximumRatedPowerWatts: Int, estimatedChargingTimeSeconds: Int) {
+                synchronized(evReceiptLock) {
+                    if (owner == evTelemetryToken) this@AasdkSession.onVehicleEnergyForecast(nextStopDistanceMeters, nextStopArrivalEnergyWh, nextStopTimeSeconds, distanceToEmptyMeters, distanceToEmptyEnergyWh, distanceToEmptyTimeSeconds, forecastQuality, minimumDepartureEnergyWh, maximumRatedPowerWatts, estimatedChargingTimeSeconds)
+                }
+            }
+            override fun onNativeLog(level: Int, tag: String, message: String) {
+                synchronized(evReceiptLock) {
+                    if (owner == evTelemetryToken) this@AasdkSession.onNativeLog(level, tag, message)
+                }
+            }
+        }
+    }
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
@@ -560,7 +609,7 @@ class AasdkSession(
             try {
                 nativeSessionGeneration.set(AasdkNative.nativeCreateSession())
                 primeDesiredHeadUnitMuteOnNativeSession()
-                AasdkNative.nativeStartSession(pipe, this, sdrConfig)
+                AasdkNative.nativeStartSession(pipe, telemetryCallback(), sdrConfig)
             } catch (e: Exception) {
                 OalLog.e(TAG, "Native session start failed (USB): ${e.message}")
                 pipe.close()
@@ -649,7 +698,7 @@ class AasdkSession(
         try {
             nativeSessionGeneration.set(AasdkNative.nativeCreateSession())
             primeDesiredHeadUnitMuteOnNativeSession()
-            AasdkNative.nativeStartSession(transportPipe!!, this, sdrConfig)
+            AasdkNative.nativeStartSession(transportPipe!!, telemetryCallback(), sdrConfig)
         } catch (e: Exception) {
             OalLog.e(TAG, "Native session start failed: ${e.message}")
             transportPipe?.close()
@@ -675,6 +724,7 @@ class AasdkSession(
     }
 
     fun stop() {
+        beginEvTelemetryGeneration()
         closeAudioLifecycle()
         explicitStop = true
         OalLog.i(TAG, "Stopping aasdk session")
@@ -1100,6 +1150,8 @@ class AasdkSession(
     }
 
     override fun onNavigationStatus(status: Int) {
+        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.event(evTelemetryToken, "navigation_status", mapOf("status" to status))
+        if (status != 1) com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken, null, reroute = status == 3)
         scope.launch {
             com.openautolink.app.diagnostics.DiagnosticLog.i("nav", "Status: $status (${if (status == 1) "ACTIVE" else "INACTIVE"})")
             if (status != 1) { // not ACTIVE
@@ -1147,6 +1199,11 @@ class AasdkSession(
         timeToArrivalSeconds: Long, destDistanceMeters: Int,
         destDistDisplay: String?, destDistUnit: String?
     ) {
+        // Capture before any coroutine/collector queue: consent and route belong to receipt.
+        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken,
+            ControlMessage.NavState(maneuver, distanceMeters, road, etaSeconds,
+                destination = destination, destDistanceMeters = destDistanceMeters.takeIf { it >= 0 },
+                timeToArrivalSeconds = timeToArrivalSeconds))
         scope.launch {
             val iconBase64 = iconPng?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
             val parsedLanes = parseLanesString(lanes)
@@ -1185,7 +1242,7 @@ class AasdkSession(
         maximumRatedPowerWatts: Int,
         estimatedChargingTimeSeconds: Int,
     ) {
-        _vehicleEnergyForecast.value = VehicleEnergyForecast(
+        val receivedForecast = VehicleEnergyForecast(
             energyAtNextStop = if (nextStopArrivalEnergyWh >= 0) {
                 EnergyAtDistance(
                     nextStopDistanceMeters,
@@ -1210,6 +1267,8 @@ class AasdkSession(
             } else null,
             receivedAtElapsedMs = SystemClock.elapsedRealtime(),
         )
+        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.forecast(evTelemetryToken, receivedForecast)
+        _vehicleEnergyForecast.value = receivedForecast
         com.openautolink.app.diagnostics.DiagnosticLog.i(
             "vem",
             "Maps forecast received: arrival=${nextStopArrivalEnergyWh}Wh " +
@@ -1323,6 +1382,7 @@ class AasdkSession(
     }
 
     override fun onNativeLog(level: Int, tag: String, message: String) {
+        if (tag == "vem") com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.nativeModel(evTelemetryToken, tag, message)
         when (level) {
             0 -> com.openautolink.app.diagnostics.DiagnosticLog.d(tag, message)
             2 -> com.openautolink.app.diagnostics.DiagnosticLog.w(tag, message)

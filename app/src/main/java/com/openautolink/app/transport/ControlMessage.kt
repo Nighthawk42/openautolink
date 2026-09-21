@@ -1,5 +1,13 @@
 ﻿package com.openautolink.app.transport
 
+/** VHAL sample time is nanoseconds since boot, NOT Unix/epoch time. */
+data class VehiclePropertyObservation(
+    val timestampElapsedNanos: Long?,
+    val receivedElapsedMs: Long,
+    val status: Int?,
+    val source: String = "vhal",
+)
+
 /**
  * Control messages exchanged between session components.
  * Used for inter-island communication within the app.
@@ -174,6 +182,8 @@ sealed class ControlMessage {
         // Null when provider returns nothing (patch / SecurityException / empty).
         val evMotorPowerW: Float? = null,
         val evMotorTorqueNm: Float? = null,
+        // Local diagnostics only; never changes value acceptance or the AA wire protocol.
+        val evObservationMetadata: Map<String, VehiclePropertyObservation> = emptyMap(),
     ) : ControlMessage()
 
     data class SatelliteInfo(
