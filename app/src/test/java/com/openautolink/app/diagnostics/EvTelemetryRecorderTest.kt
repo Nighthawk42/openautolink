@@ -148,7 +148,10 @@ class EvTelemetryRecorderTest {
                     listOf("PERF_VEHICLE_SPEED", "EV_BATTERY_LEVEL", "GEAR_SELECTION").associateWith {
                         VehiclePropertyObservation(20000000000, 20000, 0) }))
             assertTrue(recorder.flushForUpload())
-            assertFalse(dir.listFiles()!!.joinToString { it.readText() }.contains("\"arrivalCandidate\":true"))
+            val text = dir.listFiles()!!.joinToString { it.readText() }
+            assertFalse(text.contains("\"arrivalCandidate\":true"))
+            assertTrue(text.contains("\"forecastTimestampBasis\":\"callback_receipt_not_production\""))
+            assertTrue(text.contains("\"callbackReceivedAtElapsedMs\":1000"))
         } finally { recorder.disable(); recorder.flushForUpload(); dir.deleteRecursively() }
     }
 

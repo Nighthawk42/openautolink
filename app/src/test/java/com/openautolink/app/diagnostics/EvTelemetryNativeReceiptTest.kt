@@ -19,6 +19,7 @@ class EvTelemetryNativeReceiptTest {
             recorder.session(session.evTelemetryToken); recorder.enable(dir)
             callback.onNavigationStatus(1)
             callback.onNavigationStatus(1)
+            callback.onNavigationStatus(3)
             assertTrue(recorder.flushForUpload())
             val records = dir.listFiles()!!.flatMap { it.readLines() }
             val active = records.filter { it.contains("\"type\":\"route_active\"") }
@@ -27,6 +28,12 @@ class EvTelemetryNativeReceiptTest {
                 (kotlinx.serialization.json.Json.parseToJsonElement(it) as kotlinx.serialization.json.JsonObject)["routeEpochId"].toString()
             }
             assertEquals(1, epochs.distinct().size)
+            val reroute = records.single { it.contains("\"type\":\"reroute\"") }
+            assertFalse(reroute.contains(epochs.first()))
+            assertTrue(records.any {
+                it.contains("\"type\":\"navigation_status\"") &&
+                    it.contains("\"status\":3") && it.contains("\"statusName\":\"REROUTING\"")
+            })
         } finally { scope.cancel(); recorder.disable(); recorder.flushForUpload(); dir.deleteRecursively() }
     }
 

@@ -131,9 +131,14 @@ class EvTelemetryRecorder(
     @Synchronized fun forecast(sessionToken: String, forecast: VehicleEnergyForecast?, receiptGeneration: Long = captureGeneration) {
         if (receiptGeneration != captureGeneration || sessionToken != token || !capture) return
         val stop = forecast?.energyAtNextStop
+        val callbackReceivedAtElapsedMs = forecast?.receivedAtElapsedMs ?: elapsed()
         emit(core.forecast(stop?.arrivalBatteryEnergyWh, stop?.distanceMeters, stop?.timeToArrivalSeconds,
-            forecast?.forecastQuality ?: 0, elapsed(), wall(), forecast?.receivedAtElapsedMs ?: elapsed()) + mapOf(
+            forecast?.forecastQuality ?: 0, elapsed(), wall(), callbackReceivedAtElapsedMs) + mapOf(
+            // Legacy name is retained in schema 2, but both fields mean callback receipt.
+            // The protocol does not expose when Maps produced the forecast.
             "receivedAtElapsedMs" to forecast?.receivedAtElapsedMs,
+            "callbackReceivedAtElapsedMs" to callbackReceivedAtElapsedMs,
+            "forecastTimestampBasis" to "callback_receipt_not_production",
             "distanceToEmptyM" to forecast?.distanceToEmpty?.distanceMeters,
             "nextStopMayBeCharging" to (forecast?.nextChargingStop != null)))
     }

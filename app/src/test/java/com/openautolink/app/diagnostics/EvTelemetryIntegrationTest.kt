@@ -45,9 +45,13 @@ class EvTelemetryIntegrationTest {
                 val text = java.util.zip.ZipFile(archive.file).use { zip ->
                     zip.entries().asSequence().joinToString("\n") { zip.getInputStream(it).bufferedReader().readText() }
                 }
-                assertTrue(text.contains("\"arrivalCandidate\":true"))
-                assertTrue(text.contains("\"initialArrivalWh\":40000"))
-                assertTrue(text.contains("\"latestArrivalWh\":39000"))
+                assertFalse(text.contains("\"arrivalCandidate\":true"))
+                assertTrue(text.contains("\"arrivalWh\":40000"))
+                assertTrue(text.contains("\"arrivalWh\":39000"))
+                assertTrue(text.contains("\"initialArrivalWh\":null"))
+                assertTrue(text.contains("\"latestArrivalWh\":null"))
+                assertTrue(text.contains("\"forecastCorrelation\":\"uncertain_no_protocol_route_identity\""))
+                assertTrue(text.contains("\"schema\":2"))
                 assertTrue(text.contains("\"snapshotIsCached\":true"))
                 assertTrue(text.contains("\"learnerState\":\"inactive_not_initialized\""))
                 assertTrue(text.contains("native_model"))

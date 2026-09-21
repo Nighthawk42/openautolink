@@ -1150,12 +1150,23 @@ class AasdkSession(
     }
 
     override fun onNavigationStatus(status: Int) {
-        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.event(evTelemetryToken, "navigation_status", mapOf("status" to status))
-        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigationLifecycle(evTelemetryToken, status == 1)
-        if (status != 1) com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken, null, reroute = status == 3)
+        val meaning = NavigationStatusSemantics.fromWire(status)
+        val recorder = com.openautolink.app.diagnostics.EvTelemetryRecorder.instance
+        recorder.event(evTelemetryToken, "navigation_status", mapOf(
+            "status" to status,
+            "statusName" to meaning.name,
+        ))
+        when (meaning.routeAction) {
+            NavigationRouteAction.ACTIVATE -> recorder.navigationLifecycle(evTelemetryToken, active = true)
+            NavigationRouteAction.REROUTE -> recorder.navigation(evTelemetryToken, null, reroute = true)
+            NavigationRouteAction.CLEAR -> {
+                recorder.navigationLifecycle(evTelemetryToken, active = false)
+                recorder.navigation(evTelemetryToken, null)
+            }
+        }
         scope.launch {
-            com.openautolink.app.diagnostics.DiagnosticLog.i("nav", "Status: $status (${if (status == 1) "ACTIVE" else "INACTIVE"})")
-            if (status != 1) { // not ACTIVE
+            com.openautolink.app.diagnostics.DiagnosticLog.i("nav", "Status: $status (${meaning.name})")
+            if (meaning.routeAction != NavigationRouteAction.ACTIVATE) {
                 _vehicleEnergyForecast.value = null
                 _controlMessages.emit(ControlMessage.NavStateClear)
             }

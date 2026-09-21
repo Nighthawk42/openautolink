@@ -4,13 +4,57 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class EvTelemetryCoreTest {
-    @Test fun schemaKeepsLegacyFieldsAndAddsOpaqueRouteIdentity() {
+    @Test fun forecastWithoutProtocolRouteIdentityCannotSeedComparisonOrCandidate() {
+        val core = EvTelemetryCore("boot", "process")
+        core.startSession("one", 0, 0)
+        core.navigationLifecycle(true, 1000, 1000)
+        core.navigation(null, 100, 30, false, 1100, 1100)
+
+        val forecast = core.forecast(40000, 100, 30, 2, 1200, 1200)
+        val parked = core.vehicle(EvTelemetrySample(1300, 1300, 0.0, 40000.0, 1300, 1300, true))
+
+        assertEquals(40000, forecast["arrivalWh"])
+        assertEquals("uncertain_no_protocol_route_identity", forecast["forecastCorrelation"])
+        assertNull(forecast["initialArrivalWh"])
+        assertNull(forecast["latestArrivalWh"])
+        assertEquals(false, parked["arrivalCandidate"])
+    }
+
+    @Test fun positiveDistanceDiscontinuityRotatesOpaqueEpoch() {
+        val core = EvTelemetryCore("boot", "process")
+        core.startSession("one", 0, 0)
+        core.navigationLifecycle(true, 100, 100)
+        val first = core.navigation(null, 1000, 60, false, 200, 200)
+        val progress = core.navigation(null, 900, 55, false, 300, 300)
+        val discontinuity = core.navigation(null, 1800, 100, false, 400, 400)
+
+        assertEquals(first["routeEpochId"], progress["routeEpochId"])
+        assertNotEquals(progress["routeEpochId"], discontinuity["routeEpochId"])
+        assertEquals("positive_distance_discontinuity", discontinuity["routeBoundaryReason"])
+        assertEquals(true, discontinuity["routeContinuityUncertain"])
+    }
+
+    @Test fun schemaTwoRetainsSchemaOneParserFieldsAdditively() {
         val record = EvTelemetryCore("boot", "process").startSession("one", 0, 0)
-        assertEquals(1, record["schema"])
+        assertEquals(2, record["schema"])
+        val schemaOneParserFields = setOf(
+            "schema", "type", "boot", "process", "session", "drive", "gapCount",
+            "routeEpoch", "destinationHash", "initialArrivalWh", "latestArrivalWh",
+            "elapsedMs", "wallMs",
+        )
+        assertTrue(record.keys.containsAll(schemaOneParserFields))
         assertTrue(record["routeEpoch"] is Long)
         assertTrue(record["routeEpochId"] is String)
         assertTrue(record.containsKey("destinationHash"))
         assertNull(record["destinationHash"])
+        fun legacyFieldView(input: Map<String, Any?>): Map<String, Any?> {
+            require(input["schema"] in setOf(1, 2))
+            return input.filterKeys { it in schemaOneParserFields }
+        }
+        val schemaOneRecord = record + ("schema" to 1)
+        assertEquals(schemaOneParserFields, legacyFieldView(schemaOneRecord).keys)
+        assertEquals(schemaOneParserFields, legacyFieldView(record).keys)
+        assertEquals(2, legacyFieldView(record)["schema"])
     }
 
     @Test fun alternatingPartialNavigationPreservesExplicitDistanceWithoutRefreshingIt() {
@@ -50,18 +94,19 @@ class EvTelemetryCoreTest {
         assertFalse(listOf(session, active, duplicate, first, renamed, rerouted).toString().contains("PRIVATE_"))
     }
 
-    @Test fun candidateRequiresActiveSameEpochFreshPositiveDistanceParkStopAndValidBattery() {
+    @Test fun candidateIsSuppressedWhenProtocolCannotCorrelateForecastToRoute() {
         val core = EvTelemetryCore("boot", "process")
         core.startSession("one", 0, 0)
-        val active = core.navigationLifecycle(true, 100000, 100000)
+        core.navigationLifecycle(true, 100000, 100000)
         core.navigation(null, 100, 30, false, 100000, 100000)
         val forecast = core.forecast(40000, 100, 30, 2, 100000, 100000)
-        assertEquals(active["routeEpochId"], forecast["forecastRouteEpoch"])
+        assertNull(forecast["forecastRouteEpoch"])
+        assertEquals("uncertain_no_protocol_route_identity", forecast["forecastCorrelation"])
         val battery = EvObservationIdentity("vhal", 1, 1000, 0)
         val gear = EvObservationIdentity("vhal", 2, 1000, 0)
         val valid = EvTelemetrySample(100001, 100001, 0.0, 40000.0, 100001, 1000, true,
             batteryObservation = battery, gearObservation = gear)
-        assertEquals(true, core.vehicle(valid)["arrivalCandidate"])
+        assertEquals(false, core.vehicle(valid)["arrivalCandidate"])
         assertEquals(false, core.vehicle(valid.copy(batteryObservation = battery.copy(status = 1)))["arrivalCandidate"])
         assertEquals(false, core.vehicle(valid.copy(gearObservation = gear.copy(status = 1)))["arrivalCandidate"])
         core.navigation(null, null, null, false, 100002, 100002, reroute = true)
@@ -87,21 +132,30 @@ class EvTelemetryCoreTest {
             c.navigation("old", 10000, 100, false, 1000, 1000)
             if (!delayed) c.forecast(40000, 10000, 100, 2, 1000, 1000, 1000)
             c.navigation("new", 10, 1, false, 2000, 2000, reroute = true)
-            if (delayed) c.forecast(40000, 10000, 100, 2, 2000, 2000, 1000)
+            val delayedRecord = if (delayed) {
+                c.forecast(40000, 10000, 100, 2, 2000, 2000, 1000)
+            } else null
             val v = c.vehicle(EvTelemetrySample(2000, 2000, 0.0, 39000.0, 2000, 2000, true))
             assertNull(v["initialArrivalWh"])
             assertEquals(false, v["arrivalCandidate"])
+            if (delayedRecord != null) {
+                assertEquals(40000, delayedRecord["arrivalWh"])
+                assertEquals("pre_route_epoch", delayedRecord["forecastCorrelation"])
+            }
         }
     }
 
-    @Test fun emptyForecastInvalidatesArrivalCandidateWithoutLosingInitialForecast() {
+    @Test fun emptyForecastRemainsRawEvidenceWithoutCreatingComparison() {
         val core = EvTelemetryCore("boot", "process")
         core.startSession("one", 0, 0)
         core.navigation("private stop", 10, 1, false, 1000, 1000)
-        core.forecast(40000, 10, 1, 2, 1000, 1000)
-        core.forecast(null, null, null, 0, 2000, 2000)
+        val populated = core.forecast(40000, 10, 1, 2, 1000, 1000)
+        val empty = core.forecast(null, null, null, 0, 2000, 2000)
         val record = core.vehicle(EvTelemetrySample(2000, 2000, 0.0, 40000.0, 2000, 2000, true))
-        assertEquals(40000, record["initialArrivalWh"])
+        assertEquals(40000, populated["arrivalWh"])
+        assertNull(empty["arrivalWh"])
+        assertNull(record["initialArrivalWh"])
+        assertNull(record["latestArrivalWh"])
         assertEquals(false, record["arrivalCandidate"])
     }
 
@@ -143,20 +197,22 @@ class EvTelemetryCoreTest {
         assertEquals(true, changed["energyWindowBatteryCovered"])
     }
 
-    @Test fun retainsInitialForecastAndRequiresFreshSameRouteParkEvidence() {
+    @Test fun recordsRawForecastsButSuppressesUnprovableInitialLatestComparison() {
         val core = EvTelemetryCore("boot", "process")
         core.startSession("one", 0, 0)
         core.navigationLifecycle(true, 500, 500)
         core.navigation("secret home address", 100, 30, false, 1000, 1000)
-        core.forecast(40000, 100, 30, 1, 1000, 1000)
+        val initial = core.forecast(40000, 100, 30, 1, 1000, 1000)
         val latest = core.forecast(39000, 50, 20, 2, 2000, 2000)
-        assertEquals(40000, latest["initialArrivalWh"])
-        assertEquals(39000, latest["latestArrivalWh"])
+        assertEquals(40000, initial["arrivalWh"])
+        assertEquals(39000, latest["arrivalWh"])
+        assertNull(latest["initialArrivalWh"])
+        assertNull(latest["latestArrivalWh"])
         assertFalse(latest.toString().contains("secret home address"))
         val sample = EvTelemetrySample(2000, 2000, 0.0, 39000.0, 2000, 2000, parked = true)
-        assertEquals(true, core.vehicle(sample)["arrivalCandidate"])
+        assertEquals(false, core.vehicle(sample)["arrivalCandidate"])
         core.navigation("another private stop", 30, 10, false, 3000, 3000)
-        assertEquals(true, core.vehicle(sample.copy(elapsedMs = 3000))["arrivalCandidate"])
+        assertEquals(false, core.vehicle(sample.copy(elapsedMs = 3000))["arrivalCandidate"])
         core.navigation(null, null, null, false, 3500, 3500, reroute = true)
         assertEquals(false, core.vehicle(sample.copy(elapsedMs = 3500))["arrivalCandidate"])
         core.navigation(null, null, null, true, 4000, 4000)

@@ -27,11 +27,8 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
     private var routeEpochId = java.util.UUID.randomUUID().toString()
     private var routeActive = false
     private var destinationHash: String? = null
-    private var initialWh: Int? = null
-    private var latestWh: Int? = null
     private var navMs = -100000L
-    private var forecastMs = -100000L
-    private var forecastRouteEpoch: String? = null
+    private var forecastCorrelation = "none"
     private var remainingM: Int? = null
     private var remainingEtaSec: Long? = null
     private var routeStartedMs = Long.MIN_VALUE
@@ -40,13 +37,10 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
         routeEpoch++
         routeEpochId = java.util.UUID.randomUUID().toString()
         routeActive = active
-        initialWh = null
-        latestWh = null
         remainingM = null
         remainingEtaSec = null
         navMs = -100000
-        forecastMs = -100000
-        forecastRouteEpoch = null
+        forecastCorrelation = "none"
     }
     fun navigationLifecycle(active: Boolean, elapsedMs: Long, wallMs: Long): Map<String, Any?> {
         if (active && !routeActive) resetRoute(elapsedMs, active = true)
@@ -55,8 +49,19 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
     }
     fun navigation(destination: String?, distanceM: Int?, etaSec: Long?, clear: Boolean,
                    elapsedMs: Long, wallMs: Long, reroute: Boolean = false): Map<String, Any?> {
+        val priorDistanceM = remainingM
+        val positiveDistanceDiscontinuity = !clear && !reroute && routeActive &&
+            distanceM != null && distanceM > 0 && priorDistanceM != null &&
+            distanceM.toLong() - priorDistanceM.toLong() >=
+                maxOf(500L, priorDistanceM.toLong() / 4L)
+        val boundaryReason = when {
+            clear -> "clear"
+            reroute -> "explicit_reroute"
+            positiveDistanceDiscontinuity -> "positive_distance_discontinuity"
+            else -> null
+        }
         if (clear) resetRoute(elapsedMs)
-        else if (reroute) resetRoute(elapsedMs, active = true)
+        else if (reroute || positiveDistanceDiscontinuity) resetRoute(elapsedMs, active = true)
         destinationHash = null // Legacy field stays nullable; destination text never defines identity.
         if (!clear && distanceM != null && distanceM > 0) {
             remainingM = distanceM
@@ -65,19 +70,26 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
         if (!clear && etaSec != null && etaSec > 0) remainingEtaSec = etaSec
         return record(if (clear) "route_cancel_or_reset" else if (reroute) "reroute" else "navigation", elapsedMs, wallMs) +
             mapOf("remainingM" to remainingM, "remainingObservedMs" to navMs.takeIf { remainingM != null },
-                "etaSec" to remainingEtaSec)
+                "etaSec" to remainingEtaSec, "routeBoundaryReason" to boundaryReason)
     }
     fun forecast(arrivalWh: Int?, distanceM: Int?, etaSec: Int?, quality: Int,
                  elapsedMs: Long, wallMs: Long, receivedAtElapsedMs: Long = elapsedMs): Map<String, Any?> {
-        if (receivedAtElapsedMs < routeStartedMs) return record("forecast_uncorrelated", elapsedMs, wallMs) +
-            mapOf("receivedAtElapsedMs" to receivedAtElapsedMs, "reason" to "pre_route_epoch")
-        if (initialWh == null && arrivalWh != null) initialWh = arrivalWh
-        latestWh = arrivalWh
-        forecastMs = receivedAtElapsedMs
-        forecastRouteEpoch = routeEpochId
-        return record(if (arrivalWh == null) "forecast_empty" else "forecast", elapsedMs, wallMs) +
-            mapOf("distanceM" to distanceM, "etaSec" to etaSec, "quality" to quality,
-                "currentBatteryWh" to previous?.batteryWh, "batteryObservedMs" to previous?.batteryObservedMs)
+        val beforeCurrentEpoch = receivedAtElapsedMs < routeStartedMs
+        // The callback carries no route ID or forecast-production timestamp. A callback
+        // received in this epoch may have been produced for a route already replaced
+        // while navigation remained ACTIVE, so it is evidence only, never a comparison.
+        forecastCorrelation = if (beforeCurrentEpoch) {
+            "pre_route_epoch"
+        } else {
+            "uncertain_no_protocol_route_identity"
+        }
+        return record(if (beforeCurrentEpoch) "forecast_uncorrelated" else if (arrivalWh == null) "forecast_empty" else "forecast",
+            elapsedMs, wallMs) + mapOf(
+                "arrivalWh" to arrivalWh, "distanceM" to distanceM, "etaSec" to etaSec,
+                "quality" to quality, "currentBatteryWh" to previous?.batteryWh,
+                "batteryObservedMs" to previous?.batteryObservedMs,
+                "callbackReceivedAtElapsedMs" to receivedAtElapsedMs,
+                "reason" to if (beforeCurrentEpoch) "pre_route_epoch" else null)
     }
     private var previous: EvTelemetrySample? = null
     private var distanceM = 0.0
@@ -161,23 +173,18 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
             "energyWindowSpeedCovered" to completedEnergyCoverage,
             "energyWindowBatteryCovered" to completedBatteryCoverage,
             "uncoveredSpeedIntervals" to uncoveredSpeedIntervals,
-            "arrivalCandidate" to (routeActive && forecastRouteEpoch == routeEpochId &&
-                initialWh != null && latestWh != null &&
-                sample.elapsedMs - navMs in 0..10000 && sample.elapsedMs - forecastMs in 0..10000 &&
-                remainingM != null && remainingM!! in 1..150 && sample.parked &&
-                sample.gearObservation?.timestampElapsedNanos != null && sample.gearObservation.status == 0 &&
-                fresh(sample.speedObservedMs, sample.elapsedMs) && sample.speedKmh != null && sample.speedKmh in 0.0..1.0 &&
-                batteryValid),
+            // Schema 2 is fail-closed until the protocol exposes a route identity.
+            "arrivalCandidate" to false,
             "arrivalConfirmed" to false)
     }
     fun event(type: String, elapsedMs: Long, wallMs: Long): Map<String, Any?> = record(type, elapsedMs, wallMs)
     private fun record(type: String, elapsedMs: Long, wallMs: Long): Map<String, Any?> = linkedMapOf(
-        "schema" to 1, "type" to type, "boot" to bootId, "process" to processId,
+        "schema" to 2, "type" to type, "boot" to bootId, "process" to processId,
         "session" to session, "drive" to "$session:$drive", "gapCount" to gaps,
         "routeEpoch" to routeEpoch, "routeEpochId" to routeEpochId, "routeActive" to routeActive,
         "routeIdentityBasis" to "opaque_lifecycle", "routeContinuityUncertain" to true,
         "destinationHash" to destinationHash,
-        "initialArrivalWh" to initialWh, "latestArrivalWh" to latestWh,
-        "forecastRouteEpoch" to forecastRouteEpoch,
+        "initialArrivalWh" to null, "latestArrivalWh" to null,
+        "forecastRouteEpoch" to null, "forecastCorrelation" to forecastCorrelation,
         "elapsedMs" to elapsedMs, "wallMs" to wallMs)
 }
