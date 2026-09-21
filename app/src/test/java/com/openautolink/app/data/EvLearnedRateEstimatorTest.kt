@@ -1,6 +1,13 @@
 package com.openautolink.app.data
 
 import com.openautolink.app.transport.ControlMessage
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -11,11 +18,29 @@ import org.junit.Test
  */
 class EvLearnedRateEstimatorTest {
 
+    private class FakeStore(
+        private val loadGate: CompletableDeferred<Unit>? = null,
+        var raw: String = "{}",
+        var failuresRemaining: Int = 0,
+    ) : EvLearnedRateEstimator.Store {
+        val writes = mutableListOf<String>()
+        override suspend fun load(): String {
+            loadGate?.await()
+            return raw
+        }
+        override suspend fun save(value: String) {
+            if (failuresRemaining-- > 0) error("injected save failure")
+            raw = value
+            writes += value
+        }
+    }
+
     private fun tick(
         prev: EvLearnedRateEstimator.VehicleState? = null,
         batteryWh: Int? = null,
         speedKmh: Float? = null,
         evChargeRateW: Float? = null,
+        motorPowerW: Float? = null,
         nowMs: Long,
     ): Pair<EvLearnedRateEstimator.VehicleState, String> {
         val s = prev ?: EvLearnedRateEstimator.VehicleState()
@@ -23,12 +48,211 @@ class EvLearnedRateEstimatorTest {
             evBatteryLevelWh = batteryWh?.toFloat(),
             speedKmh = speedKmh,
             evChargeRateW = evChargeRateW,
+            evMotorPowerW = motorPowerW,
             carMake = "Test",
             carModel = "Model",
             carYear = "2024",
         )
         val status = EvLearnedRateEstimator.applyTick(s, vd, nowMs)
         return s to status
+    }
+
+    @Test
+    fun subFiftyMetreTicksAccumulateIntoOneWindowWithoutDoubleCounting() {
+        val state = EvLearnedRateEstimator.VehicleState()
+        var batteryWh = 50_000
+        var nowMs = 1_000L
+        tick(state, batteryWh, 36f, nowMs = nowMs)
+
+        // 20 half-second intervals at 36 km/h = exactly 100 m. The battery
+        // changes by 2 Wh per interval, so the completed window is 400 Wh/km.
+        repeat(20) {
+            nowMs += 500L
+            batteryWh -= 2
+            tick(state, batteryWh, 36f, nowMs = nowMs)
+        }
+
+        assertEquals(0.1f, state.sampleKm, 0.0001f)
+        assertEquals(400f, state.whPerKm, 0.1f)
+    }
+
+    @Test
+    fun oneSecondVaryingSpeedTicksUseTrapezoidalDistance() {
+        val state = EvLearnedRateEstimator.VehicleState()
+        var battery = 50_000
+        var now = 1_000L
+        tick(state, battery, 0f, nowMs = now)
+        val speeds = listOf(18f, 54f, 18f, 54f, 18f, 54f)
+        var status = ""
+        for (speed in speeds) {
+            now += 1_000L
+            battery -= 2
+            status = tick(state, battery, speed, nowMs = now).second
+        }
+        assertTrue(status.startsWith("ok:bd"))
+        assertEquals(0.0525f, state.sampleKm, 0.0001f)
+        assertEquals(12f / 0.0525f, state.whPerKm, 0.1f)
+    }
+
+    @Test
+    fun fullyCoveredMotorPowerIsIntegratedButPartialCoverageFallsBackToBatteryDelta() {
+        fun runWindow(missingPowerAt: Int?): Pair<EvLearnedRateEstimator.VehicleState, String> {
+            val state = EvLearnedRateEstimator.VehicleState()
+            var battery = 50_000
+            var now = 1_000L
+            tick(state, battery, 36f, motorPowerW = 7_200f, nowMs = now)
+            var status = ""
+            repeat(5) { index ->
+                now += 1_000L
+                battery -= 2 // battery source = 200 Wh/km over the 50 m window
+                status = tick(
+                    state,
+                    battery,
+                    36f,
+                    motorPowerW = if (index == missingPowerAt) null else 7_200f,
+                    nowMs = now,
+                ).second
+            }
+            return state to status
+        }
+
+        val (covered, coveredStatus) = runWindow(missingPowerAt = null)
+        assertTrue(coveredStatus.startsWith("ok:gt"))
+        assertEquals(200f, covered.whPerKm, 0.1f)
+
+        val (partial, partialStatus) = runWindow(missingPowerAt = 3)
+        assertTrue("partial motor coverage must not be spread over full distance", partialStatus.startsWith("ok:bd"))
+        assertEquals(200f, partial.whPerKm, 0.1f)
+    }
+
+    @Test
+    fun gapChargingAndRegenBreakWindowsInsteadOfBridgingThem() {
+        val state = EvLearnedRateEstimator.VehicleState()
+        tick(state, 50_000, 36f, nowMs = 1_000L)
+        tick(state, 49_992, 36f, nowMs = 3_000L) // 20 m only
+        tick(state, 49_990, 36f, evChargeRateW = 1_000f, nowMs = 4_000L)
+        tick(state, 49_982, 36f, nowMs = 6_000L) // 20 m after charging
+        assertEquals(0f, state.sampleKm, 0.0001f)
+
+        val gapStatus = tick(state, 49_980, 36f, nowMs = 20 * 60 * 1000L).second
+        assertTrue(gapStatus.startsWith("skip:gap"))
+        val regenStatus = tick(state, 49_990, 36f, nowMs = 20 * 60 * 1000L + 5_000L).second
+        assertTrue(regenStatus.startsWith("skip:regen"))
+        assertEquals(0f, state.sampleKm, 0.0001f)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun initialLoadAndTicksAreSerializedAndIdentitySwitchBreaksTheWindow() = runTest {
+        val loadGate = CompletableDeferred<Unit>()
+        val estimator = EvLearnedRateEstimator.createForTest(FakeStore(loadGate), this)
+
+        estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L)
+        estimator.onVehicleTick(vehicle("A", 49_980, 36f), 6_000L)
+        runCurrent()
+        assertEquals(null, estimator.activeSnapshot.value.key)
+
+        loadGate.complete(Unit)
+        estimator.awaitIdle()
+        assertEquals(0.05f, estimator.snapshotFor("Test|A|2024").sampleKm, 0.0001f)
+
+        estimator.onVehicleTick(vehicle("B", 40_000, 36f), 7_000L)
+        estimator.onVehicleTick(vehicle("A", 49_960, 36f), 12_000L)
+        estimator.awaitIdle()
+        assertEquals(
+            "switching away and back must not bridge another vehicle",
+            0.05f,
+            estimator.snapshotFor("Test|A|2024").sampleKm,
+            0.0001f,
+        )
+        estimator.stop()
+    }
+
+    private fun vehicle(model: String, batteryWh: Int, speedKmh: Float) =
+        ControlMessage.VehicleData(
+            evBatteryLevelWh = batteryWh.toFloat(),
+            speedKmh = speedKmh,
+            carMake = "Test",
+            carModel = model,
+            carYear = "2024",
+        )
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun continuousAcceptedSamplesPersistByMaximumDirtyDelay() = runTest {
+        val store = FakeStore()
+        val estimator = EvLearnedRateEstimator.createForTest(
+            store,
+            this,
+            EvLearnedRateEstimator.Config(5_000L, 12_000L, 1_000L),
+        )
+        var battery = 50_000
+        estimator.onVehicleTick(vehicle("A", battery, 36f), 1_000L)
+        estimator.awaitIdle()
+
+        repeat(4) { index ->
+            advanceTimeBy(4_000L)
+            battery -= 20
+            estimator.onVehicleTick(vehicle("A", battery, 36f), 6_000L + index * 5_000L)
+            estimator.awaitIdle()
+        }
+
+        assertTrue("max delay must force a checkpoint", store.writes.isNotEmpty())
+        estimator.stop()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun resetAndStopFlushImmediatelyAndFailedWriteRetries() = runTest {
+        val store = FakeStore(failuresRemaining = 1)
+        val estimator = EvLearnedRateEstimator.createForTest(
+            store,
+            this,
+            EvLearnedRateEstimator.Config(60_000L, 120_000L, 1_000L),
+        )
+        estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L)
+        estimator.onVehicleTick(vehicle("A", 49_980, 36f), 6_000L)
+        estimator.awaitIdle()
+        estimator.reset("Test|A|2024")
+        estimator.awaitIdle()
+        assertTrue(store.writes.isEmpty())
+
+        advanceTimeBy(1_000L)
+        runCurrent()
+        estimator.awaitIdle()
+        assertEquals(1, store.writes.size)
+
+        estimator.onVehicleTick(vehicle("B", 40_000, 36f), 7_000L)
+        estimator.onVehicleTick(vehicle("B", 39_980, 36f), 12_000L)
+        estimator.awaitIdle()
+        estimator.stop()
+        assertEquals(2, store.writes.size)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun persistedMapHasDeterministicEntryAndByteBounds() = runTest {
+        val store = FakeStore(
+            raw = """{
+                "Test|A|2024":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":100},
+                "Test|B|2024":{"whPerKm":201.0,"sampleKm":2.0,"lastUpdateMs":101},
+                "Test|C|2024":{"whPerKm":202.0,"sampleKm":2.0,"lastUpdateMs":102},
+                "Test|D|2024":{"whPerKm":203.0,"sampleKm":2.0,"lastUpdateMs":103}
+            }""".trimIndent(),
+        )
+        val estimator = EvLearnedRateEstimator.createForTest(
+            store,
+            this,
+            EvLearnedRateEstimator.Config(maxEntries = 2, maxJsonBytes = 300),
+        )
+        estimator.awaitIdle()
+        estimator.stop()
+
+        val saved = Json.parseToJsonElement(store.raw).jsonObject
+        assertEquals(2, saved.size)
+        assertTrue(saved.containsKey("Test|C|2024"))
+        assertTrue(saved.containsKey("Test|D|2024"))
+        assertTrue(store.raw.toByteArray(Charsets.UTF_8).size <= 300)
     }
 
     @Test
@@ -96,7 +320,7 @@ class EvLearnedRateEstimatorTest {
             speedKmh = 0f,
             nowMs = 1_000 + 60_000,
         )
-        assertTrue("expected stationary-skip, got '$status'", status.startsWith("skip:dKm"))
+        assertTrue("expected stationary accumulation, got '$status'", status.startsWith("accum:dKm"))
         assertEquals(0f, s2.whPerKm, 0.001f)
     }
 
@@ -135,6 +359,8 @@ class EvLearnedRateEstimatorTest {
         var nowMs = 1_000L
         s.lastBatteryWh = battery
         s.lastTickElapsedMs = nowMs
+        s.lastSpeedKmh = 60f
+        s.resetWindow(battery)
 
         // Repeatedly consume at 200 Wh/km for 5 km each tick (5 minutes at 60 km/h).
         repeat(5) {
