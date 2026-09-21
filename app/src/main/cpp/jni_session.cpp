@@ -605,12 +605,24 @@ void JniSession::nativeDiag(int level, const char* tag, const std::string& msg)
 void JniSession::logEnergyModelDiagOnce(
     uint32_t outcomeBit, int level, const std::string& msg)
 {
-    // Called only from the io_service strand. stop() joins that thread before
-    // deleting callbackRef_, so checking/using the JNI callback is safe here.
-    if (!cbMethods_.onNativeLog || !callbackRef_) return;
+    // Guard failures originate on JNI callers. Reserve the bit there, but touch
+    // callbackRef_ only on IO: stop() joins IO before deleting the global ref.
     const uint32_t previous = energyModelDiagMask_.fetch_or(
         outcomeBit, std::memory_order_relaxed);
-    if ((previous & outcomeBit) == 0) nativeDiag(level, "vem", msg);
+    if (previous & outcomeBit) return;
+    if (!streaming_) {
+        // Before start(), the IO thread already exists but JNI refs are not yet
+        // published. Logcat only here; do not race start's callback installation.
+        LOGI("%s %s", evdiag::prefix(energyModelSampler_.token(), 0).c_str(), msg.c_str());
+        return;
+    }
+    std::weak_ptr<JniSession> weak = shared_from_this();
+    ioService_->post([weak, level, msg] {
+        const auto self = weak.lock();
+        if (!self || self->stopped_) return;
+        self->nativeDiag(level, "vem",
+            evdiag::prefix(self->energyModelSampler_.token(), 0) + " " + msg);
+    });
 }
 
 void JniSession::reportGalStartEnvelope(
@@ -2397,9 +2409,15 @@ void JniSession::sendEnergyModelSensor(int batteryLevelWh, int batteryCapacityWh
     float drivingWhPerKmOverride, float auxWhPerKmOverride, float aeroCoefOverride,
     float reservePctOverride, int maxChargeWOverride, int maxDischargeWOverride)
 {
-    if (!streaming_ || !sensorChannel_) return;
+    if (!streaming_ || !sensorChannel_) {
+        logEnergyModelDiagOnce(1u << 0, 1, "outcome=dropped reason=session-not-ready");
+        return;
+    }
     // Guard: skip if values are invalid (matches bridge-mode logic).
-    if (batteryCapacityWh <= 0 || batteryLevelWh <= 0 || rangeM <= 0) return;
+    if (batteryCapacityWh <= 0 || batteryLevelWh <= 0 || rangeM <= 0) {
+        logEnergyModelDiagOnce(1u << 1, 1, "outcome=dropped reason=invalid-energy-or-range");
+        return;
+    }
 
     ioService_->post([this, batteryLevelWh, batteryCapacityWh, rangeM, chargeRateW,
                       drivingWhPerKmOverride, auxWhPerKmOverride, aeroCoefOverride,
@@ -2451,14 +2469,65 @@ void JniSession::sendEnergyModelSensor(int batteryLevelWh, int batteryCapacityWh
         *vemMsg = vem;
 
         auto promise = aasdk::channel::SendPromise::defer(*strand_);
-        promise->then([]() {}, [](const auto&) {});
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto sample = energyModelSampler_.begin(nowMs);
+        std::vector<std::string> diagnosticLines;
+        if (sample) {
+            const auto label = evdiag::prefix(energyModelSampler_.token(), sample);
+            // Read the message actually handed to aasdk, never reconstruct bytes
+            // from inputs or assert that our legacy-local names are the contract.
+            std::string serialized;
+            if (vemMsg->SerializeToString(&serialized)) {
+                diagnosticLines = evdiag::payloadLines(
+                    energyModelSampler_.token(), sample, serialized);
+            } else {
+                diagnosticLines.push_back(label + " capture=serialization_failed");
+            }
+            const auto& b = vemMsg->battery();
+            const auto& c = vemMsg->consumption();
+            diagnosticLines.push_back(label + " wire.1.3.1.current_Wh=" +
+                std::to_string(b.min_usable_capacity().watt_hours()) +
+                " wire.1.4.1.capacity_Wh=" + std::to_string(b.max_capacity().watt_hours()) +
+                " wire.1.1=" + std::to_string(b.config_id()) +
+                " wire.1.8.1=" + std::to_string(b.reserve_energy().watt_hours()));
+            diagnosticLines.push_back(label + " wire.1.9=" + std::to_string(b.max_charge_power_w()) +
+                " wire.1.10=" + std::to_string(b.max_discharge_power_w()) +
+                " wire.1.11=" + std::to_string(b.regen_braking_capable()) +
+                " wire.12.3=" + std::to_string(vemMsg->charging_prefs().mode()));
+            diagnosticLines.push_back(label + " coefficient_units=unresolved wire.2.1.1=" +
+                std::to_string(c.driving().rate()) + " wire.2.2.1=" +
+                std::to_string(c.auxiliary().rate()) + " wire.2.3.1=" +
+                std::to_string(c.aerodynamic().rate()));
+            diagnosticLines.push_back(label + " input_not_wire.range_m=" +
+                std::to_string(rangeM) + " input_not_wire.pack_flow_W=" +
+                std::to_string(chargeRateW));
+            // SendPromise::defer(strand) posts both outcomes on this session's IO
+            // thread. stop() joins it before DeleteGlobalRef. Weak ownership never
+            // looks up the global replacement session or keeps a dead one alive.
+            std::weak_ptr<JniSession> weak = shared_from_this();
+            promise->then(
+                [weak, sample, label] {
+                    const auto self = weak.lock();
+                    if (!self || self->stopped_) return;
+                    if (self->energyModelSampler_.complete(sample, true))
+                        self->nativeDiag(1, "vem", label + " outcome=sent transport-complete=true phone-accepted=unknown");
+                },
+                [weak, sample, label](const aasdk::error::Error&) {
+                    const auto self = weak.lock();
+                    if (!self || self->stopped_) return;
+                    if (self->energyModelSampler_.complete(sample, false))
+                        self->nativeDiag(2, "vem", label + " outcome=failed");
+                });
+        } else {
+            promise->then([]() {}, [](const auto&) {});
+        }
         sensorChannel_->sendSensorEventIndication(batch, std::move(promise));
-        logEnergyModelDiagOnce(1u << 0, 1,
-            "sendEnergyModel queued: level=" +
-            std::to_string(batteryLevelWh) + " cap=" +
-            std::to_string(batteryCapacityWh) + " range=" +
-            std::to_string(rangeM) + " charge=" +
-            std::to_string(chargeRateW));
+        if (sample) {
+            nativeDiag(1, "vem", evdiag::prefix(energyModelSampler_.token(), sample) +
+                " outcome=queued sent=unknown");
+            for (const auto& line : diagnosticLines) nativeDiag(1, "vem", line);
+        }
     });
 }
 

@@ -195,21 +195,25 @@ class VehicleEnergyReconnectContractTest {
         val sender = source.substring(start, end)
         val guardPath = sender.substringBefore("ioService_->post(")
         assertFalse(
-            "Native guard paths run off-strand and must not touch the JNI callback",
-            guardPath.contains("nativeDiag(") || guardPath.contains("logEnergyModelDiagOnce("),
+            "Native guard paths must not invoke JNI directly",
+            guardPath.contains("nativeDiag("),
         )
-        assertTrue(sender.contains("sendEnergyModel queued: level="))
-        assertTrue(
-            "The queued outcome must be logged at most once per native session",
-            sender.contains("logEnergyModelDiagOnce("),
-        )
+        assertTrue(guardPath.contains("logEnergyModelDiagOnce("))
+        assertTrue(sender.contains("outcome=queued sent=unknown"))
+        assertTrue(sender.contains("outcome=sent transport-complete=true phone-accepted=unknown"))
+        assertTrue(sender.contains("outcome=failed"))
+        assertTrue("Send diagnostics must use the bounded sampler", sender.contains("energyModelSampler_.begin(nowMs)"))
         val helper = source.substringAfter("void JniSession::logEnergyModelDiagOnce(")
-            .substringBefore("void JniSession::reportGal6StartEnvelope")
-        assertTrue(
-            "Do not consume the once bit when no safe Kotlin callback exists",
-            helper.indexOf("if (!cbMethods_.onNativeLog || !callbackRef_) return") in
-                0 until helper.indexOf("energyModelDiagMask_.fetch_or"),
-        )
+            .substringBefore("void JniSession::reportGalStartEnvelope")
+        val prePost = helper.substringBefore("ioService_->post(")
+        assertFalse("No JNI before the IO post", prePost.contains("nativeDiag("))
+        assertTrue("Pre-stream diagnostics stay native-only", prePost.contains("if (!streaming_)"))
+        assertTrue(prePost.contains("LOGI("))
+        assertTrue("Repeated drops cannot enqueue per-tick work", prePost.contains("energyModelDiagMask_.fetch_or"))
+        val posted = helper.substringAfter("ioService_->post(")
+        assertTrue(posted.contains("const auto self = weak.lock()"))
+        assertTrue(posted.contains("if (!self || self->stopped_) return"))
+        assertTrue(posted.contains("self->nativeDiag("))
         val header = projectFile("app/src/main/cpp/jni_session.h").readText()
         assertTrue(header.contains("std::atomic<uint32_t> energyModelDiagMask_{0}"))
         val nativeStart = source.substringAfter("void JniSession::start(")

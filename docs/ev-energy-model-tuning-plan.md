@@ -1,6 +1,15 @@
 # EV Energy Model Tuning — Implementation Plan
 
-Status: **PLANNED — not yet implemented**
+Status: **HISTORICAL DESIGN — not the current implementation plan**
+
+The settings UI and estimator were implemented, but an audit found their runtime
+observer reachable only through an uncalled function. The schema assumptions
+below also mix external and internal Maps models and mislabel road-load
+coefficients. Do not activate this design or use its numeric defaults as a
+protocol specification. See [the external-model contract audit](research/ev-external-model-contract.md).
+Current staged work first adds byte-level contract fixtures and bounded payload
+diagnostics without changing the transmitted model. Numerical corrections and
+learning activation require a validated cross-vehicle conversion contract.
 
 Goal: let users tune the `VehicleEnergyModel` (VEM, sensor type 23) we send to
 Google Maps so battery-on-arrival / battery-on-return estimates better match

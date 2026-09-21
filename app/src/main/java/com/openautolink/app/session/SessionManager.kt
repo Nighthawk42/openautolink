@@ -11,6 +11,7 @@ import com.openautolink.app.audio.AudioStats
 import com.openautolink.app.audio.CallState
 import com.openautolink.app.audio.MicCaptureManager
 import com.openautolink.app.cluster.ClusterNavigationState
+import com.openautolink.app.diagnostics.EvTelemetryRecorder
 import com.openautolink.app.data.AppPreferences
 import com.openautolink.app.data.EvLearnedRateEstimator
 import com.openautolink.app.data.EvProfilesRepository
@@ -388,7 +389,25 @@ class SessionManager(
      */
     private fun bindSessionCollectors(session: AasdkSession) {
         sessionCollectors?.cancel()
+        val telemetryToken = session.evTelemetryToken
+        EvTelemetryRecorder.instance.session(telemetryToken)
         sessionCollectors = scope.launch {
+            launch {
+                val ctx = context ?: return@launch
+                val prefs = AppPreferences.getInstance(ctx)
+                // Diagnostic-only desired settings. Do NOT initialize the dormant runtime observer.
+                kotlinx.coroutines.flow.combine(listOf(
+                    prefs.evTuningEnabled, prefs.evDrivingMode, prefs.evDrivingWhPerKm,
+                    prefs.evDrivingMultiplierPct, prefs.evAuxWhPerKmX10, prefs.evAeroCoefX100,
+                    prefs.evReservePct, prefs.evMaxChargeKw, prefs.evMaxDischargeKw, prefs.evUseEpaBaseline,
+                )) { values -> values.toList() }.collect { values ->
+                    evTelemetryRequested = listOf("enabled", "mode", "drivingWhPerKm", "multiplierPct",
+                        "auxWhPerKmX10", "aeroCoefX100", "reservePct", "maxChargeKw", "maxDischargeKw", "useEpaBaseline")
+                        .zip(values).toMap()
+                    EvTelemetryRecorder.instance.event(telemetryToken, "requested_settings",
+                        mapOf("requested" to evTelemetryRequested))
+                }
+            }
             // Mirror per-session reconnect-attempt counter so observers (UI
             // banner, 3-failure picker escalation) don't have to track
             // AasdkSession identity.
@@ -958,8 +977,26 @@ class SessionManager(
         ).also { _vehicleDataForwarder = it }
     }
 
+    @Volatile private var evTelemetryRequested: Map<String, Any?> = emptyMap()
+
     private fun forwardVehicleData(vd: ControlMessage.VehicleData) {
         val session = aasdkSession ?: return
+        if (EvTelemetryRecorder.instance.enabled) {
+            val learned = evLearnedEstimator?.activeSnapshot?.value
+            EvTelemetryRecorder.instance.vehicle(session.evTelemetryToken, vd, mapOf(
+                "requested" to evTelemetryRequested, "enabled" to evTuningEnabled,
+                "mode" to evDrivingMode, "observerStarted" to evTuningObserverStarted,
+                "drivingWhPerKm" to evDrivingWhPerKm, "multiplierPct" to evDrivingMultiplierPct,
+                "auxWhPerKmX10" to evAuxWhPerKmX10, "aeroCoefX100" to evAeroCoefX100,
+                "reservePct" to evReservePct, "maxChargeKw" to evMaxChargeKw,
+                "maxDischargeKw" to evMaxDischargeKw, "useEpaBaseline" to evUseEpaBaseline,
+                "epaDrivingWhPerKm" to epaDrivingWhPerKm, "epaMaxChargeKw" to epaMaxChargeKw,
+                "learnerState" to if (learned == null) "inactive_not_initialized" else "initialized",
+                "learnerWhPerKm" to learned?.whPerKm, "learnerSampleKm" to learned?.sampleKm,
+                "learnerUsable" to learned?.usable, "learnerLastTickStatus" to learned?.lastTickStatus,
+                "learnerLastUpdateMs" to learned?.lastUpdateMs,
+                "learnerAcceptedRejectedCounts" to "not_exposed_by_existing_estimator"))
+        }
         vd.speedKmh?.let { session.sendSpeed((it / 3.6f * 1000).toInt()) }
         // Edge-trigger low-cadence properties so each transition fires once.
         vd.gearRaw?.let {
@@ -1877,6 +1914,7 @@ class SessionManager(
 
         ensureVideoDecoder()
         ensureAudioPlayer()
+        session.beginEvTelemetryGeneration()
         bindSessionCollectors(session)
         OalLog.i(TAG, "Native session dependencies ready: " +
                 "decoder=${_videoDecoder != null} surface=${lastKnownSurface != null} " +
@@ -1985,6 +2023,7 @@ class SessionManager(
     }
 
     suspend fun stop() {
+        aasdkSession?.let { EvTelemetryRecorder.instance.gap(it.evTelemetryToken, "session_stop") }
         interruptPendingTransportStart("stop")
         startMutex.lock()
         try {
@@ -2478,6 +2517,7 @@ class SessionManager(
      * during steady streaming).
      */
     fun markGoingIdle(reason: String) {
+        aasdkSession?.let { EvTelemetryRecorder.instance.gap(it.evTelemetryToken, "idle") }
         lastActiveTimestamp = SystemClock.elapsedRealtime()
         isGoingIdle = true
         OalLog.i(TAG, "Going idle: $reason")

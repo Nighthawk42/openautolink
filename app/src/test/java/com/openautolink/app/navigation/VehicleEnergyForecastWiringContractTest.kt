@@ -37,13 +37,14 @@ class VehicleEnergyForecastWiringContractTest {
         val session = projectFile("app/src/main/java/com/openautolink/app/transport/aasdk/AasdkSession.kt")
         val manager = projectFile("app/src/main/java/com/openautolink/app/session/SessionManager.kt")
 
-        val stopStart = session.indexOf("override fun onSessionStopped(reason: String)")
-        val stopEnd = session.indexOf("override fun onVideoFrame", stopStart)
+        // Match the session member, not the nested generation-fencing adapter.
+        val stopStart = session.indexOf("\n    override fun onSessionStopped(reason: String)")
+        val stopEnd = session.indexOf("\n    override fun onVideoFrame", stopStart)
         assertTrue(stopStart >= 0 && stopEnd > stopStart)
         assertTrue(session.substring(stopStart, stopEnd).contains("_vehicleEnergyForecast.value = null"))
 
-        val navStart = session.indexOf("override fun onNavigationStatus(status: Int)")
-        val navEnd = session.indexOf("override fun onNavigationTurn", navStart)
+        val navStart = session.indexOf("\n    override fun onNavigationStatus(status: Int)")
+        val navEnd = session.indexOf("\n    override fun onNavigationTurn", navStart)
         assertTrue(navStart >= 0 && navEnd > navStart)
         assertTrue(session.substring(navStart, navEnd).contains("_vehicleEnergyForecast.value = null"))
         assertTrue(manager.contains("_vehicleEnergyForecast.value = null"))

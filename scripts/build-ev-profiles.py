@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import urllib.error
 import urllib.request
@@ -148,9 +149,15 @@ def epa_lookup(year: int) -> dict[str, dict]:
                     kwh_per_100mi = float(combe or "0")
                 except ValueError:
                     kwh_per_100mi = 0.0
-                if kwh_per_100mi <= 0:
+                if not math.isfinite(kwh_per_100mi) or kwh_per_100mi <= 0:
                     continue
-                wh_per_km = round(kwh_per_100mi * 6.2137 / 100 * 1000)
+                # EPA combE is grid-side kWh/100mi, including charging losses;
+                # this unit conversion alone does not make it battery-side or
+                # turn it into a VEM road-load coefficient.
+                converted = kwh_per_100mi * (1000 / (100 * 1.609344))
+                if not math.isfinite(converted):
+                    continue
+                wh_per_km = round(converted)
                 key = f"{make}|{model}|{year}"
                 out[key] = {"drivingWhPerKm": wh_per_km}
                 break  # one vehicle option is enough
