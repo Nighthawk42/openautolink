@@ -7,6 +7,28 @@ import com.openautolink.app.transport.ControlMessage
 import com.openautolink.app.transport.VehiclePropertyObservation
 
 class EvTelemetryRecorderTest {
+    @Test fun completedEnergyWindowBypassesFiveSecondDownsampling() {
+        val dir = Files.createTempDirectory("ev-window-complete").toFile()
+        var now = 1000L
+        val recorder = EvTelemetryRecorder({ now }, { now }, "boot")
+        fun vehicle(battery: Float) = ControlMessage.VehicleData(
+            speedKmh = 0f, gearRaw = 4, evBatteryLevelWh = battery,
+            evObservationMetadata = mapOf(
+                "PERF_VEHICLE_SPEED" to VehiclePropertyObservation(now * 1000000, now, 0),
+                "EV_BATTERY_LEVEL" to VehiclePropertyObservation(now * 1000000, now, 0),
+                "GEAR_SELECTION" to VehiclePropertyObservation(1000000000, 1000, 0)))
+        try {
+            recorder.session("one"); recorder.enable(dir)
+            recorder.vehicle("one", vehicle(50000f))
+            now = 2000
+            recorder.vehicle("one", vehicle(49900f))
+            assertTrue(recorder.flushForUpload())
+            val text = dir.listFiles()!!.joinToString { it.readText() }
+            assertTrue(text.contains("\"energyWindowCompleted\":true"))
+            assertTrue(text.contains("\"netPackUsedWh\":100.0"))
+        } finally { recorder.disable(); recorder.flushForUpload(); dir.deleteRecursively() }
+    }
+
     @Test fun receiptFromPreviousCaptureCannotEnterNewCapture() {
         val dir = Files.createTempDirectory("ev-capture-generation").toFile()
         val r = EvTelemetryRecorder({1000}, {1000}, "b")

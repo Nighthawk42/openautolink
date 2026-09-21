@@ -1,38 +1,71 @@
 package com.openautolink.app.diagnostics
 
 /** Diagnostic observations only. Never used by the predictor or forwarded to the phone. */
+data class EvObservationIdentity(
+    val source: String,
+    val timestampElapsedNanos: Long?,
+    val receivedElapsedMs: Long,
+    val status: Int?,
+)
+
 data class EvTelemetrySample(
     val elapsedMs: Long, val wallMs: Long,
     val speedKmh: Double? = null, val batteryWh: Double? = null,
     val speedObservedMs: Long? = null, val batteryObservedMs: Long? = null,
     val parked: Boolean = false,
+    val batteryObservation: EvObservationIdentity? = batteryObservedMs?.let {
+        EvObservationIdentity("legacy", it * 1_000_000, it, 0)
+    },
+    val gearObservation: EvObservationIdentity? = if (parked) {
+        EvObservationIdentity("legacy", elapsedMs * 1_000_000, elapsedMs, 0)
+    } else null,
 )
 
 class EvTelemetryCore(private val bootId: String, private val processId: String) {
     private var session = "none"
-    private var routeEpoch = 0L
+    private var routeEpoch = 0L // Legacy numeric field retained for schema compatibility.
+    private var routeEpochId = java.util.UUID.randomUUID().toString()
+    private var routeActive = false
     private var destinationHash: String? = null
     private var initialWh: Int? = null
     private var latestWh: Int? = null
     private var navMs = -100000L
     private var forecastMs = -100000L
+    private var forecastRouteEpoch: String? = null
     private var remainingM: Int? = null
-    private val salt = java.util.UUID.randomUUID().toString()
+    private var remainingEtaSec: Long? = null
     private var routeStartedMs = Long.MIN_VALUE
-    private fun resetRoute(elapsedMs: Long) { routeStartedMs = elapsedMs; routeEpoch++; initialWh = null; latestWh = null; remainingM = null; forecastMs = -100000 }
+    private fun resetRoute(elapsedMs: Long, active: Boolean = false) {
+        routeStartedMs = elapsedMs
+        routeEpoch++
+        routeEpochId = java.util.UUID.randomUUID().toString()
+        routeActive = active
+        initialWh = null
+        latestWh = null
+        remainingM = null
+        remainingEtaSec = null
+        navMs = -100000
+        forecastMs = -100000
+        forecastRouteEpoch = null
+    }
+    fun navigationLifecycle(active: Boolean, elapsedMs: Long, wallMs: Long): Map<String, Any?> {
+        if (active && !routeActive) resetRoute(elapsedMs, active = true)
+        else if (!active) routeActive = false
+        return record(if (active) "route_active" else "route_inactive", elapsedMs, wallMs)
+    }
     fun navigation(destination: String?, distanceM: Int?, etaSec: Long?, clear: Boolean,
                    elapsedMs: Long, wallMs: Long, reroute: Boolean = false): Map<String, Any?> {
-        val hash = destination?.takeIf { it.isNotBlank() }?.let {
-            java.security.MessageDigest.getInstance("SHA-256").digest((salt + it).toByteArray())
-                .take(12).joinToString("") { b -> "%02x".format(b) }
+        if (clear) resetRoute(elapsedMs)
+        else if (reroute) resetRoute(elapsedMs, active = true)
+        destinationHash = null // Legacy field stays nullable; destination text never defines identity.
+        if (!clear && distanceM != null && distanceM > 0) {
+            remainingM = distanceM
+            navMs = elapsedMs
         }
-        val changed = hash != null && hash != destinationHash
-        if (clear || changed || reroute) resetRoute(elapsedMs)
-        if (clear) destinationHash = null else if (hash != null) destinationHash = hash
-        navMs = elapsedMs
-        remainingM = if (clear) null else distanceM
+        if (!clear && etaSec != null && etaSec > 0) remainingEtaSec = etaSec
         return record(if (clear) "route_cancel_or_reset" else if (reroute) "reroute" else "navigation", elapsedMs, wallMs) +
-            mapOf("remainingM" to remainingM, "etaSec" to etaSec)
+            mapOf("remainingM" to remainingM, "remainingObservedMs" to navMs.takeIf { remainingM != null },
+                "etaSec" to remainingEtaSec)
     }
     fun forecast(arrivalWh: Int?, distanceM: Int?, etaSec: Int?, quality: Int,
                  elapsedMs: Long, wallMs: Long, receivedAtElapsedMs: Long = elapsedMs): Map<String, Any?> {
@@ -41,6 +74,7 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
         if (initialWh == null && arrivalWh != null) initialWh = arrivalWh
         latestWh = arrivalWh
         forecastMs = receivedAtElapsedMs
+        forecastRouteEpoch = routeEpochId
         return record(if (arrivalWh == null) "forecast_empty" else "forecast", elapsedMs, wallMs) +
             mapOf("distanceM" to distanceM, "etaSec" to etaSec, "quality" to quality,
                 "currentBatteryWh" to previous?.batteryWh, "batteryObservedMs" to previous?.batteryObservedMs)
@@ -100,10 +134,11 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
         energyCovered = energyCovered && intervalCovered
         var completedEnergyCoverage: Boolean? = null
         var completedBatteryCoverage: Boolean? = null
-        if (sample.batteryWh != null && sample.batteryWh.isFinite() && sample.batteryWh >= 0 &&
-            sample.batteryObservedMs != null && fresh(sample.batteryObservedMs, sample.elapsedMs)) {
+        val batteryValid = sample.batteryWh != null && sample.batteryWh.isFinite() && sample.batteryWh >= 0 &&
+            sample.batteryObservation?.timestampElapsedNanos != null && sample.batteryObservation.status == 0
+        if (batteryValid) {
             val anchor = energyAnchor
-            if (anchor != null && sample.batteryObservedMs > anchor.batteryObservedMs!!) {
+            if (anchor != null && sample.batteryObservation != anchor.batteryObservation) {
                 netWh += anchor.batteryWh!! - sample.batteryWh
                 completedEnergyCoverage = energyCovered
                 completedBatteryCoverage = batteryCovered
@@ -115,26 +150,34 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
                 energyAnchor = sample
                 energyCovered = true
             }
-        } else { batteryCovered = false }
+        } else {
+            batteryCovered = false
+            energyAnchor = null
+        }
         previous = sample
         return record("vehicle", sample.elapsedMs, sample.wallMs) + mapOf(
             "integratedDistanceM" to distanceM, "netPackUsedWh" to netWh,
+            "energyWindowCompleted" to (completedEnergyCoverage != null),
             "energyWindowSpeedCovered" to completedEnergyCoverage,
             "energyWindowBatteryCovered" to completedBatteryCoverage,
             "uncoveredSpeedIntervals" to uncoveredSpeedIntervals,
-            "arrivalCandidate" to (destinationHash != null && initialWh != null && latestWh != null &&
+            "arrivalCandidate" to (routeActive && forecastRouteEpoch == routeEpochId &&
+                initialWh != null && latestWh != null &&
                 sample.elapsedMs - navMs in 0..10000 && sample.elapsedMs - forecastMs in 0..10000 &&
-                remainingM != null && remainingM!! in 0..150 && sample.parked &&
+                remainingM != null && remainingM!! in 1..150 && sample.parked &&
+                sample.gearObservation?.timestampElapsedNanos != null && sample.gearObservation.status == 0 &&
                 fresh(sample.speedObservedMs, sample.elapsedMs) && sample.speedKmh != null && sample.speedKmh in 0.0..1.0 &&
-                sample.batteryWh != null && sample.batteryWh.isFinite() && sample.batteryWh >= 0 &&
-                fresh(sample.batteryObservedMs, sample.elapsedMs)),
+                batteryValid),
             "arrivalConfirmed" to false)
     }
     fun event(type: String, elapsedMs: Long, wallMs: Long): Map<String, Any?> = record(type, elapsedMs, wallMs)
     private fun record(type: String, elapsedMs: Long, wallMs: Long): Map<String, Any?> = linkedMapOf(
         "schema" to 1, "type" to type, "boot" to bootId, "process" to processId,
         "session" to session, "drive" to "$session:$drive", "gapCount" to gaps,
-        "routeEpoch" to routeEpoch, "destinationHash" to destinationHash,
+        "routeEpoch" to routeEpoch, "routeEpochId" to routeEpochId, "routeActive" to routeActive,
+        "routeIdentityBasis" to "opaque_lifecycle", "routeContinuityUncertain" to true,
+        "destinationHash" to destinationHash,
         "initialArrivalWh" to initialWh, "latestArrivalWh" to latestWh,
+        "forecastRouteEpoch" to forecastRouteEpoch,
         "elapsedMs" to elapsedMs, "wallMs" to wallMs)
 }

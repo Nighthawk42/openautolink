@@ -25,6 +25,7 @@ class EvTelemetryIntegrationTest {
                     .associateWith { com.openautolink.app.transport.VehiclePropertyObservation(time * 1000000, time, 0) })
             recorder.vehicle("testsession", vehicle(), mapOf("requested" to mapOf("mode" to "learned"),
                 "mode" to "default", "learnerState" to "inactive_not_initialized"))
+            recorder.navigationLifecycle("testsession", true)
             recorder.navigation("testsession", com.openautolink.app.transport.ControlMessage.NavState(
                 maneuver = null, distanceMeters = null, road = "PRIVATE_ROAD", etaSeconds = null,
                 destination = "PRIVATE_DESTINATION", destDistanceMeters = 50, timeToArrivalSeconds = 10))

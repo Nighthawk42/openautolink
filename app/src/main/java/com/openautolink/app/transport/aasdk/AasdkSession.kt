@@ -1151,6 +1151,7 @@ class AasdkSession(
 
     override fun onNavigationStatus(status: Int) {
         com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.event(evTelemetryToken, "navigation_status", mapOf("status" to status))
+        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigationLifecycle(evTelemetryToken, status == 1)
         if (status != 1) com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken, null, reroute = status == 3)
         scope.launch {
             com.openautolink.app.diagnostics.DiagnosticLog.i("nav", "Status: $status (${if (status == 1) "ACTIVE" else "INACTIVE"})")
@@ -1202,8 +1203,8 @@ class AasdkSession(
         // Capture before any coroutine/collector queue: consent and route belong to receipt.
         com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken,
             ControlMessage.NavState(maneuver, distanceMeters, road, etaSeconds,
-                destination = destination, destDistanceMeters = destDistanceMeters.takeIf { it >= 0 },
-                timeToArrivalSeconds = timeToArrivalSeconds))
+                destination = destination, destDistanceMeters = destDistanceMeters.takeIf { it > 0 },
+                timeToArrivalSeconds = timeToArrivalSeconds.takeIf { it > 0 }))
         scope.launch {
             val iconBase64 = iconPng?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
             val parsedLanes = parseLanesString(lanes)

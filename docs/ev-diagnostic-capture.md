@@ -21,7 +21,7 @@ Records also distinguish requested EV settings from effective runtime settings, 
 
 - Collection follows explicit file-logging consent. Disabling capture rejects new observations; previously accepted entries may finish flushing to disk.
 - The compact recorder has a bounded queue, small rotating files, retained-byte/file/age limits, and loss/error counters. It cannot guarantee recovery from process death, full storage or unavailable vehicle properties.
-- Compact records exclude raw destinations, coordinates and VINs. Route identity is salted for the capture. **Existing general diagnostic/logcat files can still contain navigation and device details**; the complete upload remains private diagnostic data.
+- Compact records exclude raw destinations, roads, coordinates and VINs. Route identity uses a process-local opaque lifecycle epoch that rotates only at explicit route/session boundaries; the legacy `destinationHash` field remains nullable for compatibility. **Existing general diagnostic/logcat files can still contain navigation and device details**; the complete upload remains private diagnostic data.
 - EV files are prioritized across their retention window. Large or old general logs may be omitted; the ZIP manifest and result message report that. Growing files are bounded-prefix snapshots, not an atomic snapshot of every byte written afterward.
 - Standard AAOS properties vary by vehicle. No fixed battery size, guessed temperature correction or one-vehicle calibration is applied.
 

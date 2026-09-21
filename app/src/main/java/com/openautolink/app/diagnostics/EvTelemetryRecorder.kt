@@ -86,9 +86,12 @@ class EvTelemetryRecorder(
         val metadata = vd.evObservationMetadata
         fun observed(key: String): Long? = metadata[key]?.takeIf { it.status == 0 }
             ?.timestampElapsedNanos?.div(1000000)
+        fun identity(key: String): EvObservationIdentity? = metadata[key]?.let {
+            EvObservationIdentity(it.source, it.timestampElapsedNanos, it.receivedElapsedMs, it.status)
+        }
         val sample = EvTelemetrySample(now, wall(), vd.speedKmh?.toDouble(), vd.evBatteryLevelWh?.toDouble(),
             observed("PERF_VEHICLE_SPEED"), observed("EV_BATTERY_LEVEL"),
-            vd.gearRaw == 4 && observed("GEAR_SELECTION")?.let { now - it in 0..10000 } == true)
+            vd.gearRaw == 4, identity("EV_BATTERY_LEVEL"), identity("GEAR_SELECTION"))
         val record = core.vehicle(sample) + mapOf(
             "speedKmh" to vd.speedKmh, "batteryWh" to vd.evBatteryLevelWh,
             "designCapacityWh" to vd.evBatteryCapacityWh, "currentCapacityWh" to vd.evCurrentBatteryCapacityWh,
@@ -109,7 +112,8 @@ class EvTelemetryRecorder(
             "coverage" to "bounded_observed_adjacent_samples_not_full_vhal_stream")
         lastVehicle = record
         val edge = listOf(vd.gearRaw, vd.ignitionState, vd.chargePortConnected, vd.evChargeState, effective)
-        if (lastEdge != edge || now - lastEmissionMs >= 5000 || record["arrivalCandidate"] == true) {
+        if (lastEdge != edge || now - lastEmissionMs >= 5000 || record["arrivalCandidate"] == true ||
+            record["energyWindowCompleted"] == true) {
             emit(record)
             lastEdge = edge
             lastEmissionMs = now
@@ -119,6 +123,10 @@ class EvTelemetryRecorder(
         if (receiptGeneration != captureGeneration || sessionToken != token || !capture) return
         emit(core.navigation(nav?.destination, nav?.destDistanceMeters, nav?.timeToArrivalSeconds,
             nav == null && !reroute, elapsed(), wall(), reroute))
+    }
+    @Synchronized fun navigationLifecycle(sessionToken: String, active: Boolean, receiptGeneration: Long = captureGeneration) {
+        if (receiptGeneration != captureGeneration || sessionToken != token || !capture) return
+        emit(core.navigationLifecycle(active, elapsed(), wall()))
     }
     @Synchronized fun forecast(sessionToken: String, forecast: VehicleEnergyForecast?, receiptGeneration: Long = captureGeneration) {
         if (receiptGeneration != captureGeneration || sessionToken != token || !capture) return

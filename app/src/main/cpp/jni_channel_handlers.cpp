@@ -653,8 +653,8 @@ void JniNavStatusHandler::onNavigationState(
         }
     }
 
-    // Distance/ETA come from onCurrentPosition (separate message) not NavigationState,
-    // so pass zeroes — the merge logic in Kotlin will keep previous values
+    // Distance/ETA come from onCurrentPosition (separate message). Negative sentinels
+    // distinguish absent fields from an explicit numeric observation.
     LOGI("Nav state: maneuver=%s road=%s cue=%s lanes=%s dest=%s",
          maneuver.c_str(), road.c_str(), cue.c_str(),
          lanes.empty() ? "(none)" : lanes.c_str(),
@@ -662,9 +662,9 @@ void JniNavStatusHandler::onNavigationState(
 
     session_.dispatchNavFullState(
         maneuver, road, nullptr, 0,
-        0, 0, "", "",
+        -1, -1, "", "",
         lanes, cue, roundaboutExitNumber,
-        "", destination, "", 0, 0, "", "");
+        "", destination, "", -1, -1, "", "");
 
     channel_->receive(shared_from_this());
 }
@@ -743,14 +743,14 @@ void JniNavStatusHandler::onCurrentPosition(
     }
     // === END INVESTIGATION ===
 
-    int distanceMeters = 0;
-    int etaSeconds = 0;
+    int distanceMeters = -1;
+    int etaSeconds = -1;
     std::string displayDistance;
     std::string displayUnit;
     std::string currentRoad;
     std::string etaFormatted;
-    long long timeToArrivalSeconds = 0;
-    int destDistanceMeters = 0;
+    long long timeToArrivalSeconds = -1;
+    int destDistanceMeters = -1;
     std::string destDistDisplay;
     std::string destDistUnit;
 
