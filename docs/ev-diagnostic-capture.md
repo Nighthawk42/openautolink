@@ -29,3 +29,5 @@ Records also distinguish requested EV settings from effective runtime settings, 
 ## Interpretation
 
 Treat individual forecasts as raw evidence only. Do not compare initial and settled forecasts until a future protocol signal can prove they belong to the same route; explicit boundaries and distance discontinuities can disprove continuity but cannot establish it. Native transport completion is not proof Maps used that exact revision. The separate synthetic tablet lab is never part of the car build, and its fixtures must not be treated as real driving data.
+
+The privacy-safe regression gate derived from the private 0.1.501 upload is documented in [ev-real-upload-replay.md](ev-real-upload-replay.md). It replays sanitized semantic inputs through current recorder/core behavior; it does not treat the old archive's computed fields as proof of the repaired behavior.
