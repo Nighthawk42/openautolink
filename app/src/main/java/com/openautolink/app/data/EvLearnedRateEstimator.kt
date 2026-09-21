@@ -125,6 +125,9 @@ class EvLearnedRateEstimator private constructor(
         private const val MAX_TICK_GAP_MS = 15 * 60 * 1000L
         internal const val MOTOR_POWER_OBSERVATION = "EV_MOTOR_POWER"
         private const val MAX_MOTOR_OBSERVATION_AGE_MS = 10_000L
+        private const val MAX_VHAL_OBSERVATION_AGE_MS = 10_000L
+        private const val SPEED_OBSERVATION = "PERF_VEHICLE_SPEED"
+        private const val BATTERY_OBSERVATION = "EV_BATTERY_LEVEL"
         // Throttle DataStore writes so we don't thrash on every sub-second tick.
         private const val PERSIST_DEBOUNCE_MS = 5_000L
 
@@ -157,8 +160,25 @@ class EvLearnedRateEstimator private constructor(
             vd: ControlMessage.VehicleData,
             nowElapsedMs: Long,
         ): String {
-            val batteryWh = vd.evBatteryLevelWh?.toInt() ?: return "skip:noBattery"
+            val batteryRaw = vd.evBatteryLevelWh ?: return "skip:noBattery"
+            if (!batteryRaw.isFinite() || batteryRaw < 0f) {
+                s.resetTransient()
+                return "skip:invalidBattery"
+            }
+            if (!validOptionalObservation(vd, BATTERY_OBSERVATION, nowElapsedMs)) {
+                s.resetTransient()
+                return "skip:invalidBatteryObservation"
+            }
+            val batteryWh = batteryRaw.toInt()
             val speedKmh = vd.speedKmh ?: 0f
+            if (!speedKmh.isFinite() || speedKmh < 0f) {
+                s.resetTransient()
+                return "skip:invalidSpeed"
+            }
+            if (!validOptionalObservation(vd, SPEED_OBSERVATION, nowElapsedMs)) {
+                s.resetTransient()
+                return "skip:invalidSpeedObservation"
+            }
             val charging = vd.evChargeRateW?.let { it.isFinite() && it > 0f } == true ||
                 vd.evChargeState == 2 || vd.chargePortConnected == true
 
@@ -252,6 +272,20 @@ class EvLearnedRateEstimator private constructor(
             val ageMs = nowElapsedMs - observedElapsedMs
             if (ageMs !in 0L..MAX_MOTOR_OBSERVATION_AGE_MS) return null
             return value
+        }
+
+        private fun validOptionalObservation(
+            vd: ControlMessage.VehicleData,
+            key: String,
+            nowElapsedMs: Long,
+        ): Boolean {
+            val observation = vd.evObservationMetadata[key] ?: return true
+            if (observation.status != null && observation.status != 0) return false
+            val observedElapsedMs = observation.timestampElapsedNanos
+                ?.div(1_000_000L)
+                ?: observation.receivedElapsedMs
+            if (observedElapsedMs == 0L && observation.timestampElapsedNanos == null) return true
+            return nowElapsedMs - observedElapsedMs in 0L..MAX_VHAL_OBSERVATION_AGE_MS
         }
     }
 
@@ -618,25 +652,26 @@ class EvLearnedRateEstimator private constructor(
     }
 
     private suspend fun persistNow(): Boolean {
-        val values = linkedMapOf<String, kotlinx.serialization.json.JsonElement>()
-        val newestFirst = states.entries.sortedWith(
-            compareByDescending<Map.Entry<String, VehicleState>> { it.value.lastUpdateMs }
-                .thenByDescending { it.key },
-        )
-        for ((k, s) in newestFirst) {
-            if (s.whPerKm <= 0f && s.sampleKm <= 0f) continue
-            val value = buildJsonObject {
-                put("whPerKm", s.whPerKm.toDouble())
-                put("sampleKm", s.sampleKm.toDouble())
-                put("lastUpdateMs", s.lastUpdateMs)
-            }
-            values[k] = value
-            if (JsonObject(values).toString().toByteArray(Charsets.UTF_8).size > config.maxJsonBytes) {
-                values.remove(k)
-            }
-        }
-        val encoded = JsonObject(values).toString()
         try {
+            val values = linkedMapOf<String, kotlinx.serialization.json.JsonElement>()
+            val newestFirst = states.entries.sortedWith(
+                compareByDescending<Map.Entry<String, VehicleState>> { it.value.lastUpdateMs }
+                    .thenByDescending { it.key },
+            )
+            for ((k, s) in newestFirst) {
+                if (!s.whPerKm.isFinite() || !s.sampleKm.isFinite() || s.sampleKm < 0f) continue
+                if (s.whPerKm <= 0f && s.sampleKm <= 0f) continue
+                val value = buildJsonObject {
+                    put("whPerKm", s.whPerKm.toDouble())
+                    put("sampleKm", s.sampleKm.toDouble())
+                    put("lastUpdateMs", s.lastUpdateMs)
+                }
+                values[k] = value
+                if (JsonObject(values).toString().toByteArray(Charsets.UTF_8).size > config.maxJsonBytes) {
+                    values.remove(k)
+                }
+            }
+            val encoded = JsonObject(values).toString()
             store.save(encoded)
             return true
         } catch (e: Exception) {

@@ -6,6 +6,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.advanceTimeBy
@@ -179,6 +180,111 @@ class EvLearnedRateEstimatorTest {
             ).startsWith("ok:bd"),
         )
         assertTrue(resultFor(7_200f, null).startsWith("ok:bd"))
+    }
+
+    @Test
+    fun `non-finite or negative speed and battery reset baselines before valid recovery`() {
+        val invalidValues = listOf(Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, -1f)
+        for (invalid in invalidValues) {
+            val speedState = EvLearnedRateEstimator.VehicleState()
+            tick(speedState, 50_000, 36f, nowMs = 1_000L)
+            val speedStatus = EvLearnedRateEstimator.applyTick(
+                speedState,
+                rawVehicle(49_998f, invalid),
+                2_000L,
+            )
+            assertEquals("skip:invalidSpeed", speedStatus)
+            assertEquals(0L, speedState.lastTickElapsedMs)
+            assertEquals(0f, speedState.windowDistanceKm, 0f)
+
+            val batteryState = EvLearnedRateEstimator.VehicleState()
+            tick(batteryState, 50_000, 36f, nowMs = 1_000L)
+            val batteryStatus = EvLearnedRateEstimator.applyTick(
+                batteryState,
+                rawVehicle(invalid, 36f),
+                2_000L,
+            )
+            assertEquals("skip:invalidBattery", batteryStatus)
+            assertEquals(0L, batteryState.lastTickElapsedMs)
+            assertEquals(0f, batteryState.windowDistanceKm, 0f)
+        }
+
+        val recovered = EvLearnedRateEstimator.VehicleState()
+        tick(recovered, 50_000, 36f, nowMs = 1_000L)
+        EvLearnedRateEstimator.applyTick(recovered, rawVehicle(49_998f, Float.NaN), 2_000L)
+        assertEquals("init", EvLearnedRateEstimator.applyTick(recovered, rawVehicle(49_998f, 36f), 3_000L))
+        val recoveredStatus = EvLearnedRateEstimator.applyTick(recovered, rawVehicle(49_988f, 36f), 8_000L)
+        assertTrue(recoveredStatus.startsWith("ok:bd"))
+    }
+
+    @Test
+    fun `explicitly unavailable or stale speed and battery observations reset baselines`() {
+        val state = EvLearnedRateEstimator.VehicleState()
+        tick(state, 50_000, 36f, nowMs = 1_000L)
+        val unavailable = rawVehicle(
+            49_998f,
+            36f,
+            observations = mapOf(
+                "PERF_VEHICLE_SPEED" to VehiclePropertyObservation(null, 2_000L, 1, "test"),
+            ),
+        )
+        assertEquals("skip:invalidSpeedObservation", EvLearnedRateEstimator.applyTick(state, unavailable, 2_000L))
+        assertEquals(0L, state.lastTickElapsedMs)
+
+        tick(state, 49_998, 36f, nowMs = 3_000L)
+        val staleBattery = rawVehicle(
+            49_996f,
+            36f,
+            observations = mapOf(
+                "EV_BATTERY_LEVEL" to VehiclePropertyObservation(null, -20_000L, 0, "test"),
+            ),
+        )
+        assertEquals("skip:invalidBatteryObservation", EvLearnedRateEstimator.applyTick(state, staleBattery, 4_000L))
+        assertEquals(0L, state.lastTickElapsedMs)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `invalid telemetry cannot kill actor and reset stop and valid recovery complete`() = runTest {
+        val store = FakeStore()
+        val estimator = EvLearnedRateEstimator.createForTest(
+            store,
+            this,
+            EvLearnedRateEstimator.Config(persistDebounceMs = 0L),
+        )
+        estimator.onVehicleTick(rawVehicle(50_000f, 36f), 1_000L)
+        estimator.onVehicleTick(rawVehicle(49_998f, Float.NaN), 2_000L)
+        estimator.onVehicleTick(rawVehicle(Float.POSITIVE_INFINITY, 36f), 3_000L)
+        estimator.onVehicleTick(rawVehicle(49_998f, 36f), 4_000L)
+        estimator.onVehicleTick(rawVehicle(49_988f, 36f), 9_000L)
+        estimator.awaitIdle()
+        runCurrent()
+        estimator.awaitIdle()
+
+        assertTrue(estimator.activeSnapshot.value.lastTickStatus.startsWith("ok:bd"))
+        assertEquals("COMPLETED", withTimeout(1_000L) { estimator.reset("Test|Model|2024") }.toString())
+        assertTrue(withTimeout(1_000L) { estimator.stop() }.finalSaveSucceeded)
+        assertTrue(Json.parseToJsonElement(store.raw).jsonObject.isEmpty())
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `non-finite in-memory state cannot kill persistence actor or hang stop`() = runTest {
+        val store = FakeStore()
+        val estimator = EvLearnedRateEstimator.createForTest(store, this)
+        estimator.awaitIdle()
+        @Suppress("UNCHECKED_CAST")
+        val states = estimator.javaClass.getDeclaredField("states").apply { isAccessible = true }
+            .get(estimator) as MutableMap<String, EvLearnedRateEstimator.VehicleState>
+        states["Test|Poison|2024"] = EvLearnedRateEstimator.VehicleState().apply {
+            whPerKm = Float.NaN
+            sampleKm = Float.POSITIVE_INFINITY
+        }
+
+        val result = withTimeout(1_000L) { estimator.stop() }
+
+        assertTrue(result.finalSaveSucceeded)
+        assertEquals("{}", store.raw)
     }
 
     @Test
@@ -499,6 +605,19 @@ class EvLearnedRateEstimatorTest {
             carModel = model,
             carYear = "2024",
         )
+
+    private fun rawVehicle(
+        batteryWh: Float,
+        speedKmh: Float,
+        observations: Map<String, VehiclePropertyObservation> = emptyMap(),
+    ) = ControlMessage.VehicleData(
+        evBatteryLevelWh = batteryWh,
+        speedKmh = speedKmh,
+        evObservationMetadata = observations,
+        carMake = "Test",
+        carModel = "Model",
+        carYear = "2024",
+    )
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
