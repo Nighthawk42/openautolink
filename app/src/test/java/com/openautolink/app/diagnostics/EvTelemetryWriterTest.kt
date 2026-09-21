@@ -5,6 +5,15 @@ import org.junit.Test
 import java.nio.file.Files
 
 class EvTelemetryWriterTest {
+    @Test fun closedWriterCannotConfirmAnUnadmittedSnapshot() {
+        val dir = Files.createTempDirectory("ev-closed").toFile()
+        val writer = EvTelemetryWriter(dir)
+        try {
+            writer.close()
+            assertFalse(writer.flushForUpload(100, mapOf("type" to "upload_snapshot")))
+        } finally { dir.deleteRecursively() }
+    }
+
     @Test fun blockedDiskNeverBlocksProducerAndOverflowIsCounted() {
         val dir = Files.createTempDirectory("ev-blocked").toFile()
         val entered = java.util.concurrent.CountDownLatch(1)

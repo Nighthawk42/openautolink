@@ -389,15 +389,9 @@ class SessionManager(
      */
     private fun bindSessionCollectors(session: AasdkSession) {
         sessionCollectors?.cancel()
-        EvTelemetryRecorder.instance.session(session.evTelemetryToken)
+        val telemetryToken = session.evTelemetryToken
+        EvTelemetryRecorder.instance.session(telemetryToken)
         sessionCollectors = scope.launch {
-            launch {
-                session.connectionState.collect { state ->
-                    if (state != ConnectionState.STREAMING) {
-                        EvTelemetryRecorder.instance.gap(session.evTelemetryToken, "transport_${state.name}")
-                    }
-                }
-            }
             launch {
                 val ctx = context ?: return@launch
                 val prefs = AppPreferences.getInstance(ctx)
@@ -410,7 +404,7 @@ class SessionManager(
                     evTelemetryRequested = listOf("enabled", "mode", "drivingWhPerKm", "multiplierPct",
                         "auxWhPerKmX10", "aeroCoefX100", "reservePct", "maxChargeKw", "maxDischargeKw", "useEpaBaseline")
                         .zip(values).toMap()
-                    EvTelemetryRecorder.instance.event(session.evTelemetryToken, "requested_settings",
+                    EvTelemetryRecorder.instance.event(telemetryToken, "requested_settings",
                         mapOf("requested" to evTelemetryRequested))
                 }
             }
@@ -436,7 +430,6 @@ class SessionManager(
             }
             launch {
                 session.vehicleEnergyForecast.collect { forecast ->
-                    EvTelemetryRecorder.instance.forecast(session.evTelemetryToken, forecast)
                     forecastExpiryJob?.cancel()
                     _vehicleEnergyForecast.value = forecast
                     ClusterNavigationState.vehicleEnergyForecast.value = forecast
@@ -1921,6 +1914,7 @@ class SessionManager(
 
         ensureVideoDecoder()
         ensureAudioPlayer()
+        session.beginEvTelemetryGeneration()
         bindSessionCollectors(session)
         OalLog.i(TAG, "Native session dependencies ready: " +
                 "decoder=${_videoDecoder != null} surface=${lastKnownSurface != null} " +
@@ -3176,7 +3170,6 @@ class SessionManager(
                 lastVideoFrameArrivedMs = SystemClock.elapsedRealtime() + VIDEO_STALL_WARMUP_MS
             }
             is ControlMessage.PhoneDisconnected -> {
-                EvTelemetryRecorder.instance.gap(sourceSession.evTelemetryToken, "phone_disconnected")
                 _remoteDiagnostics?.log(DiagnosticLevel.INFO, "session", "Phone disconnected: ${message.reason}")
                 _gnssForwarder?.stop()
                 _vehicleDataForwarder?.stop()
@@ -3227,14 +3220,12 @@ class SessionManager(
                 }
             }
             is ControlMessage.NavState -> {
-                EvTelemetryRecorder.instance.navigation(sourceSession.evTelemetryToken, message)
                 _navigationDisplay.onNavState(message)
                 _navigationDisplay.currentManeuver.value?.let { maneuver ->
                     ClusterNavigationState.update(maneuver)
                 }
             }
             is ControlMessage.NavStateClear -> {
-                EvTelemetryRecorder.instance.navigation(sourceSession.evTelemetryToken, null)
                 _navigationDisplay.clear()
                 _vehicleEnergyForecast.value = null
                 ClusterNavigationState.clear()

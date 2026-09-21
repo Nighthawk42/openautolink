@@ -511,14 +511,20 @@ class VehicleDataForwarderImpl(
     }
 
     /** Create ONE shared callback proxy for all properties (app_v1 pattern). */
+    private var registrationGeneration = 0L
+
+    @Synchronized
     private fun createCallbackProxy(callbackInterface: Class<*>): Any {
+        val generation = ++registrationGeneration
         return java.lang.reflect.Proxy.newProxyInstance(
             callbackInterface.classLoader,
             arrayOf(callbackInterface),
         ) { proxy, method, args ->
             when (method.name) {
                 "onChangeEvent" -> {
-                    args?.firstOrNull()?.let(::handleChangeEvent)
+                    synchronized(this) {
+                        if (generation == registrationGeneration) args?.firstOrNull()?.let(::handleChangeEvent)
+                    }
                     null
                 }
                 "onErrorEvent" -> {
@@ -608,9 +614,10 @@ class VehicleDataForwarderImpl(
             // Observe raw availability without filtering currentValues or changing prediction.
             // Reflection failures are independent: a missing timestamp must not hide status.
             val receivedElapsedMs = SystemClock.elapsedRealtime()
+            val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
             VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let { name ->
                 evObservationMetadata[name] = VehiclePropertyObservation(
-                    timestampElapsedNanos = runCatching {
+                    timestampElapsedNanos = if (value == null) null else runCatching {
                         propertyValue.javaClass.getMethod("getTimestamp").invoke(propertyValue) as? Long
                     }.getOrNull(),
                     receivedElapsedMs = receivedElapsedMs,
@@ -619,7 +626,7 @@ class VehicleDataForwarderImpl(
                     }.getOrNull(),
                 )
             }
-            val value = propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) ?: return
+            if (value == null) return
             DiagnosticLog.d("vhal", "prop 0x${propertyId.toString(16)}: $value")
 
             // Detect ignition state transitions to ON(4)/START(5) for wake signaling
@@ -900,6 +907,7 @@ class VehicleDataForwarderImpl(
 
     @Synchronized
     private fun cleanup() {
+        registrationGeneration++
         historyPollerJob?.cancel()
         historyPollerJob = null
         latestMotorPowerW = null

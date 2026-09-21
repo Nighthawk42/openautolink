@@ -63,8 +63,11 @@ class EvTelemetryIntegrationTest {
     @Test fun captureHooksExistWithoutActivatingEstimatorObserver() {
         val manager = source("session/SessionManager.kt")
         assertTrue(manager.contains("EvTelemetryRecorder.instance.vehicle("))
-        assertTrue(manager.contains("EvTelemetryRecorder.instance.forecast("))
-        assertTrue(manager.contains("EvTelemetryRecorder.instance.navigation("))
+        val native = source("transport/aasdk/AasdkSession.kt")
+        assertTrue(native.contains("EvTelemetryRecorder.instance.forecast("))
+        assertTrue(native.contains("EvTelemetryRecorder.instance.navigation("))
+        assertFalse(manager.contains("EvTelemetryRecorder.instance.forecast("))
+        assertFalse(manager.contains("EvTelemetryRecorder.instance.navigation("))
         assertEquals(2, Regex("observeEvTuningPrefs\\(").findAll(manager).count()) // definition + existing dormant caller
         val vm = source("ui/projection/ProjectionViewModel.kt")
         assertTrue(vm.contains("EvTelemetryRecorder.instance.enable("))

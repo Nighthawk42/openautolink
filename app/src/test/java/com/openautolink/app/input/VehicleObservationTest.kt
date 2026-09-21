@@ -6,6 +6,29 @@ import org.junit.Assert.assertNotNull
 import org.junit.Test
 
 class VehicleObservationTest {
+    interface Callback { fun onChangeEvent(value: Any) }
+    @Test fun retiredProxyCannotOverwriteNewRegistration() {
+        val f = forwarder()
+        val proxy = f.javaClass.getDeclaredMethod("createCallbackProxy", Class::class.java)
+            .apply { isAccessible = true }.invoke(f, Callback::class.java) as Callback
+        f.javaClass.getDeclaredMethod("cleanup").apply { isAccessible = true }.invoke(f)
+        @Suppress("UNCHECKED_CAST")
+        val tracked = f.javaClass.getDeclaredField("trackedPropertyIds").apply { isAccessible = true }.get(f) as MutableSet<Int>
+        tracked.add(batteryId)
+        event(f, PropertyValue(batteryId, 49000f, 300L, 0))
+        proxy.onChangeEvent(PropertyValue(batteryId, 50000f, 100L, 0))
+        assertEquals(49000f, snapshot(f).evBatteryLevelWh)
+        assertEquals(300L, snapshot(f).evObservationMetadata.getValue("EV_BATTERY_LEVEL").timestampElapsedNanos)
+    }
+    @Test fun nullAvailableValueDoesNotRefreshNumericProvenance() {
+        val f = forwarder()
+        event(f, PropertyValue(batteryId, 50000f, 100L, 0))
+        event(f, PropertyValue(batteryId, null, 200L, 0))
+        val m = snapshot(f).evObservationMetadata.getValue("EV_BATTERY_LEVEL")
+        assertEquals(50000f, snapshot(f).evBatteryLevelWh)
+        org.junit.Assert.assertFalse(m.status == 0 && m.timestampElapsedNanos == 200L)
+    }
+
     private val batteryId = 0x11600309
 
     class PropertyValue(private val id: Int, private val value: Any?, private val timestamp: Long, private val status: Int) {
@@ -134,7 +157,7 @@ class VehicleObservationTest {
         val data = snapshot(forwarder)
         assertEquals(12f, data.evBatteryLevelWh)
         assertEquals(1, data.evObservationMetadata.getValue("EV_BATTERY_LEVEL").status)
-        assertEquals(200L, data.evObservationMetadata.getValue("EV_BATTERY_LEVEL").timestampElapsedNanos)
+        assertEquals(null, data.evObservationMetadata.getValue("EV_BATTERY_LEVEL").timestampElapsedNanos)
     }
 
     @Test fun unknownPropertyDoesNotAddObservation() {

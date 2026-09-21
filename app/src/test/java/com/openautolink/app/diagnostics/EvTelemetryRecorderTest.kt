@@ -7,6 +7,62 @@ import com.openautolink.app.transport.ControlMessage
 import com.openautolink.app.transport.VehiclePropertyObservation
 
 class EvTelemetryRecorderTest {
+    @Test fun receiptFromPreviousCaptureCannotEnterNewCapture() {
+        val dir = Files.createTempDirectory("ev-capture-generation").toFile()
+        val r = EvTelemetryRecorder({1000}, {1000}, "b")
+        try {
+            r.session("s"); r.enable(dir)
+            // Capture at producer receipt, before any delayed delivery.
+            val generation = r.captureGeneration
+            r.disable(); r.enable(dir)
+            r.event("s", "retired_capture", receiptGeneration = generation)
+            r.event("s", "current_capture", receiptGeneration = r.captureGeneration)
+            assertTrue(r.flushForUpload())
+            val text = dir.listFiles()!!.joinToString { it.readText() }
+            assertFalse(text.contains("retired_capture"))
+            assertTrue(text.contains("current_capture"))
+        } finally { r.disable(); r.flushForUpload(); dir.deleteRecursively() }
+    }
+
+    @Test fun disconnectedUploadDoesNotReuseOldParkSnapshot() {
+        val dir = Files.createTempDirectory("ev-gap").toFile()
+        val r = EvTelemetryRecorder({1000}, {1000}, "b")
+        try {
+            r.session("s"); r.enable(dir)
+            r.vehicle("s", ControlMessage.VehicleData(gearRaw = 4))
+            r.gap("s", "disconnect")
+            assertTrue(r.flushForUpload())
+            val snapshot = dir.listFiles()!!.flatMap { it.readLines() }.last { it.contains("upload_snapshot") }
+            assertTrue(snapshot.contains("\"vehicle\":null"))
+            assertTrue(snapshot.contains("\"parkSnapshot\":false"))
+        } finally { r.disable(); r.flushForUpload(); dir.deleteRecursively() }
+    }
+
+    @Test fun saturatedQueueNeverConfirmsMissingUploadSnapshot() {
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val dir = object : java.io.File(Files.createTempDirectory("ev-full").toFile().path) {
+            override fun isDirectory(): Boolean {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                return super.isDirectory()
+            }
+        }
+        val r = EvTelemetryRecorder({1000}, {1000}, "b")
+        r.session("s"); r.enable(dir)
+        assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+        repeat(256) { r.event("s", "queued") }
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<Boolean> { r.flushForUpload() }
+            Thread.sleep(100)
+            release.countDown()
+            val confirmed = result.get(3, java.util.concurrent.TimeUnit.SECONDS)
+            val present = dir.listFiles()!!.any { it.readText().contains("upload_snapshot") }
+            assertTrue("Cannot confirm a missing snapshot", !confirmed || present)
+        } finally { release.countDown(); r.disable(); r.flushForUpload(); executor.shutdown(); dir.deleteRecursively() }
+    }
+
     @Test fun consentStopRejectsNewCallbacksAndRestartBeginsNewDriveEpoch() {
         val dir = Files.createTempDirectory("ev-consent").toFile()
         var now = 1000L

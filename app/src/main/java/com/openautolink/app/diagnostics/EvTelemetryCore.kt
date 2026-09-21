@@ -18,7 +18,8 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
     private var forecastMs = -100000L
     private var remainingM: Int? = null
     private val salt = java.util.UUID.randomUUID().toString()
-    private fun resetRoute() { routeEpoch++; initialWh = null; latestWh = null; remainingM = null; forecastMs = -100000 }
+    private var routeStartedMs = Long.MIN_VALUE
+    private fun resetRoute(elapsedMs: Long) { routeStartedMs = elapsedMs; routeEpoch++; initialWh = null; latestWh = null; remainingM = null; forecastMs = -100000 }
     fun navigation(destination: String?, distanceM: Int?, etaSec: Long?, clear: Boolean,
                    elapsedMs: Long, wallMs: Long, reroute: Boolean = false): Map<String, Any?> {
         val hash = destination?.takeIf { it.isNotBlank() }?.let {
@@ -26,7 +27,7 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
                 .take(12).joinToString("") { b -> "%02x".format(b) }
         }
         val changed = hash != null && hash != destinationHash
-        if (clear || changed || reroute) resetRoute()
+        if (clear || changed || reroute) resetRoute(elapsedMs)
         if (clear) destinationHash = null else if (hash != null) destinationHash = hash
         navMs = elapsedMs
         remainingM = if (clear) null else distanceM
@@ -35,6 +36,8 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
     }
     fun forecast(arrivalWh: Int?, distanceM: Int?, etaSec: Int?, quality: Int,
                  elapsedMs: Long, wallMs: Long, receivedAtElapsedMs: Long = elapsedMs): Map<String, Any?> {
+        if (receivedAtElapsedMs < routeStartedMs) return record("forecast_uncorrelated", elapsedMs, wallMs) +
+            mapOf("receivedAtElapsedMs" to receivedAtElapsedMs, "reason" to "pre_route_epoch")
         if (initialWh == null && arrivalWh != null) initialWh = arrivalWh
         latestWh = arrivalWh
         forecastMs = receivedAtElapsedMs
@@ -47,13 +50,15 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
     private var netWh = 0.0
     private var energyAnchor: EvTelemetrySample? = null
     private var energyCovered = true
+    private var batteryCovered = true
     private var uncoveredSpeedIntervals = 0L
     fun startSession(token: String, elapsedMs: Long, wallMs: Long): Map<String, Any?> {
         session = token
         previous = null
         energyAnchor = null
+        batteryCovered = true
         energyCovered = true
-        resetRoute()
+        resetRoute(elapsedMs)
         destinationHash = null
         drive++
         distanceM = 0.0
@@ -66,9 +71,10 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
         if (token != session) return null
         previous = null
         energyAnchor = null
+        batteryCovered = true
         energyCovered = true
         gaps++
-        resetRoute()
+        resetRoute(elapsedMs)
         destinationHash = null
         drive++
         return record("gap", elapsedMs, wallMs) + ("reason" to reason)
@@ -88,33 +94,39 @@ class EvTelemetryCore(private val bootId: String, private val processId: String)
                     distanceM += (p.speedKmh + sample.speedKmh) / 2.0 / 3.6 *
                         (sample.speedObservedMs - p.speedObservedMs).coerceAtMost(dt) / 1000.0
                 }
-            } else { gaps++; drive++; energyAnchor = null; resetRoute(); destinationHash = null }
+            } else { gaps++; drive++; energyAnchor = null; resetRoute(sample.elapsedMs); destinationHash = null }
         }
         if (!intervalCovered) uncoveredSpeedIntervals++
         energyCovered = energyCovered && intervalCovered
         var completedEnergyCoverage: Boolean? = null
+        var completedBatteryCoverage: Boolean? = null
         if (sample.batteryWh != null && sample.batteryWh.isFinite() && sample.batteryWh >= 0 &&
             sample.batteryObservedMs != null && fresh(sample.batteryObservedMs, sample.elapsedMs)) {
             val anchor = energyAnchor
             if (anchor != null && sample.batteryObservedMs > anchor.batteryObservedMs!!) {
                 netWh += anchor.batteryWh!! - sample.batteryWh
                 completedEnergyCoverage = energyCovered
+                completedBatteryCoverage = batteryCovered
+                batteryCovered = true
                 energyAnchor = sample
                 energyCovered = true
             } else if (anchor == null) {
+                batteryCovered = true
                 energyAnchor = sample
                 energyCovered = true
             }
-        }
+        } else { batteryCovered = false }
         previous = sample
         return record("vehicle", sample.elapsedMs, sample.wallMs) + mapOf(
             "integratedDistanceM" to distanceM, "netPackUsedWh" to netWh,
             "energyWindowSpeedCovered" to completedEnergyCoverage,
+            "energyWindowBatteryCovered" to completedBatteryCoverage,
             "uncoveredSpeedIntervals" to uncoveredSpeedIntervals,
             "arrivalCandidate" to (destinationHash != null && initialWh != null && latestWh != null &&
                 sample.elapsedMs - navMs in 0..10000 && sample.elapsedMs - forecastMs in 0..10000 &&
                 remainingM != null && remainingM!! in 0..150 && sample.parked &&
                 fresh(sample.speedObservedMs, sample.elapsedMs) && sample.speedKmh != null && sample.speedKmh in 0.0..1.0 &&
+                sample.batteryWh != null && sample.batteryWh.isFinite() && sample.batteryWh >= 0 &&
                 fresh(sample.batteryObservedMs, sample.elapsedMs)),
             "arrivalConfirmed" to false)
     }

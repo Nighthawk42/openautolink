@@ -68,13 +68,25 @@ class EvTelemetryWriter(
             }
         }
     }
-    fun flushForUpload(timeoutMs: Long = 2000): Boolean {
-        if (closed) return queue.isEmpty() && errors.get() == 0L
+    fun flushForUpload(timeoutMs: Long = 2000, snapshot: Map<String, Any?>? = null): Boolean {
+        // A closed writer cannot admit a required snapshot, even if its queue drained.
+        // An empty queue alone also does not prove an in-flight append has finished.
+        if (closed) return snapshot == null && !worker.isAlive && errors.get() == 0L
         val done = CountDownLatch(1)
         val start = System.nanoTime()
-        val accepted = queue.offer({ done.countDown() }, timeoutMs.coerceAtLeast(0), TimeUnit.MILLISECONDS)
+        val snapshotWritten = java.util.concurrent.atomic.AtomicBoolean(snapshot == null)
+        val accepted = queue.offer({
+            try {
+                if (snapshot != null) {
+                    val before = dropped.get()
+                    append(snapshot + mapOf("dropped" to before, "writerErrors" to errors.get(),
+                        "retentionEvictedFiles" to evictedFiles.get()))
+                    snapshotWritten.set(dropped.get() == before)
+                }
+            } finally { done.countDown() }
+        }, timeoutMs.coerceAtLeast(0), TimeUnit.MILLISECONDS)
         val left = timeoutMs - (System.nanoTime() - start) / 1000000
-        return accepted && done.await(left.coerceAtLeast(0), TimeUnit.MILLISECONDS) && errors.get() == 0L
+        return accepted && done.await(left.coerceAtLeast(0), TimeUnit.MILLISECONDS) && errors.get() == 0L && snapshotWritten.get()
     }
     override fun close() { closed = true }
 }

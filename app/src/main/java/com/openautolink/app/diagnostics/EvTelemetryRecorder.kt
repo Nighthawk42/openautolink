@@ -24,6 +24,9 @@ class EvTelemetryRecorder(
     private var token = "none"
     private var writer: EvTelemetryWriter? = null
     private var capture = false
+    /** Stamp before deferring work; default arguments are for synchronous receipt callers only. */
+    @Volatile var captureGeneration = 0L
+        private set
     private var directory: File? = null
     private var lastVehicle: Map<String, Any?>? = null
     private var lastDropped = 0L
@@ -39,34 +42,40 @@ class EvTelemetryRecorder(
             writer = EvTelemetryWriter(directory)
             this.directory = directory
         }
+        captureGeneration++
         capture = true
         lastDropped = 0
         lastVehicle = null
         lastEdge = null
         emit(core.startSession(token, elapsed(), wall()) + mapOf("type" to "consent_start", "sourceAvailability" to "awaiting_vehicle_observations"))
     }
+    /** Stop NEW admission immediately. Previously consented entries may finish normal disk flushing. */
     @Synchronized fun disable() {
         emit(core.gap(token, "consent_stop", elapsed(), wall()))
         capture = false
+        captureGeneration++
         lastVehicle = null
     }
     @Synchronized fun session(sessionToken: String) {
+        captureGeneration++
         token = sessionToken
         lastVehicle = null
         lastEdge = null
         emit(core.startSession(token, elapsed(), wall()))
     }
-    @Synchronized fun gap(sessionToken: String, reason: String) {
-        if (sessionToken != token) return
+    @Synchronized fun gap(sessionToken: String, reason: String, receiptGeneration: Long = captureGeneration) {
+        if (receiptGeneration != captureGeneration || sessionToken != token) return
         emit(core.gap(sessionToken, reason, elapsed(), wall()))
+        lastVehicle = null
+        lastEdge = null
     }
-    @Synchronized fun event(sessionToken: String, type: String, fields: Map<String, Any?> = emptyMap()) {
-        if (sessionToken != token || !capture) return
+    @Synchronized fun event(sessionToken: String, type: String, fields: Map<String, Any?> = emptyMap(), receiptGeneration: Long = captureGeneration) {
+        if (receiptGeneration != captureGeneration || sessionToken != token || !capture) return
         emit(core.event(type, elapsed(), wall()) + fields)
     }
-    @Synchronized fun vehicle(sessionToken: String, vd: ControlMessage.VehicleData, effective: Map<String, Any?> = emptyMap()) {
+    @Synchronized fun vehicle(sessionToken: String, vd: ControlMessage.VehicleData, effective: Map<String, Any?> = emptyMap(), receiptGeneration: Long = captureGeneration) {
         val sink = writer ?: return
-        if (!capture || sessionToken != token) return
+        if (receiptGeneration != captureGeneration || !capture || sessionToken != token) return
         val now = elapsed()
         if (sink.dropped.get() != lastDropped) {
             lastDropped = sink.dropped.get()
@@ -106,13 +115,13 @@ class EvTelemetryRecorder(
             lastEmissionMs = now
         }
     }
-    @Synchronized fun navigation(sessionToken: String, nav: ControlMessage.NavState?, reroute: Boolean = false) {
-        if (sessionToken != token || !capture) return
+    @Synchronized fun navigation(sessionToken: String, nav: ControlMessage.NavState?, reroute: Boolean = false, receiptGeneration: Long = captureGeneration) {
+        if (receiptGeneration != captureGeneration || sessionToken != token || !capture) return
         emit(core.navigation(nav?.destination, nav?.destDistanceMeters, nav?.timeToArrivalSeconds,
             nav == null && !reroute, elapsed(), wall(), reroute))
     }
-    @Synchronized fun forecast(sessionToken: String, forecast: VehicleEnergyForecast?) {
-        if (sessionToken != token || !capture) return
+    @Synchronized fun forecast(sessionToken: String, forecast: VehicleEnergyForecast?, receiptGeneration: Long = captureGeneration) {
+        if (receiptGeneration != captureGeneration || sessionToken != token || !capture) return
         val stop = forecast?.energyAtNextStop
         emit(core.forecast(stop?.arrivalBatteryEnergyWh, stop?.distanceMeters, stop?.timeToArrivalSeconds,
             forecast?.forecastQuality ?: 0, elapsed(), wall(), forecast?.receivedAtElapsedMs ?: elapsed()) + mapOf(
@@ -120,21 +129,20 @@ class EvTelemetryRecorder(
             "distanceToEmptyM" to forecast?.distanceToEmpty?.distanceMeters,
             "nextStopMayBeCharging" to (forecast?.nextChargingStop != null)))
     }
-    @Synchronized fun nativeModel(sessionToken: String, tag: String, line: String) {
-        if (sessionToken != token || !capture || tag != "vem" || !line.startsWith("VEM session=")) return
+    @Synchronized fun nativeModel(sessionToken: String, tag: String, line: String, receiptGeneration: Long = captureGeneration) {
+        if (receiptGeneration != captureGeneration || sessionToken != token || !capture || tag != "vem" || !line.startsWith("VEM session=")) return
         emit(core.event("native_model", elapsed(), wall()) + ("line" to line.take(500)))
     }
     fun flushForUpload(timeoutMs: Long = 2000): Boolean {
-        val sink = synchronized(this) {
+        val pending = synchronized(this) {
             val target = writer ?: return true
-            emit(core.event("upload_snapshot", elapsed(), wall()) + mapOf(
+            val snapshot = if (capture) core.event("upload_snapshot", elapsed(), wall()) + mapOf(
                 "vehicle" to lastVehicle, "parkSnapshot" to (lastVehicle?.get("gearRaw") == 4),
-                "snapshotIsCached" to true, "dropped" to target.dropped.get(), "writerErrors" to target.errors.get(),
-                "retentionEvictedFiles" to target.evictedFiles.get()))
-            target
+                "snapshotIsCached" to true) else null
+            target to snapshot
         }
-        // Waiting for disk must not hold the sensor producer's monitor.
-        return sink.flushForUpload(timeoutMs)
+        // Snapshot admission and completion are ONE queued task; no producer monitor during IO.
+        return pending.first.flushForUpload(timeoutMs, pending.second)
     }
     private fun emit(record: Map<String, Any?>?) { if (capture && record != null) writer?.offer(record) }
 }

@@ -4,6 +4,32 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class EvTelemetryCoreTest {
+    @Test fun missingBatteryCannotQualifyAndBreaksBatteryCoverage() {
+        val c = EvTelemetryCore("b", "p")
+        c.startSession("s", 0, 0)
+        c.navigation("stop", 10, 1, false, 1000, 1000)
+        c.forecast(40000, 10, 1, 2, 1000, 1000)
+        c.vehicle(EvTelemetrySample(1000, 1000, 0.0, 50000.0, 1000, 1000, true))
+        val missing = c.vehicle(EvTelemetrySample(2000, 2000, 0.0, null, 2000, 2000, true))
+        assertEquals(false, missing["arrivalCandidate"])
+        val after = c.vehicle(EvTelemetrySample(3000, 3000, 0.0, 49000.0, 3000, 3000, true))
+        assertEquals(false, after["energyWindowBatteryCovered"])
+    }
+
+    @Test fun delayedPreEpochForecastCannotSeedNewRouteInEitherOrder() {
+        for (delayed in listOf(false, true)) {
+            val c = EvTelemetryCore("b", "p")
+            c.startSession("s", 0, 0)
+            c.navigation("old", 10000, 100, false, 1000, 1000)
+            if (!delayed) c.forecast(40000, 10000, 100, 2, 1000, 1000, 1000)
+            c.navigation("new", 10, 1, false, 2000, 2000)
+            if (delayed) c.forecast(40000, 10000, 100, 2, 2000, 2000, 1000)
+            val v = c.vehicle(EvTelemetrySample(2000, 2000, 0.0, 39000.0, 2000, 2000, true))
+            assertNull(v["initialArrivalWh"])
+            assertEquals(false, v["arrivalCandidate"])
+        }
+    }
+
     @Test fun emptyForecastInvalidatesArrivalCandidateWithoutLosingInitialForecast() {
         val core = EvTelemetryCore("boot", "process")
         core.startSession("one", 0, 0)
