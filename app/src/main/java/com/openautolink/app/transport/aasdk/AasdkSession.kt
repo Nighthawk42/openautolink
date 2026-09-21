@@ -1150,11 +1150,23 @@ class AasdkSession(
     }
 
     override fun onNavigationStatus(status: Int) {
-        com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.event(evTelemetryToken, "navigation_status", mapOf("status" to status))
-        if (status != 1) com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken, null, reroute = status == 3)
+        val meaning = NavigationStatusSemantics.fromWire(status)
+        val recorder = com.openautolink.app.diagnostics.EvTelemetryRecorder.instance
+        recorder.event(evTelemetryToken, "navigation_status", mapOf(
+            "status" to status,
+            "statusName" to meaning.name,
+        ))
+        when (meaning.routeAction) {
+            NavigationRouteAction.ACTIVATE -> recorder.navigationLifecycle(evTelemetryToken, active = true)
+            NavigationRouteAction.REROUTE -> recorder.navigation(evTelemetryToken, null, reroute = true)
+            NavigationRouteAction.CLEAR -> {
+                recorder.navigationLifecycle(evTelemetryToken, active = false)
+                recorder.navigation(evTelemetryToken, null)
+            }
+        }
         scope.launch {
-            com.openautolink.app.diagnostics.DiagnosticLog.i("nav", "Status: $status (${if (status == 1) "ACTIVE" else "INACTIVE"})")
-            if (status != 1) { // not ACTIVE
+            com.openautolink.app.diagnostics.DiagnosticLog.i("nav", "Status: $status (${meaning.name})")
+            if (meaning.routeAction != NavigationRouteAction.ACTIVATE) {
                 _vehicleEnergyForecast.value = null
                 _controlMessages.emit(ControlMessage.NavStateClear)
             }
@@ -1202,8 +1214,8 @@ class AasdkSession(
         // Capture before any coroutine/collector queue: consent and route belong to receipt.
         com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.navigation(evTelemetryToken,
             ControlMessage.NavState(maneuver, distanceMeters, road, etaSeconds,
-                destination = destination, destDistanceMeters = destDistanceMeters.takeIf { it >= 0 },
-                timeToArrivalSeconds = timeToArrivalSeconds))
+                destination = destination, destDistanceMeters = destDistanceMeters.takeIf { it > 0 },
+                timeToArrivalSeconds = timeToArrivalSeconds.takeIf { it > 0 }))
         scope.launch {
             val iconBase64 = iconPng?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
             val parsedLanes = parseLanesString(lanes)
