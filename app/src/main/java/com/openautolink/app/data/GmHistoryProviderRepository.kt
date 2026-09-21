@@ -24,15 +24,23 @@ import com.openautolink.app.diagnostics.OalLog
  *   table  HistoricalData(id INT PK, value FLOAT, history_type INT)
  *          inserted in chronological order, ring-buffered to 6000 rows
  *   table  HistoryTimestamp(id INT PK, timestamp LONG)
- *          one row per history_type — latest insert timestamp in ms
+ *          one row per history_type — latest VHAL elapsed timestamp divided by 1e6
  *
  * Query selection arg must be `"SELECTION_HISTORY_DATA"` (values) or
- * `"SELECTION_HISTORY_TIMESTAMP"` (epoch-ms of latest sample). Cursors
+ * `"SELECTION_HISTORY_TIMESTAMP"` (elapsed-ms of latest sample). Cursors
  * have a single column named `value` or `timestamp`.
  */
 object GmHistoryProviderRepository {
 
     private const val TAG = "GmHistory"
+
+    data class LatestSample(
+        val value: Float,
+        val sourceElapsedMs: Long,
+    ) {
+        val sourceElapsedNanos: Long
+            get() = sourceElapsedNanos(sourceElapsedMs)
+    }
 
     enum class Series(val path: String) {
         E_POWER("history/e_power"),
@@ -59,7 +67,7 @@ object GmHistoryProviderRepository {
         if (disabled) return false
         available?.let { return it }
         val ok = try {
-            queryLatest(context, Series.E_BATTERY) != null
+            queryLatestSample(context, Series.E_BATTERY) != null
         } catch (_: Throwable) { false }
         available = ok
         if (!ok) {
@@ -74,16 +82,20 @@ object GmHistoryProviderRepository {
     fun disable() { disabled = true; available = false }
 
     /** Latest motor power in W, or null when provider is unavailable / empty. */
-    fun latestMotorPowerW(context: Context): Float? = queryLatest(context, Series.E_POWER)
+    fun latestMotorPowerW(context: Context): Float? = latestMotorPowerSample(context)?.value
+
+    /** Value and source timestamp from one stable provider generation. */
+    fun latestMotorPowerSample(context: Context): LatestSample? =
+        queryLatestSample(context, Series.E_POWER)
 
     /** Latest motor torque in Nm, or null. */
-    fun latestMotorTorqueNm(context: Context): Float? = queryLatest(context, Series.E_TORQUE)
+    fun latestMotorTorqueNm(context: Context): Float? = queryLatestSample(context, Series.E_TORQUE)?.value
 
     /** Latest battery level reading, or null (unit per GM HAL). */
-    fun latestBatteryLevel(context: Context): Float? = queryLatest(context, Series.E_BATTERY)
+    fun latestBatteryLevel(context: Context): Float? = queryLatestSample(context, Series.E_BATTERY)?.value
 
     /**
-     * Latest sample timestamp (epoch-ms) for the series. The HistoryTimestamp
+     * Latest sample timestamp in the elapsed-realtime millisecond domain. The HistoryTimestamp
      * table only stores the most recent timestamp per type, so this is the
      * time of the LATEST insert — not per-sample.
      */
@@ -95,6 +107,25 @@ object GmHistoryProviderRepository {
                 if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
             }
         } catch (_: Throwable) { null }
+    }
+
+    internal fun sourceElapsedNanos(sourceElapsedMs: Long): Long =
+        Math.multiplyExact(sourceElapsedMs, 1_000_000L)
+
+    /**
+     * Values and latest timestamps use separate cursor modes. Bracket the value
+     * query and accept it only when both timestamps match, so a concurrent insert
+     * cannot pair a value with the wrong timestamp. Unknown timestamps fail closed.
+     */
+    private fun queryLatestSample(context: Context, series: Series): LatestSample? {
+        val before = latestTimestampMs(context, series)?.takeIf { it > 0L } ?: return null
+        val value = queryLatest(context, series)?.takeIf { it.isFinite() } ?: return null
+        val after = latestTimestampMs(context, series)?.takeIf { it > 0L } ?: return null
+        if (before != after) return null
+        return runCatching {
+            sourceElapsedNanos(after)
+            LatestSample(value, after)
+        }.getOrNull()
     }
 
     /**

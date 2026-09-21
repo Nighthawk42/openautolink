@@ -212,8 +212,14 @@ class EvEnergyModelViewModel(app: Application) : AndroidViewModel(app) {
         // Reset the active key (whatever the estimator last saw); falls back
         // to "all" if nothing has been observed yet.
         val activeKey = learnedEstimator.activeSnapshot.value.key
-        learnedEstimator.reset(activeKey)
-        _events.value = "Learned rate reset"
+        viewModelScope.launch {
+            _events.value = when (learnedEstimator.reset(activeKey)) {
+                EvLearnedRateEstimator.ResetResult.COMPLETED -> "Learned rate reset"
+                EvLearnedRateEstimator.ResetResult.PERSIST_PENDING -> "Learned rate cleared; save will retry"
+                EvLearnedRateEstimator.ResetResult.REJECTED_BUSY -> "Reset busy; try again"
+                EvLearnedRateEstimator.ResetResult.REJECTED_STOPPING -> "Reset unavailable while stopping"
+            }
+        }
     }
 
     // ── Phase 2 / 2b ────────────────────────────────────────────────

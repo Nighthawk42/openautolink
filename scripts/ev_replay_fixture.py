@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Build a deterministic, privacy-safe EV semantic replay fixture from an upload ZIP.
+"""Build a deterministic, pseudonymized EV semantic replay fixture from an upload ZIP.
 
 The private archive contains output from the old recorder. This tool discards old
 computed outputs and retains only fields that can be replayed as inputs to the
-current EvTelemetryRecorder/EvTelemetryCore semantics.
+current EvTelemetryRecorder/EvTelemetryCore semantics. The allowlist removes
+direct identifiers but retained cadence and value sequences still carry residual
+within-fixture linkage risk; see docs/ev-real-upload-replay.md.
 """
 
 from __future__ import annotations

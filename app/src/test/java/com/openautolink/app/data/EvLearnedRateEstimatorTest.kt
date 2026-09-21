@@ -145,9 +145,13 @@ class EvLearnedRateEstimatorTest {
 
     @Test
     fun `motor power requires finite fresh available observation coverage`() {
-        fun resultFor(power: Float, observation: VehiclePropertyObservation?): String {
+        fun resultFor(
+            power: Float,
+            observation: VehiclePropertyObservation?,
+            startNowMs: Long = 1_000L,
+        ): String {
             val state = EvLearnedRateEstimator.VehicleState()
-            var now = 1_000L
+            var now = startNowMs
             tick(state, 50_000, 36f, motorPowerW = 7_200f, nowMs = now)
             var status = ""
             repeat(5) { index ->
@@ -167,6 +171,13 @@ class EvLearnedRateEstimatorTest {
         assertTrue(resultFor(Float.NaN, VehiclePropertyObservation(null, 5_000L, 0)).startsWith("ok:bd"))
         assertTrue(resultFor(7_200f, VehiclePropertyObservation(null, 5_000L, 1)).startsWith("ok:bd"))
         assertTrue(resultFor(7_200f, VehiclePropertyObservation(null, -20_000L, 0)).startsWith("ok:bd"))
+        assertTrue(
+            resultFor(
+                7_200f,
+                VehiclePropertyObservation(-20_000_000_000L, 5_000L, 0),
+                startNowMs = 5_000L,
+            ).startsWith("ok:bd"),
+        )
         assertTrue(resultFor(7_200f, null).startsWith("ok:bd"))
     }
 
@@ -235,6 +246,29 @@ class EvLearnedRateEstimatorTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun `dropped tick breaks continuity before the next accepted tick`() = runTest {
+        val loadGate = CompletableDeferred<Unit>()
+        val estimator = EvLearnedRateEstimator.createForTest(
+            FakeStore(loadGate),
+            this,
+            EvLearnedRateEstimator.Config(commandCapacity = 1),
+        )
+        runCurrent()
+
+        assertTrue(estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L))
+        assertFalse(estimator.onVehicleTick(vehicle("A", 49_900, 36f), 2_000L))
+        loadGate.complete(Unit)
+        estimator.awaitIdle()
+
+        assertTrue(estimator.onVehicleTick(vehicle("A", 49_800, 36f), 6_000L))
+        estimator.awaitIdle()
+        assertEquals("init", estimator.activeSnapshot.value.lastTickStatus)
+        assertEquals(0f, estimator.activeSnapshot.value.sampleKm, 0.0001f)
+        estimator.stop()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun `bounded nonblocking admission reports dropped ticks`() = runTest {
         val loadGate = CompletableDeferred<Unit>()
         val estimator = EvLearnedRateEstimator.createForTest(
@@ -257,6 +291,36 @@ class EvLearnedRateEstimatorTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun `eviction caused by an init tick is persisted`() = runTest {
+        val store = FakeStore(
+            raw = """{
+                "Test|A|2024":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":0},
+                "Test|B|2024":{"whPerKm":201.0,"sampleKm":2.0,"lastUpdateMs":101}
+            }""".trimIndent(),
+        )
+        val estimator = EvLearnedRateEstimator.createForTest(
+            store,
+            this,
+            EvLearnedRateEstimator.Config(
+                persistDebounceMs = 0L,
+                persistMaxDelayMs = 10_000L,
+                maxEntries = 2,
+            ),
+        )
+        estimator.awaitIdle()
+        estimator.onVehicleTick(vehicle("C", 50_000, 36f), 1_000L)
+        estimator.awaitIdle()
+        runCurrent()
+        estimator.awaitIdle()
+
+        val persisted = Json.parseToJsonElement(store.raw).jsonObject
+        assertFalse(persisted.containsKey("Test|A|2024"))
+        assertTrue(persisted.containsKey("Test|B|2024"))
+        estimator.stop()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun `incomplete identities obey deterministic entry bound`() = runTest {
         val estimator = EvLearnedRateEstimator.createForTest(
             FakeStore(),
@@ -273,6 +337,59 @@ class EvLearnedRateEstimatorTest {
         assertEquals("Test|B|2024", estimator.snapshotFor("Test|B|2024").key)
         assertEquals("Test|C|2024", estimator.snapshotFor("Test|C|2024").key)
         estimator.stop()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `reset reports durable completion instead of fire and forget`() = runTest {
+        val store = FakeStore(
+            raw = """{"Test|A|2024":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":100}}""",
+        )
+        val estimator = EvLearnedRateEstimator.createForTest(store, this)
+        estimator.awaitIdle()
+
+        val result = estimator.reset("Test|A|2024")
+
+        assertEquals("COMPLETED", result.toString())
+        assertFalse(Json.parseToJsonElement(store.raw).jsonObject.containsKey("Test|A|2024"))
+        estimator.stop()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `reset reports busy when its command cannot be admitted`() = runTest {
+        val loadGate = CompletableDeferred<Unit>()
+        val estimator = EvLearnedRateEstimator.createForTest(
+            FakeStore(loadGate), this, EvLearnedRateEstimator.Config(commandCapacity = 1),
+        )
+        runCurrent()
+        assertTrue(estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L))
+
+        val result = estimator.reset("Test|A|2024")
+
+        assertEquals("REJECTED_BUSY", result.toString())
+        loadGate.complete(Unit)
+        estimator.stop()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `cancelled stop caller cannot strand a live nonaccepting actor`() = runTest {
+        val loadGate = CompletableDeferred<Unit>()
+        val estimator = EvLearnedRateEstimator.createForTest(
+            FakeStore(loadGate), this, EvLearnedRateEstimator.Config(commandCapacity = 1),
+        )
+        runCurrent()
+        assertTrue(estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L))
+        val firstStop = launch { estimator.stop() }
+        yield()
+        assertFalse(estimator.runtimeState.value.accepting)
+        firstStop.cancel()
+        loadGate.complete(Unit)
+        runCurrent()
+
+        val secondResult = estimator.stop()
+        assertTrue(secondResult.finalSaveSucceeded)
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -338,6 +455,40 @@ class EvLearnedRateEstimatorTest {
             assertTrue(expected.message!!.contains("dirty learned state"))
         }
         assertEquals(3, store.saveAttempts)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `mutation after retry exhaustion rearms maximum dirty delay`() = runTest {
+        val store = FakeStore(failuresRemaining = 1)
+        val estimator = EvLearnedRateEstimator.createForTest(
+            store,
+            this,
+            EvLearnedRateEstimator.Config(
+                persistDebounceMs = 60_000L,
+                persistMaxDelayMs = 5_000L,
+                persistRetryMs = 1_000L,
+                maxPersistAttempts = 1,
+            ),
+        )
+        estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L)
+        estimator.onVehicleTick(vehicle("A", 49_980, 36f), 6_000L)
+        estimator.awaitIdle()
+        advanceTimeBy(5_000L)
+        runCurrent()
+        estimator.awaitIdle()
+        assertTrue(estimator.runtimeState.value.retryExhausted)
+        assertEquals(1, store.saveAttempts)
+
+        estimator.onVehicleTick(vehicle("A", 49_960, 36f), 11_000L)
+        estimator.awaitIdle()
+        advanceTimeBy(5_000L)
+        runCurrent()
+        estimator.awaitIdle()
+
+        assertEquals(2, store.saveAttempts)
+        assertFalse(estimator.runtimeState.value.dirty)
+        estimator.stop()
     }
 
     private fun vehicle(model: String, batteryWh: Int, speedKmh: Float) =

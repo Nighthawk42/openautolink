@@ -20,6 +20,15 @@ class EvLearningWireSafetyContractTest {
         assertTrue(chokepoint.contains("learnerReady=${'$'}{activation.learnerReady}"))
         assertTrue(chokepoint.contains("wireEffective=${'$'}{activation.wireEffectiveMode}"))
         assertTrue(chokepoint.contains("safetyHolds=${'$'}{activation.safetyHolds"))
+        assertTrue(chokepoint.contains("if (logSafetyInfo)"))
+
+        val telemetry = source.substringAfter("private fun forwardVehicleData(")
+            .substringBefore("vd.speedKmh?.let")
+        assertTrue(telemetry.contains("\"requested\" to activation.requestedMode"))
+        assertTrue(telemetry.contains("\"learnerReady\" to activation.learnerReady"))
+        assertTrue(telemetry.contains("\"wireEffective\" to activation.wireEffectiveMode"))
+        assertTrue(telemetry.contains("\"safetyHolds\" to activation.safetyHolds.toList()"))
+        assertTrue(telemetry.contains("\"droppedCommands\" to runtime?.droppedCommands"))
     }
 
     private fun projectFile(path: String): File {

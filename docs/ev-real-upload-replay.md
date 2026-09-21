@@ -32,7 +32,11 @@ The archive contained three `ev_*.log` members with **2,819 valid JSONL records*
 
 The 351 excluded records are 350 native payload/output diagnostics and one upload snapshot. They are old outputs, not inputs to the repaired semantics.
 
-The sanitizer replaces session UUIDs with `s1`/`s2`, converts elapsed times and observation times to relative values, and drops wall clocks, file names, boot/process/drive IDs, raw native lines, destinations, destination hashes, roads, coordinates, VINs, and unrelated vehicle fields. Its privacy gate rejects unknown event keys, UUID-shaped values, IP/MAC-like values, and location/device/household terms. The checked-in artifact has zero UUID matches, zero forbidden-key hits, and only the aliases `s1` and `s2` as session values.
+The sanitizer replaces session UUIDs with `s1`/`s2`, converts elapsed times and observation times to relative values, and drops wall clocks, file names, boot/process/drive IDs, raw native lines, destinations, destination hashes, roads, coordinates, VINs, and unrelated vehicle fields. Its allowlist gate rejects unknown event keys, UUID-shaped values, IP/MAC-like values, and location/device/household terms. The checked-in artifact has zero UUID matches, zero forbidden-key hits, and only the aliases `s1` and `s2` as session values.
+
+This fixture is **pseudonymized behavioral telemetry, not anonymous data**. Exact relative cadence, navigation-distance sequences, battery values, speed values, and the two stable session aliases can still link records within the fixture and may be recognizable to someone who already knows the drive. Those fields are retained only because the regression assertions exercise zero-distance navigation semantics, source-observation cadence, and battery-window completion. Removing or coarsely quantizing them would destroy those assertions. The raw archive remains private; do not combine this fixture with dates, locations, account/device identifiers, or other trip records.
+
+`app/src/test/resources/ev-replay/provenance.json` pins the private source archive SHA-256, committed fixture SHA-256, byte count, release, path, and event count. `scripts/test_ev_telemetry_analysis.py` verifies that manifest in ordinary CI without requiring access to the private archive.
 
 ## What the replay proves
 
@@ -48,6 +52,8 @@ The sanitizer replaces session UUIDs with `s1`/`s2`, converts elapsed times and 
 - the one requested settings record says enabled learned mode, while all 291 vehicle records diagnose effective disabled/derived mode with an inactive, unstarted learner.
 
 The private-archive test independently sanitizes the supplied ZIP in Kotlin, requires byte-for-byte-equivalent semantic events and metadata to the committed fixture, then runs the same current-code assertions. This detects fixture drift or a sanitizer that no longer represents the source archive.
+
+`scripts/ev_telemetry_analysis.py` is the offline mixed-schema consumer for compact `ev_*.log` JSONL. It parses schema 1 and schema 2 together while refusing to treat schema-2 raw, uncorrelated forecasts as legacy comparable initial/latest forecasts.
 
 ## Commands
 

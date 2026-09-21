@@ -2,6 +2,10 @@ package com.openautolink.app.diagnostics
 
 import java.io.File
 import java.nio.file.Files
+import java.security.MessageDigest
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -14,6 +18,22 @@ class EvUploadReplayTest {
             checkNotNull(javaClass.getResourceAsStream(fixtureResource))
         )
         assertReplayContract(dataset)
+    }
+
+    @Test fun committedFixtureMatchesProvenanceManifestWithoutPrivateArchive() {
+        val manifest = Json.parseToJsonElement(
+            checkNotNull(javaClass.getResourceAsStream("/ev-replay/provenance.json"))
+                .bufferedReader().use { it.readText() },
+        ).jsonObject
+        val payload = checkNotNull(javaClass.getResourceAsStream(fixtureResource)).use { it.readBytes() }
+        val digest = MessageDigest.getInstance("SHA-256").digest(payload)
+            .joinToString("") { "%02x".format(it) }
+        val dataset = EvUploadReplay.loadSanitized(payload.inputStream())
+
+        assertEquals(manifest.getValue("sourceArchiveSha256").jsonPrimitive.content, dataset.metadata.sourceSha256)
+        assertEquals(manifest.getValue("fixtureSha256").jsonPrimitive.content, digest)
+        assertEquals(manifest.getValue("fixtureBytes").jsonPrimitive.content.toInt(), payload.size)
+        assertEquals(manifest.getValue("eventCount").jsonPrimitive.content.toInt(), dataset.events.size)
     }
 
     @Test fun externallySuppliedArchiveProducesTheCommittedSanitizedInputsAndSemantics() {

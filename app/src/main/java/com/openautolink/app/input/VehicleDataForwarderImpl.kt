@@ -879,14 +879,17 @@ class VehicleDataForwarderImpl(
             if (!available) return@launch
             while (true) {
                 try {
-                    latestMotorPowerW = com.openautolink.app.data.GmHistoryProviderRepository
-                        .latestMotorPowerW(context)?.takeIf { it.isFinite() }
-                    latestMotorPowerObservation = VehiclePropertyObservation(
-                        timestampElapsedNanos = null,
-                        receivedElapsedMs = SystemClock.elapsedRealtime(),
-                        status = 0,
-                        source = "history-provider",
-                    ).takeIf { latestMotorPowerW != null }
+                    val sample = com.openautolink.app.data.GmHistoryProviderRepository
+                        .latestMotorPowerSample(context)
+                    latestMotorPowerW = sample?.value
+                    latestMotorPowerObservation = sample?.let {
+                        VehiclePropertyObservation(
+                            timestampElapsedNanos = sample.sourceElapsedNanos,
+                            receivedElapsedMs = SystemClock.elapsedRealtime(),
+                            status = 0,
+                            source = "history-provider-coherent",
+                        )
+                    }
                     latestMotorTorqueNm = com.openautolink.app.data.GmHistoryProviderRepository
                         .latestMotorTorqueNm(context)
                 } catch (_: Throwable) {

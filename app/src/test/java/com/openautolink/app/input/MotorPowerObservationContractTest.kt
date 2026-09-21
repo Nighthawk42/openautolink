@@ -6,15 +6,23 @@ import java.io.File
 
 class MotorPowerObservationContractTest {
     @Test
-    fun `history motor cache carries explicit identity status and receipt time into vehicle data`() {
+    fun `history motor cache uses the coherent source timestamp instead of poll receipt`() {
         val source = projectFile(
             "app/src/main/java/com/openautolink/app/input/VehicleDataForwarderImpl.kt",
         ).readText()
-        assertTrue(source.contains("latestMotorPowerObservation = VehiclePropertyObservation("))
+        assertTrue(source.contains("latestMotorPowerSample(context)"))
+        assertTrue(source.contains("timestampElapsedNanos = sample.sourceElapsedNanos"))
         assertTrue(source.contains("receivedElapsedMs = SystemClock.elapsedRealtime()"))
-        assertTrue(source.contains("status = 0"))
-        assertTrue(source.contains("source = \"history-provider\""))
+        assertTrue(source.contains("source = \"history-provider-coherent\""))
         assertTrue(source.contains("EvLearnedRateEstimator.MOTOR_POWER_OBSERVATION to it"))
+    }
+
+    @Test
+    fun `history timestamp milliseconds convert to elapsed nanoseconds exactly`() {
+        val source = projectFile(
+            "app/src/main/java/com/openautolink/app/data/GmHistoryProviderRepository.kt",
+        ).readText()
+        assertTrue(source.contains("Math.multiplyExact(sourceElapsedMs, 1_000_000L)"))
     }
 
     private fun projectFile(path: String): File {
