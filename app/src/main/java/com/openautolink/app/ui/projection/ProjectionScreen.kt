@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -825,14 +826,12 @@ fun ProjectionScreen(
             }
         }
 
-        // USB device picker overlay — shown whenever the user has selected the
-        // USB transport, no session is connected yet, and one or more candidate
-        // devices are attached. Only the device the user picks will be granted
-        // permission and switched into AOA mode; we do NOT auto-prompt for
-        // every USB device the head unit enumerates.
+        // The USB picker is above the floating controls in this Box. Never let
+        // it cover Settings/Diagnostics, and offer an explicit way back to the
+        // transport settings even while no phone is plugged in.
         val transportMode by viewModel.transportMode.collectAsStateWithLifecycle()
-        if (transportMode == "usb") {
-            UsbDevicePickerOverlay()
+        if (UsbPickerVisibility.shouldShow(transportMode, showSettings, showDiagnostics)) {
+            UsbDevicePickerOverlay(onOpenSettings = { showSettings = true })
         }
 
     }
@@ -1650,7 +1649,7 @@ private fun SafeAreaOverlay(
  * permission prompt and then the AOA v2 switch + connect flow.
  */
 @Composable
-private fun UsbDevicePickerOverlay() {
+private fun UsbDevicePickerOverlay(onOpenSettings: () -> Unit) {
     val devices by com.openautolink.app.transport.usb.UsbConnectionManager
         .availableDevices.collectAsStateWithLifecycle()
     val state by com.openautolink.app.transport.usb.UsbConnectionManager
@@ -1758,6 +1757,15 @@ private fun UsbDevicePickerOverlay() {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    FilledTonalButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.testTag("usbConnectionSettingsButton"),
+                    ) {
+                        Icon(Icons.Default.Settings, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Connection settings")
+                    }
                 }
             }
         }
