@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicReference
 
 class VehicleObservationTest {
     interface Callback { fun onChangeEvent(value: Any) }
@@ -232,5 +233,32 @@ class VehicleObservationTest {
             .firstOrNull { it.name == "getEvObservationMetadata" }
         assertNotNull("VehicleData must carry diagnostic-only observation metadata", getter)
         assertEquals(emptyMap<String, Any>(), getter!!.invoke(ControlMessage.VehicleData()))
+    }
+
+    @Test fun propertyStatusConcurrentWritesClearsAndReadsExposeImmutableSnapshots() {
+        val forwarder = forwarder()
+        val field = forwarder.javaClass.getDeclaredField("_propertyStatus").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val statuses = field.get(forwarder) as MutableMap<String, String>
+        val failure = AtomicReference<Throwable?>()
+        val writer = Thread {
+            runCatching {
+                repeat(10_000) { i ->
+                    statuses["p${i % 32}"] = i.toString()
+                    if (i % 17 == 0) statuses.clear()
+                }
+            }.onFailure(failure::set)
+        }
+        writer.start()
+        repeat(10_000) {
+            val snapshot = forwarder.propertyStatus
+            snapshot.entries.forEach { entry -> assertTrue(entry.key.startsWith("p")) }
+            try {
+                (snapshot as MutableMap)["bad"] = "bad"
+                org.junit.Assert.fail("propertyStatus snapshots must be immutable")
+            } catch (_: UnsupportedOperationException) { }
+        }
+        writer.join()
+        failure.get()?.let { throw it }
     }
 }

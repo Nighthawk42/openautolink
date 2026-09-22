@@ -174,6 +174,32 @@ class EvContributionHardeningTest {
         assertEquals(0, q.counters().quarantined)
     }
 
+    @Test fun `invalidated upload retains exact worker ownership until worker releases`() {
+        val gate = EvContributionLifecycleGate()
+        val old = gate.admitUpload { true }!!
+        val oldEntered = CountDownLatch(1)
+        val releaseOld = CountDownLatch(1)
+        val oldExited = CountDownLatch(1)
+        val worker = thread {
+            oldEntered.countDown()
+            releaseOld.await(5, TimeUnit.SECONDS)
+            gate.releaseUpload(old)
+            oldExited.countDown()
+        }
+        assertTrue(oldEntered.await(5, TimeUnit.SECONDS))
+        gate.invalidate()
+
+        var openedConnections = 0
+        if (gate.admitUpload { true } != null) openedConnections++
+        assertEquals("replacement event must open no connection while old worker unwinds", 0, openedConnections)
+
+        releaseOld.countDown()
+        assertTrue(oldExited.await(5, TimeUnit.SECONDS))
+        worker.join(5_000)
+        if (gate.admitUpload { true } != null) openedConnections++
+        assertEquals("a later event starts exactly one replacement after exact exit", 1, openedConnections)
+    }
+
     @Test fun `cancel closes exact blocking request body and later clean attempt succeeds`() {
         val q = EvContributionQueue(dir(), 100_000, 8)
         q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
@@ -297,11 +323,30 @@ class EvContributionHardeningTest {
         assertEquals(1, fires)
     }
 
-    @Test fun `safe parked attestation is fresh only inside bounded restart window`() {
-        assertTrue(EvSafeParkAttestation.isFresh(recordedAtMs = 10_000, nowMs = 10_000 + EvSafeParkAttestation.MAX_AGE_MS))
-        assertFalse(EvSafeParkAttestation.isFresh(recordedAtMs = 10_000, nowMs = 10_001 + EvSafeParkAttestation.MAX_AGE_MS))
-        assertFalse(EvSafeParkAttestation.isFresh(recordedAtMs = 0, nowMs = 10_000))
-        assertFalse(EvSafeParkAttestation.isFresh(recordedAtMs = 20_000, nowMs = 10_000))
+    @Test fun `restart never inherits upload authorization and moving revokes it immediately`() {
+        val gate = EvFreshParkGate()
+        assertFalse(gate.freshParkObservedThisProcess)
+        assertFalse(gate.observe(gearRaw = 4, ignitionState = null))
+        assertFalse(gate.observe(gearRaw = 8, ignitionState = 4))
+        assertTrue(gate.observe(gearRaw = 4, ignitionState = 2))
+        assertFalse(gate.observe(gearRaw = 8, ignitionState = 4))
+    }
+
+    @Test fun `failed delete remains blocked until verified empty successful retry`() {
+        val root = dir()
+        var fail = true
+        val q = EvContributionQueue(root, deleteFile = { file -> if (fail) false else file.delete() })
+        q.append("drive", 1, vehicleLine(), "owner")
+        val first = q.deleteAllArtifacts()
+        assertTrue(first.failures > 0)
+        assertTrue(q.storageUsage().units > 0)
+        assertFalse(EvDeleteAdmissionPolicy.mayResume(first, q.storageUsage()))
+
+        fail = false
+        val retry = q.deleteAllArtifacts()
+        assertEquals(0, retry.failures)
+        assertEquals(0, q.storageUsage().units)
+        assertTrue(EvDeleteAdmissionPolicy.mayResume(retry, q.storageUsage()))
     }
 
     @Test fun `event driven drain uploads offline batches oldest first when network later arrives`() {

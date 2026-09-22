@@ -20,7 +20,8 @@ class EvContributionProtocolTest {
         val bytes = first.file.readBytes()
         assertTrue(first.file.name.endsWith(".zip"))
         ZipFile(first.file).use { zip ->
-            assertEquals(setOf("telemetry.jsonl", "manifest.txt"), zip.entries().asSequence().map { it.name }.toSet())
+            assertEquals(setOf("telemetry.log", "manifest.log"), zip.entries().asSequence().map { it.name }.toSet())
+            assertTrue(zip.entries().asSequence().all { it.name.endsWith(".log") })
             assertTrue(zip.entries().asSequence().all { !it.name.contains('/') && !it.isDirectory })
         }
         val restored = queue(root).pending().single()
@@ -28,6 +29,16 @@ class EvContributionProtocolTest {
         assertEquals(first.sha256, restored.sha256)
         assertEquals("owner-device", restored.namespace)
         assertFalse(root.walkTopDown().filter { it.isFile }.any { it.readText().contains("raw-secret-token") })
+    }
+
+    @Test fun `compiled candidate exports the server contract archive`() {
+        val pending = closed(queue())
+        val output = File("build/integration/ev-candidate.zip")
+        output.parentFile!!.mkdirs()
+        pending.file.copyTo(output, overwrite = true)
+        ZipFile(output).use { zip ->
+            assertEquals(setOf("telemetry.log", "manifest.log"), zip.entries().asSequence().map { it.name }.toSet())
+        }
     }
 
     @Test fun `crash after zip publication keeps closed unit and removes redundant source`() {
@@ -61,7 +72,7 @@ class EvContributionProtocolTest {
         assertFalse(text.contains(id))
         assertFalse(text.contains(epoch.toString()))
         assertFalse(text.contains((epoch + 9_999).toString()))
-        assertEquals(setOf("telemetry.jsonl", "manifest.txt"), ZipFile(pending.file).use { zip ->
+        assertEquals(setOf("telemetry.log", "manifest.log"), ZipFile(pending.file).use { zip ->
             zip.entries().asSequence().map { it.name }.toSet()
         })
     }
@@ -135,6 +146,18 @@ class EvContributionProtocolTest {
         assertFalse(EvContributionPolicy.mayUpload(true, ready.copy(projectionActive = true)))
         assertFalse(EvContributionPolicy.mayUpload(true, ready.copy(startupSensitive = true)))
         assertFalse(EvContributionPolicy.mayUpload(true, ready.copy(validatedInternet = false)))
+    }
+
+    @Test fun `upload policy requires a fresh park observation from this process`() {
+        val ready = EvContributionPolicy.UploadContext(
+            validatedInternet = true,
+            parked = true,
+            idle = true,
+            startupSensitive = false,
+            freshParkObservedThisProcess = false,
+        )
+        assertFalse(EvContributionPolicy.mayUpload(true, ready))
+        assertTrue(EvContributionPolicy.mayUpload(true, ready.copy(freshParkObservedThisProcess = true)))
     }
 
     @Test fun `revocation generation fences a completed in flight response`() {

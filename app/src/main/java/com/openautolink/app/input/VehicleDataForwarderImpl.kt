@@ -137,8 +137,9 @@ class VehicleDataForwarderImpl(
     private val _latestVehicleData = MutableStateFlow(ControlMessage.VehicleData())
     override val latestVehicleData: StateFlow<ControlMessage.VehicleData> = _latestVehicleData.asStateFlow()
 
-    private val _propertyStatus = mutableMapOf<String, String>()
-    override val propertyStatus: Map<String, String> get() = _propertyStatus.toMap()
+    private val _propertyStatus = ConcurrentHashMap<String, String>()
+    override val propertyStatus: Map<String, String> get() =
+        java.util.Collections.unmodifiableMap(HashMap(_propertyStatus))
 
     private var startInFlight = false
     private var desiredActive = false
@@ -146,14 +147,20 @@ class VehicleDataForwarderImpl(
     private var reconnectAttempt = 0
     private var reconnectJob: kotlinx.coroutines.Job? = null
     private var carLifecycleProxy: Any? = null
+    private val retryState = VhalRetryState()
 
     override fun start() {
         val generation = synchronized(this) {
             if (!desiredActive) reconnectAttempt = 0
             desiredActive = true
-            if (isActive || startInFlight) return
+            if (isActive || startInFlight) {
+                retryState.request()
+                return
+            }
+            val retryGeneration = retryState.start() ?: return
             startInFlight = true
-            ++lifecycleGeneration
+            lifecycleGeneration = retryGeneration
+            retryGeneration
         }
         launchStartAttempt(generation)
     }
@@ -162,7 +169,7 @@ class VehicleDataForwarderImpl(
         // Run on background thread — Car API calls can block (connect, waitForConnected).
         // Every stage is fenced because stop() may run while this coroutine is blocked.
         scope.launch {
-            var retryScheduled = false
+            var failed = false
             try {
                 if (!isStartCurrent(generation)) return@launch
                 connectToCar()
@@ -174,8 +181,8 @@ class VehicleDataForwarderImpl(
 
                 val activated = synchronized(this@VehicleDataForwarderImpl) {
                     if (lifecycleGeneration == generation && desiredActive) {
-                        isActive = true
-                        true
+                        isActive = retryState.started(generation)
+                        isActive
                     } else {
                         false
                     }
@@ -190,12 +197,12 @@ class VehicleDataForwarderImpl(
                 _latestVehicleData.value = buildVehicleData()
                 startHistoryPoller()
             } catch (e: Exception) {
-                retryScheduled = scheduleReconnectAfterFailure(generation)
+                failed = true
                 val root = e.rootCause()
                 Log.w(TAG, "Failed to start vehicle data forwarding: ${root.message}")
                 DiagnosticLog.w("vhal", "Failed to start: ${root.javaClass.simpleName}: ${root.message}")
             } finally {
-                cleanupAfterStartAttempt(generation, retryScheduled)
+                cleanupAfterStartAttempt(generation, failed)
             }
         }
     }
@@ -204,27 +211,30 @@ class VehicleDataForwarderImpl(
         lifecycleGeneration == generation && desiredActive
     }
 
-    private fun cleanupAfterStartAttempt(generation: Long, retryScheduled: Boolean) {
+    private fun cleanupAfterStartAttempt(generation: Long, failed: Boolean) {
         var nextGeneration: Long? = null
         var cleanupOutcome: String? = null
+        var retryDelayMs: Long? = null
         synchronized(this) {
             val stale = lifecycleGeneration != generation || !desiredActive
-            if (stale || retryScheduled) {
+            if (stale || failed) {
                 isActive = false
                 cleanup()
                 cleanupOutcome = when {
-                    retryScheduled -> "Failed VHAL start cleaned before bounded retry"
+                    failed -> "Failed VHAL start cleaned before bounded retry"
                     desiredActive -> "Stale VHAL start cleaned before queued restart"
                     else -> "In-flight VHAL start cleaned after stop"
                 }
             }
             startInFlight = false
+            if (failed && !stale) retryDelayMs = retryState.failedAttemptCleaned(generation)
             // stop() followed quickly by start() while the old attempt was blocked
             // leaves desiredActive=true but invalidates the old generation. Relaunch
             // only after that attempt has cleaned up its partially-created Car state.
-            if (desiredActive && !isActive && !retryScheduled) {
+            if (desiredActive && !isActive && (stale || !failed)) {
                 startInFlight = true
-                nextGeneration = ++lifecycleGeneration
+                nextGeneration = retryState.serviceReady()
+                if (nextGeneration != null) lifecycleGeneration = nextGeneration!!
             }
         }
         cleanupOutcome?.let {
@@ -232,31 +242,24 @@ class VehicleDataForwarderImpl(
             DiagnosticLog.i("vhal", it)
         }
         nextGeneration?.let(::launchStartAttempt)
+        retryDelayMs?.let { scheduleReconnectAfterCleanup(generation, it) }
     }
 
-    private fun scheduleReconnectAfterFailure(failedGeneration: Long): Boolean {
-        val delayMs = synchronized(this) {
-            if (!desiredActive || lifecycleGeneration != failedGeneration) return false
-            if (reconnectAttempt >= 5) {
-                desiredActive = false
-                DiagnosticLog.w("vhal", "VHAL reconnect attempts exhausted")
-                return true
-            }
-            val attempt = reconnectAttempt++
-            (1_000L shl attempt).coerceAtMost(30_000L)
-        }
+    private fun scheduleReconnectAfterCleanup(failedGeneration: Long, delayMs: Long) {
+        synchronized(this) { reconnectAttempt++ }
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             delay(delayMs)
             val next = synchronized(this@VehicleDataForwarderImpl) {
                 if (!desiredActive || isActive || startInFlight || lifecycleGeneration != failedGeneration) return@launch
+                val retryGeneration = retryState.retryTimerFired(failedGeneration) ?: return@launch
                 startInFlight = true
-                ++lifecycleGeneration
+                lifecycleGeneration = retryGeneration
+                retryGeneration
             }
             launchStartAttempt(next)
         }
         DiagnosticLog.i("vhal", "VHAL reconnect scheduled attempt=$reconnectAttempt delayMs=$delayMs")
-        return true
     }
 
     override fun stop() {
@@ -264,6 +267,7 @@ class VehicleDataForwarderImpl(
             val pendingOrActive = isActive || startInFlight || carObject != null
             val deferred = startInFlight
             desiredActive = false
+            retryState.stop()
             reconnectJob?.cancel()
             reconnectJob = null
             reconnectAttempt = 0
@@ -355,7 +359,7 @@ class VehicleDataForwarderImpl(
             when (method.name) {
                 "onLifecycleChanged" -> {
                     val ready = args?.getOrNull(1) as? Boolean ?: false
-                    if (!ready) onCarServiceLost(args?.firstOrNull())
+                    if (ready) onCarServiceReady(args?.firstOrNull()) else onCarServiceLost(args?.firstOrNull())
                     null
                 }
                 "toString" -> "OalCarServiceLifecycleListener"
@@ -375,14 +379,29 @@ class VehicleDataForwarderImpl(
     private fun onCarServiceLost(lostCar: Any?) {
         val failedGeneration = synchronized(this) {
             if (!desiredActive || !isActive || carObject !== lostCar) return
+            if (!retryState.serviceLost(lifecycleGeneration)) return
             isActive = false
             reconnectAttempt = 0
             cleanup()
             startInFlight = false
-            ++lifecycleGeneration
+            lifecycleGeneration
         }
         DiagnosticLog.w("vhal", "Car service lost; scheduling process-owned reconnect")
-        scheduleReconnectAfterFailure(failedGeneration)
+        retryState.failedAttemptCleaned(failedGeneration)?.let { scheduleReconnectAfterCleanup(failedGeneration, it) }
+    }
+
+    private fun onCarServiceReady(readyCar: Any?) {
+        val generation = synchronized(this) {
+            if (!desiredActive || isActive || startInFlight || (carObject != null && carObject !== readyCar)) return
+            reconnectJob?.cancel()
+            reconnectJob = null
+            reconnectAttempt = 0
+            val next = retryState.serviceReady() ?: return
+            startInFlight = true
+            lifecycleGeneration = next
+            next
+        }
+        launchStartAttempt(generation)
     }
 
     /** Poll isConnected() up to timeoutMs, matching app_v1's waitForConnected pattern. */
@@ -1032,6 +1051,7 @@ class VehicleDataForwarderImpl(
 
         trackedPropertyIds.clear()
         currentValues.clear()
+        _propertyStatus.clear()
         evObservationMetadata.clear()
         // Do not alter retained numeric values; only retire their diagnostic observations.
         _latestVehicleData.value = _latestVehicleData.value.copy(evObservationMetadata = emptyMap())

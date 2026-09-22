@@ -138,7 +138,6 @@ class EvContributionLifecycleGate {
     fun invalidate(blockAdmissions: Boolean = false, update: () -> Unit = {}): Long {
         update()
         if (blockAdmissions) admissionsBlocked = true
-        uploadOwner = null
         return ++generation
     }
 
@@ -226,10 +225,15 @@ class EarliestOneShotDeadline(
     }
 }
 
-object EvSafeParkAttestation {
-    const val MAX_AGE_MS = 6L * 60 * 60 * 1000
-    fun isFresh(recordedAtMs: Long, nowMs: Long): Boolean =
-        recordedAtMs > 0 && nowMs >= recordedAtMs && nowMs - recordedAtMs <= MAX_AGE_MS
+class EvFreshParkGate {
+    @Volatile var freshParkObservedThisProcess: Boolean = false
+        private set
+
+    @Synchronized
+    fun observe(gearRaw: Int?, ignitionState: Int?): Boolean {
+        freshParkObservedThisProcess = gearRaw == 4 && ignitionState in setOf(1, 2)
+        return freshParkObservedThisProcess
+    }
 }
 
 object EvContributionPolicy {
@@ -240,6 +244,7 @@ object EvContributionPolicy {
         val startupSensitive: Boolean,
         val projectionActive: Boolean = false,
         val reconnecting: Boolean = false,
+        val freshParkObservedThisProcess: Boolean = true,
     )
 
     fun mayCapture(consent: Boolean, uploadUrl: String, token: String): Boolean =
@@ -249,7 +254,8 @@ object EvContributionPolicy {
         binding?.matches(uploadUrl, token) == true
 
     fun mayUpload(consent: Boolean, context: UploadContext): Boolean = consent &&
-        context.validatedInternet && context.parked && context.idle && !context.startupSensitive &&
+        context.validatedInternet && context.parked && context.freshParkObservedThisProcess &&
+        context.idle && !context.startupSensitive &&
         !context.projectionActive && !context.reconnecting
 }
 
@@ -345,6 +351,7 @@ class EvContributionQueue(
     private val maxBytes: Long = 8L * 1024 * 1024,
     private val maxFiles: Int = 32,
     private val maxAgeMs: Long = 30L * 24 * 60 * 60 * 1000,
+    private val deleteFile: (File) -> Boolean = { it.delete() },
 ) {
     data class Pending(
         val id: String,
@@ -417,9 +424,9 @@ class EvContributionQueue(
         val logBytes = entry.file.readBytes()
         FileOutputStream(tmp).use { fos ->
             ZipOutputStream(fos).use { out ->
-                addZip(out, "telemetry.jsonl", logBytes)
+                addZip(out, "telemetry.log", logBytes)
                 val manifest = "schema=2\nvehicleClass=${entry.vehicleLabel.removePrefix("ev-class-")}\nstartedHourBucket=${entry.startedMs / 3_600_000}\ncompletedHourBucket=${completedMs / 3_600_000}\n"
-                addZip(out, "manifest.txt", manifest.toByteArray(Charsets.UTF_8))
+                addZip(out, "manifest.log", manifest.toByteArray(Charsets.UTF_8))
             }
             runCatching { fos.fd.sync() }
         }
@@ -474,9 +481,11 @@ class EvContributionQueue(
         val files = directory.walkBottomUp().filter { it.isFile }.toList()
         val bytes = files.sumOf { it.length() }
         var failed = 0
-        files.forEach { if (it.exists() && !it.delete()) failed++ }
+        files.forEach { if (it.exists() && !deleteFile(it)) failed++ }
         directory.walkBottomUp().filter { it.isDirectory && it != directory }.forEach { it.delete() }
-        evicted.set(0); accepted.set(0); failures.set(0)
+        if (failed == 0 && directory.walkTopDown().none { it.isFile }) {
+            evicted.set(0); accepted.set(0); failures.set(0)
+        }
         syncDirectory(directory)
         return DeleteResult(files.size, bytes, failed)
     }
@@ -637,6 +646,11 @@ class EvContributionQueue(
             try { android.system.Os.fsync(descriptor) } finally { android.system.Os.close(descriptor) }
         }
     }
+}
+
+object EvDeleteAdmissionPolicy {
+    fun mayResume(result: EvContributionQueue.DeleteResult, retained: EvContributionQueue.StorageUsage): Boolean =
+        result.failures == 0 && retained.units == 0 && retained.bytes == 0L
 }
 
 class EvContributionUploader(

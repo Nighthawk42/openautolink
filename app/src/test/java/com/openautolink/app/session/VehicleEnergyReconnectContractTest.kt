@@ -161,17 +161,22 @@ class VehicleEnergyReconnectContractTest {
         )
         assertTrue(
             "A stale in-flight attempt must clean up rather than activate after stop",
-            start.contains("cleanupAfterStartAttempt(generation, retryScheduled)"),
+            start.contains("cleanupAfterStartAttempt(generation, failed)"),
         )
-        assertTrue("Failed starts must schedule bounded one-shot reconnects",
-            source.contains("scheduleReconnectAfterFailure(generation)") &&
-                source.contains("reconnectAttempt >= 5") && source.contains("delay(delayMs)"))
-        assertTrue("Car service death must flow through the same reconnect owner",
-            source.contains("CarServiceLifecycleListener") &&
-                source.contains("onCarServiceLost") &&
-                source.contains("scheduleReconnectAfterFailure(failedGeneration)"))
+        val cleanup = source.substring(
+            source.indexOf("private fun cleanupAfterStartAttempt"),
+            source.indexOf("private fun scheduleReconnectAfterCleanup"),
+        )
+        assertTrue("Failed starts must clean before scheduling one-shot reconnects",
+            cleanup.indexOf("startInFlight = false") < cleanup.indexOf("scheduleReconnectAfterCleanup"))
+        assertTrue("Retry delay is capped, but total attempts must not be capped",
+            source.contains("VhalRetryState()") && source.contains("delay(delayMs)") &&
+                !source.contains("reconnectAttempt >= 5") && !source.contains("reconnect attempts exhausted"))
+        assertTrue("Car service lifecycle must reset or schedule through the same retry owner",
+            source.contains("CarServiceLifecycleListener") && source.contains("onCarServiceLost") &&
+                source.contains("onCarServiceReady") && source.contains("retryState.serviceReady()"))
         assertTrue("Failed partial starts must clean before retry to prevent duplicate subscriptions",
-            source.contains("if (stale || retryScheduled)") &&
+            source.contains("if (stale || failed)") &&
                 source.contains("Failed VHAL start cleaned before bounded retry"))
     }
 
