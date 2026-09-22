@@ -14,6 +14,7 @@ import com.openautolink.app.cluster.ClusterNavigationState
 import com.openautolink.app.diagnostics.EvTelemetryRecorder
 import com.openautolink.app.data.AppPreferences
 import com.openautolink.app.data.EvLearnedRateEstimator
+import com.openautolink.app.data.EvLearningActivationPolicy
 import com.openautolink.app.data.EvProfilesRepository
 import com.openautolink.app.diagnostics.DiagnosticLevel
 import com.openautolink.app.diagnostics.DiagnosticLog
@@ -669,7 +670,10 @@ class SessionManager(
 
     fun resetEvLearnedRate() {
         val snapshot = evLearnedEstimator?.activeSnapshot?.value
-        evLearnedEstimator?.reset(snapshot?.key)
+        scope.launch {
+            val result = evLearnedEstimator?.reset(snapshot?.key) ?: return@launch
+            DiagnosticLog.i("ev_learned", "session reset outcome=$result")
+        }
     }
 
     // IMU forwarder
@@ -983,9 +987,16 @@ class SessionManager(
         val session = aasdkSession ?: return
         if (EvTelemetryRecorder.instance.enabled) {
             val learned = evLearnedEstimator?.activeSnapshot?.value
+            val runtime = evLearnedEstimator?.runtimeState?.value
+            val activation = currentEvLearningActivation(learned?.usable == true)
             EvTelemetryRecorder.instance.vehicle(session.evTelemetryToken, vd, mapOf(
-                "requested" to evTelemetryRequested, "enabled" to evTuningEnabled,
-                "mode" to evDrivingMode, "observerStarted" to evTuningObserverStarted,
+                "requestedSettings" to evTelemetryRequested,
+                "requested" to activation.requestedMode,
+                "learnerReady" to activation.learnerReady,
+                "wireEffective" to activation.wireEffectiveMode,
+                "safetyHolds" to activation.safetyHolds.toList(),
+                "droppedCommands" to runtime?.droppedCommands,
+                "observerStarted" to evTuningObserverStarted,
                 "drivingWhPerKm" to evDrivingWhPerKm, "multiplierPct" to evDrivingMultiplierPct,
                 "auxWhPerKmX10" to evAuxWhPerKmX10, "aeroCoefX100" to evAeroCoefX100,
                 "reservePct" to evReservePct, "maxChargeKw" to evMaxChargeKw,
@@ -1040,7 +1051,8 @@ class SessionManager(
             val movedCharge = kotlin.math.abs(chargeW - lastVemChargeW) >= 100
             val firstEmit = lastVemLogMs == 0L
             val staleEnough = (now - lastVemLogMs) >= VEM_LOG_MIN_GAP_MS
-            if (firstEmit || movedBattery || movedRange || movedCharge || staleEnough) {
+            val logVemInfo = firstEmit || movedBattery || movedRange || movedCharge || staleEnough
+            if (logVemInfo) {
                 DiagnosticLog.i(
                     "vem",
                     "sendEnergyModel: level=${batteryWh}Wh cap=${capacityWh}Wh range=${rangeM}m charge=${chargeW}W${evTuningSummary(batteryWh, rangeM)}",
@@ -1050,7 +1062,7 @@ class SessionManager(
                 lastVemRangeM = rangeM
                 lastVemChargeW = chargeW
             }
-            sendEnergyModelWithTuning(session, batteryWh, capacityWh, rangeM, chargeW)
+            sendEnergyModelWithTuning(session, batteryWh, capacityWh, rangeM, chargeW, logVemInfo)
         }
     }
 
@@ -3372,7 +3384,25 @@ class SessionManager(
 
     private fun sendEnergyModelWithTuning(
         session: AasdkSession, batteryWh: Int, capacityWh: Int, rangeM: Int, chargeW: Int,
+        logSafetyInfo: Boolean,
     ) {
+        val learnerReady = evLearnedEstimator?.activeSnapshot?.value?.usable == true
+        val activation = currentEvLearningActivation(learnerReady)
+        if (logSafetyInfo) {
+            DiagnosticLog.i(
+                "vem_safety",
+                "requested=${activation.requestedMode} learnerReady=${activation.learnerReady} " +
+                    "wireEffective=${activation.wireEffectiveMode} safetyHolds=${activation.safetyHolds.joinToString(",")}",
+            )
+        }
+        if (!activation.wireTuningAllowed) {
+            // Production safety chokepoint: neither learned nor manually/profile-tuned
+            // coefficients may reach the external VEM until its semantics and receiver
+            // behavior have been validated. Observer/collector lifecycle is irrelevant.
+            session.sendEnergyModel(batteryWh, capacityWh, rangeM, chargeW)
+            return
+        }
+
         // EPA baseline path: master tuning OFF, but user opted in to "use EPA
         // as baseline". Apply driving Wh/km and max charge kW from the bundled
         // profile when available. All other fields stay at hardcoded defaults
@@ -3400,6 +3430,18 @@ class SessionManager(
             reservePct = evReservePct.toFloat(),
             maxChargeW = evMaxChargeKw * 1000,
             maxDischargeW = evMaxDischargeKw * 1000,
+        )
+    }
+
+    private fun currentEvLearningActivation(learnerReady: Boolean): EvLearningActivationPolicy.State {
+        val requestedMode = when {
+            !evTuningEnabled && evUseEpaBaseline -> "epa-baseline"
+            else -> evDrivingMode
+        }
+        return EvLearningActivationPolicy.evaluate(
+            tuningEnabled = evTuningEnabled || evUseEpaBaseline,
+            requestedMode = requestedMode,
+            learnerReady = learnerReady,
         )
     }
 
@@ -3444,7 +3486,9 @@ class SessionManager(
             "vem",
             "sendCurrentEnergyModel[$reason]: level=${batteryWh}Wh cap=${capacityWh}Wh range=${rangeM}m charge=${chargeW}W${evTuningSummary(batteryWh, rangeM)}",
         )
-        sendEnergyModelWithTuning(session, batteryWh, capacityWh, rangeM, chargeW)
+        sendEnergyModelWithTuning(
+            session, batteryWh, capacityWh, rangeM, chargeW, logSafetyInfo = true,
+        )
         return true
     }
 

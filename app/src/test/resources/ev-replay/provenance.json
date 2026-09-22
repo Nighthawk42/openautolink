@@ -1,0 +1,8 @@
+{
+  "eventCount": 2468,
+  "fixtureBytes": 329979,
+  "fixturePath": "app/src/test/resources/ev-replay/0.1.501-a7ddb384-sanitized.jsonl",
+  "fixtureSha256": "4d08a86de9cbb86b55f5972873118fb17f331f8bf70a8a70d4e267c7743e2d3f",
+  "release": "0.1.501",
+  "sourceArchiveSha256": "a7ddb384fa9ac0e998238d1dbce371b5a0c93b3cfd0d07405712bac419f6662d"
+}

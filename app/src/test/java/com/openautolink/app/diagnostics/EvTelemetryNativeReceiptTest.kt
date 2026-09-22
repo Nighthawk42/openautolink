@@ -8,6 +8,58 @@ import java.nio.file.Files
 import kotlin.coroutines.CoroutineContext
 
 class EvTelemetryNativeReceiptTest {
+    @Test fun nativeActiveBoundaryRotatesOnceAndDuplicatePreservesEpoch() {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val session = AasdkSession(scope, io.mockk.mockk(relaxed = true))
+        val callback = session.javaClass.getDeclaredMethod("telemetryCallback").apply { isAccessible = true }
+            .invoke(session) as com.openautolink.app.transport.aasdk.AasdkSessionCallback
+        val recorder = EvTelemetryRecorder.instance
+        val dir = Files.createTempDirectory("ev-active-boundary").toFile()
+        try {
+            recorder.session(session.evTelemetryToken); recorder.enable(dir)
+            callback.onNavigationStatus(1)
+            callback.onNavigationStatus(1)
+            callback.onNavigationStatus(3)
+            assertTrue(recorder.flushForUpload())
+            val records = dir.listFiles()!!.flatMap { it.readLines() }
+            val active = records.filter { it.contains("\"type\":\"route_active\"") }
+            assertEquals(2, active.size)
+            val epochs = active.map {
+                (kotlinx.serialization.json.Json.parseToJsonElement(it) as kotlinx.serialization.json.JsonObject)["routeEpochId"].toString()
+            }
+            assertEquals(1, epochs.distinct().size)
+            val reroute = records.single { it.contains("\"type\":\"reroute\"") }
+            assertFalse(reroute.contains(epochs.first()))
+            assertTrue(records.any {
+                it.contains("\"type\":\"navigation_status\"") &&
+                    it.contains("\"status\":3") && it.contains("\"statusName\":\"REROUTING\"")
+            })
+        } finally { scope.cancel(); recorder.disable(); recorder.flushForUpload(); dir.deleteRecursively() }
+    }
+
+    @Test fun nativeReceiptNormalizesOnlyExplicitPositiveDestinationNumbers() {
+        val source = java.io.File("src/main/java/com/openautolink/app/transport/aasdk/AasdkSession.kt").readText()
+        val first = source.indexOf("override fun onNavigationFullState(")
+        val start = source.indexOf("override fun onNavigationFullState(", first + 1)
+        val callback = source.substring(start, source.indexOf("override fun onVehicleEnergyForecast(", start))
+        assertTrue(callback.contains("destDistanceMeters.takeIf { it > 0 }"))
+        assertTrue(callback.contains("timeToArrivalSeconds.takeIf { it > 0 }"))
+        assertFalse(callback.contains("takeIf { it >= 0 }"))
+    }
+
+    @Test fun jniUsesNegativeSentinelsForAbsentNavigationNumbers() {
+        val source = java.io.File("src/main/cpp/jni_channel_handlers.cpp").readText()
+        val state = source.substring(source.indexOf("void JniNavStatusHandler::onNavigationState"),
+            source.indexOf("void JniNavStatusHandler::onCurrentPosition"))
+        val position = source.substring(source.indexOf("void JniNavStatusHandler::onCurrentPosition"))
+        assertTrue(state.contains("nullptr, 0,\n        -1, -1"))
+        assertTrue(state.contains("\"\", destination, \"\", -1, -1"))
+        assertTrue(position.contains("int distanceMeters = -1;"))
+        assertTrue(position.contains("int etaSeconds = -1;"))
+        assertTrue(position.contains("long long timeToArrivalSeconds = -1;"))
+        assertTrue(position.contains("int destDistanceMeters = -1;"))
+    }
+
     @Test fun currentNativeAdapterClearsForecastWhenNavigationEnds() {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         val session = AasdkSession(scope, io.mockk.mockk(relaxed = true))

@@ -1,8 +1,10 @@
 package com.openautolink.app.input
 
 import com.openautolink.app.transport.ControlMessage
+import com.openautolink.app.transport.VehiclePropertyObservation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VehicleObservationTest {
@@ -148,6 +150,41 @@ class VehicleObservationTest {
                 }
             }
         } finally { writer.join() }
+    }
+
+    @Test fun concurrentHistorySnapshotsKeepMotorPowerAndObservationTogether() {
+        val forwarder = forwarder()
+        val holderField = forwarder.javaClass.getDeclaredField("latestMotorPowerSnapshot")
+            .apply { isAccessible = true }
+        val holderClass = forwarder.javaClass.declaredClasses
+            .single { it.simpleName == "MotorPowerSnapshot" }
+        val constructor = holderClass.declaredConstructors.single().apply { isAccessible = true }
+        val writer = Thread {
+            repeat(2_000) { sequence ->
+                holderField.set(
+                    forwarder,
+                    constructor.newInstance(
+                        sequence.toFloat(),
+                        VehiclePropertyObservation(sequence.toLong(), sequence.toLong(), 0, "test"),
+                    ),
+                )
+            }
+        }
+        writer.start()
+        try {
+            repeat(2_000) {
+                val data = snapshot(forwarder)
+                data.evMotorPowerW?.let { power ->
+                    val observation = data.evObservationMetadata.getValue("EV_MOTOR_POWER")
+                    assertEquals(power.toLong(), observation.timestampElapsedNanos)
+                }
+            }
+        } finally { writer.join() }
+
+        val source = java.io.File("src/main/java/com/openautolink/app/input/VehicleDataForwarderImpl.kt").readText()
+        assertTrue(source.contains("@Volatile private var latestMotorPowerSnapshot"))
+        org.junit.Assert.assertFalse(source.contains("latestMotorPowerObservation"))
+        org.junit.Assert.assertFalse(source.contains("latestMotorPowerW:"))
     }
 
     @Test fun nullValueRetainsPreviousNumericValueButRecordsUnavailableObservation() {
