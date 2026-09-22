@@ -985,6 +985,7 @@ class SessionManager(
 
     private fun forwardVehicleData(vd: ControlMessage.VehicleData) {
         val session = aasdkSession ?: return
+        com.openautolink.app.diagnostics.EvContributionService.onVehicle(vd)
         if (EvTelemetryRecorder.instance.enabled) {
             val learned = evLearnedEstimator?.activeSnapshot?.value
             val runtime = evLearnedEstimator?.runtimeState?.value

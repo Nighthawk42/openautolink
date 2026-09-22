@@ -2822,6 +2822,32 @@ private fun DiagnosticsSettingsTab(
             )
         }
 
+        Row(
+            modifier = Modifier.fillMaxWidth(0.7f).padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Automatic compact EV contribution", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    "Off by default and separate from manual diagnostic upload. With your one-time opt-in, " +
+                        "the app retains compact battery, distance, forecast, and EV configuration data " +
+                        "offline and sends completed drives later while parked on validated internet. " +
+                        "It includes no destinations, coordinates, VIN, device identifiers, or general logs.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (uiState.evContributionConsent) {
+                    Button(onClick = viewModel::deletePendingEvContributions) {
+                        Text("Delete pending compact contributions")
+                    }
+                }
+            }
+            Switch(
+                checked = uiState.evContributionConsent,
+                onCheckedChange = viewModel::updateEvContributionConsent,
+                modifier = Modifier.testTag("evContributionConsentToggle"),
+            )
+        }
+
         // ── Log Upload (maintainer) ────────────────────────────────────
         // OFF by default. Uploads recent diagnostic logs to the maintainer's
         // own server. Only meant for the maintainer's own car + phones.

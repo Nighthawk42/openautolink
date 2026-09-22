@@ -1280,6 +1280,7 @@ class AasdkSession(
             receivedAtElapsedMs = SystemClock.elapsedRealtime(),
         )
         com.openautolink.app.diagnostics.EvTelemetryRecorder.instance.forecast(evTelemetryToken, receivedForecast)
+        com.openautolink.app.diagnostics.EvContributionService.onForecast(receivedForecast)
         _vehicleEnergyForecast.value = receivedForecast
         com.openautolink.app.diagnostics.DiagnosticLog.i(
             "vem",

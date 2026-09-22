@@ -146,6 +146,9 @@ class AppPreferences private constructor(private val dataStore: DataStore<Prefer
         // recent log files and POSTs them. Never imposed on other users — the
         // button and the feature are entirely gated behind LOG_UPLOAD_ENABLED.
         val LOG_UPLOAD_ENABLED = booleanPreferencesKey("log_upload_enabled")
+        // Separate, explicit consent for compact EV-only automatic contributions.
+        // Existing upload credentials and LOG_UPLOAD_ENABLED never migrate into consent.
+        val EV_CONTRIBUTION_CONSENT = booleanPreferencesKey("ev_contribution_consent_v1")
 
         // Floating "simulate ignition cycle" button. OFF by default, maintainer
         // tool. Reproduces the shutdown -> Bluetooth loss -> republish ->
@@ -331,6 +334,7 @@ class AppPreferences private constructor(private val dataStore: DataStore<Prefer
         const val DEFAULT_LOGCAT_CAPTURE_ENABLED = true
         const val DEFAULT_LOG_PERSIST_ENABLED = false
         const val DEFAULT_LOG_UPLOAD_ENABLED = false
+        const val DEFAULT_EV_CONTRIBUTION_CONSENT = false
         const val DEFAULT_SIMULATE_IGNITION_BUTTON = false
         const val DEFAULT_KNOWN_PHONE_IPS = ""
         const val DEFAULT_LOG_UPLOAD_URL = ""
@@ -585,6 +589,10 @@ class AppPreferences private constructor(private val dataStore: DataStore<Prefer
         prefs[LOG_UPLOAD_ENABLED] ?: DEFAULT_LOG_UPLOAD_ENABLED
     }
 
+    val evContributionConsent: Flow<Boolean> = dataStore.data.map { prefs ->
+        prefs[EV_CONTRIBUTION_CONSENT] ?: DEFAULT_EV_CONTRIBUTION_CONSENT
+    }
+
     val simulateIgnitionButton: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[SIMULATE_IGNITION_BUTTON] ?: DEFAULT_SIMULATE_IGNITION_BUTTON
     }
@@ -729,6 +737,10 @@ class AppPreferences private constructor(private val dataStore: DataStore<Prefer
 
     suspend fun setLogUploadEnabled(value: Boolean) {
         dataStore.edit { it[LOG_UPLOAD_ENABLED] = value }
+    }
+
+    suspend fun setEvContributionConsent(value: Boolean) {
+        dataStore.edit { it[EV_CONTRIBUTION_CONSENT] = value }
     }
 
     suspend fun setSimulateIgnitionButton(value: Boolean) {

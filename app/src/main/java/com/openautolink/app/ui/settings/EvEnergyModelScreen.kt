@@ -103,6 +103,22 @@ fun EvEnergyModelTab(
             )
             Spacer(Modifier.height(16.dp))
             LiveReadoutCard(readout, state.tuningEnabled)
+            Spacer(Modifier.height(8.dp))
+            Card(modifier = Modifier.fillMaxWidth(0.85f)) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("Safety and shadow status", fontWeight = FontWeight.SemiBold)
+                    Text("Selected: ${state.drivingMode}", style = MaterialTheme.typography.bodySmall)
+                    Text("Effective on Maps wire: existing unlearned model", style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        "Safety hold: learned, manual, multiplier, and profile values are not sent while the external contract is unvalidated.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Text(
+                        "Shadow learner: always observing valid consumption samples (${learned.lastTickStatus.ifBlank { "awaiting data" }}); navigation is not required.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
 
             Spacer(Modifier.height(24.dp))
             HorizontalDivider(modifier = Modifier.fillMaxWidth(0.7f))
@@ -235,7 +251,7 @@ private fun LiveReadoutCard(r: EvEnergyModelViewModel.LiveReadout, tuningEnabled
             ReadoutRow("Charging", if (r.chargeW > 0) "${r.chargeW / 1000} kW" else "—")
             ReadoutRow("Derived rate", "%.0f Wh/km".format(r.derivedWhPerKm))
             ReadoutRow(
-                label = "Effective rate",
+                label = "Selected preview rate (not sent)",
                 value = "%.0f Wh/km".format(r.effectiveWhPerKm),
                 emphasized = tuningEnabled && r.effectiveWhPerKm != r.derivedWhPerKm,
             )
@@ -578,8 +594,8 @@ private fun LearnedStatusCard(
             ) { Text("Reset learned rate") }
             Spacer(Modifier.height(6.dp))
             Text(
-                "Stored per vehicle (Make|Model|Year). Not learned while " +
-                    "charging. Resets automatically after long gaps.",
+                "Stored per compatible model/capacity band with estimator revision and energy basis (no VIN). " +
+                    "Not learned while charging; stale observations and long gaps are excluded.",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -47,6 +47,14 @@ class OalApplication : Application() {
         // shutdown burns a 45s timeout into a dead WiFi.
         com.openautolink.app.input.IgnitionMonitor.start(this)
 
+        // Independent default-off compact EV contribution runtime. Initialization
+        // performs no network request; uploads are considered only on later parked ticks.
+        com.openautolink.app.diagnostics.EvContributionService.initialize(this)
+        // Shadow learning is process-scoped and independent of the selected outgoing mode.
+        com.openautolink.app.data.EvLearnedRateEstimator.getInstance(
+            com.openautolink.app.data.AppPreferences.getInstance(this),
+        )
+
         // Passive, process-scope pre-wake diagnostics. This must be initialized
         // after the VHAL observer and before Bluetooth advertising so it can
         // observe (but never cause) the complete pre-ignition sequence.

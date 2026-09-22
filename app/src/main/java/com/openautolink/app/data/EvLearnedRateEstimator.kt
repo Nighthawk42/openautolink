@@ -38,7 +38,8 @@ import java.util.concurrent.atomic.AtomicLong
  * the only viable distance source — it's also what the dashboard's own trip
  * computer uses.)
  *
- * Per-vehicle state (keyed by `Make|Model|Year`) is persisted to DataStore
+ * Per-configuration state (model plus capacity band, estimator revision and
+ * energy basis; never VIN) is persisted to DataStore
  * as a small JSON blob so the value survives car-off / sleep / app restart.
  *
  * See docs/ev-energy-model-tuning-plan.md.
@@ -130,6 +131,9 @@ class EvLearnedRateEstimator private constructor(
         private const val BATTERY_OBSERVATION = "EV_BATTERY_LEVEL"
         // Throttle DataStore writes so we don't thrash on every sub-second tick.
         private const val PERSIST_DEBOUNCE_MS = 5_000L
+        private const val ESTIMATOR_REVISION = "rev2"
+        private const val ENERGY_BASIS = "absolute-wh"
+        private const val CAPACITY_BAND_WH = 5_000
 
         @Volatile private var instance: EvLearnedRateEstimator? = null
 
@@ -147,6 +151,17 @@ class EvLearnedRateEstimator private constructor(
             scope: CoroutineScope,
             config: Config = Config(),
         ): EvLearnedRateEstimator = EvLearnedRateEstimator(store, scope, config)
+
+        /** Fail closed when configuration identity is incomplete or implausible. */
+        internal fun calibrationKey(vd: ControlMessage.VehicleData): String? {
+            val make = vd.carMake?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            val model = vd.carModel?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            val year = vd.carYear?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            val capacity = vd.evBatteryCapacityWh?.takeIf { it.isFinite() && it > 0f } ?: return null
+            val band = (capacity.toInt() / CAPACITY_BAND_WH) * CAPACITY_BAND_WH
+            return listOf(make, model, year, "cap${band}-${band + CAPACITY_BAND_WH}", ESTIMATOR_REVISION, ENERGY_BASIS)
+                .joinToString("|")
+        }
 
         /**
          * Pure tick math. Mutates `s` in place, returns a short status string.
@@ -423,12 +438,7 @@ class EvLearnedRateEstimator private constructor(
         }
     }
 
-    private fun keyOf(vd: ControlMessage.VehicleData): String? {
-        val mk = vd.carMake?.takeIf { it.isNotBlank() } ?: return null
-        val md = vd.carModel?.takeIf { it.isNotBlank() } ?: return null
-        val yr = vd.carYear?.takeIf { it.isNotBlank() } ?: "?"
-        return "$mk|$md|$yr"
-    }
+    private fun keyOf(vd: ControlMessage.VehicleData): String? = calibrationKey(vd)
 
     /**
      * Feed one VHAL tick. No-op when the data is too thin to learn from.
