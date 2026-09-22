@@ -2829,16 +2829,17 @@ private fun DiagnosticsSettingsTab(
             Column(modifier = Modifier.weight(1f)) {
                 Text("Automatic compact EV contribution", style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    "Off by default and separate from manual diagnostic upload. With your one-time opt-in, " +
-                        "the app retains compact battery, distance, forecast, and EV configuration data " +
-                        "offline and sends completed drives later while parked on validated internet. " +
-                        "It includes no destinations, coordinates, VIN, device identifiers, or general logs.",
+                    "Off by default and separate from manual diagnostic upload. Opt-in is bound to compact schema v2, " +
+                        "the HTTPS server origin, and a fingerprint of the current upload token; changing either pauses it until you opt in again. " +
+                        "Completed drives are queued as compact ZIPs and sent only after a real Park or ignition-off sample, on validated internet, " +
+                        "outside startup and with no active or reconnecting projection. Records use minute time buckets and include battery, distance, " +
+                        "forecast, coarse capacity, gear/ignition and EV configuration fields. It includes no destinations, coordinates, VIN, device identifiers, or general logs. " +
+                        "No raw payloads or raw token are stored. " +
+                        "Turning this off preserves pending ZIPs until you delete them below.",
                     style = MaterialTheme.typography.bodySmall,
                 )
-                if (uiState.evContributionConsent) {
-                    Button(onClick = viewModel::deletePendingEvContributions) {
-                        Text("Delete pending compact contributions")
-                    }
+                Button(onClick = viewModel::deletePendingEvContributions) {
+                    Text("Delete pending compact contributions")
                 }
             }
             Switch(

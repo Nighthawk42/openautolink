@@ -108,6 +108,14 @@ class SessionManager(
         @Volatile
         private var instance: SessionManager? = null
 
+        @Volatile
+        private var processEvLearnedEstimator: EvLearnedRateEstimator? = null
+
+        fun installEvLearnedEstimator(estimator: EvLearnedRateEstimator) {
+            processEvLearnedEstimator = estimator
+            instance?.evLearnedEstimator = estimator
+        }
+
         fun getInstance(scope: CoroutineScope, context: Context, audioManager: AudioManager): SessionManager {
             return instance ?: synchronized(this) {
                 instance ?: SessionManager(scope, context, audioManager).also { instance = it }
@@ -664,7 +672,7 @@ class SessionManager(
      *  is available; null on the (rare) early ticks before that. The UI
      *  reads the same singleton directly via [EvLearnedRateEstimator.getInstance]
      *  so the EV screen works even when no session has started. */
-    private var evLearnedEstimator: EvLearnedRateEstimator? = null
+    private var evLearnedEstimator: EvLearnedRateEstimator? = processEvLearnedEstimator
     val evLearnedSnapshot: StateFlow<EvLearnedRateEstimator.Snapshot>?
         get() = evLearnedEstimator?.activeSnapshot
 
@@ -984,8 +992,10 @@ class SessionManager(
     @Volatile private var evTelemetryRequested: Map<String, Any?> = emptyMap()
 
     private fun forwardVehicleData(vd: ControlMessage.VehicleData) {
-        val session = aasdkSession ?: return
+        val now = SystemClock.elapsedRealtime()
+        evLearnedEstimator?.onVehicleTick(vd, now)
         com.openautolink.app.diagnostics.EvContributionService.onVehicle(vd)
+        val session = aasdkSession ?: return
         if (EvTelemetryRecorder.instance.enabled) {
             val learned = evLearnedEstimator?.activeSnapshot?.value
             val runtime = evLearnedEstimator?.runtimeState?.value
@@ -1044,8 +1054,6 @@ class SessionManager(
                 _vehicleBatteryCapacityWh.value = capacityWh
                 ClusterNavigationState.batteryCapacityWh = capacityWh
             }
-            val now = SystemClock.elapsedRealtime()
-            evLearnedEstimator?.onVehicleTick(vd, now)
             refreshEvProfileLookup(vd)
             val movedBattery = kotlin.math.abs(batteryWh - lastVemBatteryWh) >= 100
             val movedRange = kotlin.math.abs(rangeM - lastVemRangeM) >= 500
@@ -2050,6 +2058,7 @@ class SessionManager(
     }
 
     private suspend fun stopWhileLifecycleLocked(cancelObserveJob: Boolean = true) {
+        evLearnedEstimator?.resetContinuity()
         clearWirelessSessionAdmission()
         // Let another phone claim the session. Without this the first phone to
         // dial holds it until the app restarts, so a second phone in the car can

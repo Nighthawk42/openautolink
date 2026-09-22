@@ -26,9 +26,9 @@ class EvContributionManagerTest {
     @Test fun `closed contributions survive recreation and are oldest first`() {
         val root = dir()
         EvContributionQueue(root, maxBytes = 10_000, maxFiles = 8).apply {
-            append("b", 20, "{\"type\":\"vehicle\"}")
+            append("b", 20, "{\"schema\":2,\"type\":\"vehicle\"}")
             close("b", 21)
-            append("a", 10, "{\"type\":\"vehicle\"}")
+            append("a", 10, "{\"schema\":2,\"type\":\"vehicle\"}")
             close("a", 11)
         }
         val restored = EvContributionQueue(root, maxBytes = 10_000, maxFiles = 8)
@@ -38,7 +38,7 @@ class EvContributionManagerTest {
     @Test fun `process recreation closes an interrupted drive without losing it`() {
         val root = dir()
         EvContributionQueue(root, maxBytes = 10_000, maxFiles = 8)
-            .append("wife-drive", 10, "{\"type\":\"vehicle\",\"batteryWh\":50000}")
+            .append("wife-drive", 10, "{\"schema\":2,\"type\":\"vehicle\",\"batteryWh\":50000}")
         val restored = EvContributionQueue(root, maxBytes = 10_000, maxFiles = 8)
         assertEquals(1, restored.recoverInterrupted(20))
         assertEquals("wife-drive", restored.pending().single().id)
@@ -46,9 +46,9 @@ class EvContributionManagerTest {
 
     @Test fun `queue is bounded and evicts oldest completed contribution`() {
         val root = dir()
-        val queue = EvContributionQueue(root, maxBytes = 100, maxFiles = 2)
+        val queue = EvContributionQueue(root, maxBytes = 10_000, maxFiles = 2)
         for (id in listOf("a", "b", "c")) {
-            queue.append(id, id[0].code.toLong(), "{\"type\":\"vehicle\",\"safetyHolds\":\"1234567890\"}")
+            queue.append(id, id[0].code.toLong(), "{\"schema\":2,\"type\":\"vehicle\",\"safetyHolds\":\"1234567890\"}")
             queue.close(id, id[0].code.toLong())
         }
         assertEquals(listOf("b", "c"), queue.pending().map { it.id })
@@ -56,10 +56,10 @@ class EvContributionManagerTest {
     }
 
     @Test fun `privacy allowlist rejects coordinates destinations logs and identifiers`() {
-        val allowed = """{"schema":1,"type":"vehicle","batteryWh":50000,"distanceM":42,"forecastWh":49000,"config":{"capacityBandKwh":80}}"""
+        val allowed = """{"schema":2,"type":"vehicle","batteryWh":50000,"distanceM":42,"forecastWh":49000,"capacityBandKwh":80}"""
         assertEquals(allowed, EvContributionPrivacy.requireAllowedJsonLine(allowed))
         for (forbidden in listOf("latitude", "longitude", "destination", "vin", "deviceId", "token", "road", "logcat", "rawLog")) {
-            val line = "{\"type\":\"vehicle\",\"$forbidden\":\"secret\"}"
+            val line = "{\"schema\":2,\"type\":\"vehicle\",\"$forbidden\":\"secret\"}"
             assertThrows(IllegalArgumentException::class.java) { EvContributionPrivacy.requireAllowedJsonLine(line) }
         }
     }
@@ -67,15 +67,16 @@ class EvContributionManagerTest {
     @Test fun `accepted and duplicate responses delete exactly once while failures retain`() {
         val root = dir()
         val queue = EvContributionQueue(root, maxBytes = 10_000, maxFiles = 8)
-        queue.append("drive", 1, "{\"type\":\"vehicle\"}")
+        queue.append("drive", 1, "{\"schema\":2,\"type\":\"vehicle\"}")
         queue.close("drive", 2)
-        val failed = EvContributionUploader(queue) { _, _ -> EvContributionUploader.Response(503, false) }
+        val failed = EvContributionUploader(queue) { _, _ -> EvContributionUploader.Response(503, "{}") }
         assertEquals(EvContributionUploader.Outcome.RETRY, failed.uploadOldest(nowMs = 100))
         assertEquals(1, queue.pending().size)
         val retryAt = queue.pending().single().nextAttemptMs
         val duplicate = EvContributionUploader(queue) { _, key ->
             assertEquals("drive", key)
-            EvContributionUploader.Response(200, duplicate = true)
+            val digest = queue.pending().single().sha256
+            EvContributionUploader.Response(200, "{\"ok\":true,\"duplicate\":true,\"sha256\":\"$digest\"}")
         }
         assertEquals(EvContributionUploader.Outcome.ACCEPTED_DUPLICATE, duplicate.uploadOldest(nowMs = retryAt))
         assertTrue(queue.pending().isEmpty())
@@ -85,9 +86,9 @@ class EvContributionManagerTest {
     @Test fun `retry is exponential bounded and does not wake poll`() {
         val root = dir()
         val queue = EvContributionQueue(root, maxBytes = 10_000, maxFiles = 8)
-        queue.append("drive", 1, "{\"type\":\"vehicle\"}")
+        queue.append("drive", 1, "{\"schema\":2,\"type\":\"vehicle\"}")
         queue.close("drive", 2)
-        val uploader = EvContributionUploader(queue) { _, _ -> EvContributionUploader.Response(500, false) }
+        val uploader = EvContributionUploader(queue) { _, _ -> EvContributionUploader.Response(500, "{}") }
         assertEquals(EvContributionUploader.Outcome.RETRY, uploader.uploadOldest(100))
         val first = queue.pending().single().nextAttemptMs
         assertEquals(EvContributionUploader.Outcome.BACKOFF, uploader.uploadOldest(first - 1))
@@ -101,7 +102,7 @@ class EvContributionManagerTest {
         val root = dir()
         val ordinary = File(root, "oal_ordinary.log").apply { writeText("keep") }
         val queue = EvContributionQueue(File(root, "compact"), maxBytes = 10_000, maxFiles = 8)
-        queue.append("drive", 1, "{\"type\":\"vehicle\"}")
+        queue.append("drive", 1, "{\"schema\":2,\"type\":\"vehicle\"}")
         queue.close("drive", 2)
         assertEquals(1, queue.deletePending())
         assertTrue(queue.pending().isEmpty())

@@ -51,8 +51,10 @@ class OalApplication : Application() {
         // performs no network request; uploads are considered only on later parked ticks.
         com.openautolink.app.diagnostics.EvContributionService.initialize(this)
         // Shadow learning is process-scoped and independent of the selected outgoing mode.
-        com.openautolink.app.data.EvLearnedRateEstimator.getInstance(
-            com.openautolink.app.data.AppPreferences.getInstance(this),
+        com.openautolink.app.session.SessionManager.installEvLearnedEstimator(
+            com.openautolink.app.data.EvLearnedRateEstimator.getInstance(
+                com.openautolink.app.data.AppPreferences.getInstance(this),
+            ),
         )
 
         // Passive, process-scope pre-wake diagnostics. This must be initialized

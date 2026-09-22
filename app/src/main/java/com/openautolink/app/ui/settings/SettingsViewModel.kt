@@ -527,8 +527,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun updateEvContributionConsent(enabled: Boolean) {
         viewModelScope.launch {
-            preferences.setEvContributionConsent(enabled)
-            if (!enabled) com.openautolink.app.diagnostics.EvContributionService.deletePendingEvContributions()
+            val binding = if (enabled) {
+                com.openautolink.app.diagnostics.EvContributionConsentBinding.create(
+                    uiState.value.logUploadUrl,
+                    uiState.value.logUploadToken,
+                )?.encode() ?: return@launch
+            } else null
+            preferences.setEvContributionConsent(enabled, binding)
         }
     }
 

@@ -149,6 +149,7 @@ class AppPreferences private constructor(private val dataStore: DataStore<Prefer
         // Separate, explicit consent for compact EV-only automatic contributions.
         // Existing upload credentials and LOG_UPLOAD_ENABLED never migrate into consent.
         val EV_CONTRIBUTION_CONSENT = booleanPreferencesKey("ev_contribution_consent_v1")
+        val EV_CONTRIBUTION_BINDING = stringPreferencesKey("ev_contribution_binding_v2")
 
         // Floating "simulate ignition cycle" button. OFF by default, maintainer
         // tool. Reproduces the shutdown -> Bluetooth loss -> republish ->
@@ -593,6 +594,10 @@ class AppPreferences private constructor(private val dataStore: DataStore<Prefer
         prefs[EV_CONTRIBUTION_CONSENT] ?: DEFAULT_EV_CONTRIBUTION_CONSENT
     }
 
+    val evContributionBinding: Flow<String> = dataStore.data.map { prefs ->
+        prefs[EV_CONTRIBUTION_BINDING] ?: ""
+    }
+
     val simulateIgnitionButton: Flow<Boolean> = dataStore.data.map { prefs ->
         prefs[SIMULATE_IGNITION_BUTTON] ?: DEFAULT_SIMULATE_IGNITION_BUTTON
     }
@@ -739,8 +744,12 @@ class AppPreferences private constructor(private val dataStore: DataStore<Prefer
         dataStore.edit { it[LOG_UPLOAD_ENABLED] = value }
     }
 
-    suspend fun setEvContributionConsent(value: Boolean) {
-        dataStore.edit { it[EV_CONTRIBUTION_CONSENT] = value }
+    suspend fun setEvContributionConsent(value: Boolean, binding: String? = null) {
+        dataStore.edit {
+            it[EV_CONTRIBUTION_CONSENT] = value
+            if (value && !binding.isNullOrBlank()) it[EV_CONTRIBUTION_BINDING] = binding
+            if (!value) it.remove(EV_CONTRIBUTION_BINDING)
+        }
     }
 
     suspend fun setSimulateIgnitionButton(value: Boolean) {

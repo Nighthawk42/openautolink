@@ -531,6 +531,11 @@ class EvLearnedRateEstimator private constructor(
         return publishedStates[key] ?: Snapshot()
     }
 
+    /** Breaks delta continuity at projection/session lifecycle boundaries without erasing learning. */
+    fun resetContinuity() {
+        continuityGeneration.incrementAndGet()
+    }
+
     /** Clear learned state and report admission plus durable persistence status. */
     suspend fun reset(key: String? = null): ResetResult {
         if (!accepting.get()) return ResetResult.REJECTED_STOPPING
