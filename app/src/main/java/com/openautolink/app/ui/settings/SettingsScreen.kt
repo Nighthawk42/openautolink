@@ -2833,7 +2833,7 @@ private fun DiagnosticsSettingsTab(
                     "Off by default and separate from manual diagnostic upload. Opt-in is bound to compact schema v2, " +
                         "the HTTPS server origin, and a fingerprint of the current upload token; changing either revokes consent and deletes retained contribution files until you opt in again. " +
                         "Completed drives are queued as compact ZIPs and sent only after a real Park or ignition-off sample, on validated internet, " +
-                        "outside startup and with no active or reconnecting projection. Records use minute time buckets and include battery, distance, " +
+                        "outside startup and with no active or reconnecting projection. Records use elapsed minute buckets; the manifest discloses only start/completion hour buckets. They include battery, distance, " +
                         "forecast, coarse capacity, gear/ignition and EV configuration fields. It includes no destinations, coordinates, VIN, device identifiers, or general logs. " +
                         "The upload label is a generic hash of the frozen vehicle class, never the mutable device label. No raw token is stored. " +
                         "Turning this off deletes every retained contribution artifact but keeps learned calibration.",

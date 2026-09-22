@@ -82,11 +82,154 @@ data class EvVehicleCalibrationIdentity(
     }
 }
 
+class EvContributionDriveIdentityOwner(
+    private val idFactory: () -> String,
+) {
+    data class Transition(val activeId: String, val closeId: String?)
+    var activeId: String? = null
+        private set
+    var activeIdentity: EvVehicleCalibrationIdentity? = null
+        private set
+
+    @Synchronized
+    fun observe(identity: EvVehicleCalibrationIdentity): Transition {
+        val previous = activeId.takeIf { activeIdentity != null && activeIdentity != identity }
+        if (activeId == null || previous != null) {
+            activeId = idFactory()
+            activeIdentity = identity
+        }
+        return Transition(checkNotNull(activeId), previous)
+    }
+
+    @Synchronized
+    fun close(): String? = activeId.also {
+        activeId = null
+        activeIdentity = null
+    }
+
+    @Synchronized fun clear() { activeId = null; activeIdentity = null }
+}
+
 class EvContributionGenerationFence {
     private val generation = AtomicLong()
     fun snapshot(): Long = generation.get()
     fun invalidate(): Long = generation.incrementAndGet()
     fun isCurrent(snapshot: Long): Boolean = generation.get() == snapshot
+}
+
+/** Single monitor for admission, generation invalidation, and exact upload ownership. */
+class EvContributionLifecycleGate {
+    class Lease internal constructor(internal val generation: Long)
+    private var generation = 0L
+    private var uploadOwner: Lease? = null
+    private var admissionsBlocked = false
+
+    @Synchronized
+    fun admitCapture(eligible: () -> Boolean): Lease? =
+        if (!admissionsBlocked && eligible()) Lease(generation) else null
+
+    @Synchronized
+    fun admitUpload(eligible: () -> Boolean): Lease? {
+        if (admissionsBlocked || uploadOwner != null || !eligible()) return null
+        return Lease(generation).also { uploadOwner = it }
+    }
+
+    @Synchronized
+    fun invalidate(blockAdmissions: Boolean = false, update: () -> Unit = {}): Long {
+        update()
+        if (blockAdmissions) admissionsBlocked = true
+        uploadOwner = null
+        return ++generation
+    }
+
+    @Synchronized fun resumeAdmissions() { admissionsBlocked = false }
+
+    @Synchronized
+    fun <T> withCurrent(lease: Lease, action: () -> T): T? =
+        if (lease.generation == generation) action() else null
+
+    @Synchronized fun snapshot(): Lease = Lease(generation)
+
+    @Synchronized fun isCurrent(lease: Lease): Boolean = lease.generation == generation
+
+    @Synchronized
+    fun <T> exclusive(action: () -> T): T = action()
+
+    @Synchronized
+    fun releaseUpload(lease: Lease) {
+        if (uploadOwner == lease) uploadOwner = null
+    }
+}
+
+class ValidatedDefaultNetworkTracker<T : Any> {
+    enum class Change { REPLACED, UNVALIDATED, LOST, IGNORED }
+    private var current: T? = null
+
+    @Synchronized fun current(): T? = current
+
+    @Synchronized
+    fun capabilities(network: T, validated: Boolean): Change {
+        if (validated) {
+            if (current == network) return Change.IGNORED
+            current = network
+            return Change.REPLACED
+        }
+        if (current != network) return Change.IGNORED
+        current = null
+        return Change.UNVALIDATED
+    }
+
+    @Synchronized
+    fun lost(network: T): Change {
+        if (current != network) return Change.IGNORED
+        current = null
+        return Change.LOST
+    }
+}
+
+class EarliestOneShotDeadline(
+    private val now: () -> Long,
+    private val schedule: (delayMs: Long, task: () -> Unit) -> Cancellable,
+) {
+    fun interface Cancellable { fun cancel() }
+    private var deadline = Long.MAX_VALUE
+    private var ticket = 0L
+    private var pending: Cancellable? = null
+
+    @Synchronized
+    fun schedule(delayMs: Long, isCurrent: () -> Boolean, action: () -> Unit): Boolean {
+        require(delayMs >= 0)
+        val target = now() + delayMs
+        if (pending != null && deadline <= target) return false
+        pending?.cancel()
+        deadline = target
+        val ownTicket = ++ticket
+        pending = schedule(delayMs) {
+            val run = synchronized(this) {
+                if (ticket != ownTicket || deadline != target) return@synchronized false
+                pending = null
+                deadline = Long.MAX_VALUE
+                ticket++
+                isCurrent()
+            }
+            if (run) action()
+        }
+        return true
+    }
+
+    @Synchronized
+    fun cancel() {
+        pending?.cancel()
+        pending = null
+        deadline = Long.MAX_VALUE
+        ticket++
+    }
+}
+
+object EvSafeParkAttestation {
+    const val MAX_AGE_MS = 6L * 60 * 60 * 1000
+    fun isFresh(recordedAtMs: Long, nowMs: Long): Boolean =
+        recordedAtMs > 0 && nowMs >= recordedAtMs && nowMs - recordedAtMs <= MAX_AGE_MS
 }
 
 object EvContributionPolicy {
@@ -232,7 +375,7 @@ class EvContributionQueue(
 
     init {
         require(maxBytes > 0); require(maxFiles > 0); require(maxAgeMs > 0)
-        recoverArtifacts()
+        runCatching { recoverArtifacts() }
     }
 
     @Synchronized
@@ -254,7 +397,7 @@ class EvContributionQueue(
         check(existing == null || (existing.id == id && existing.startedMs == startedMs && existing.namespace == namespace && existing.vehicleLabel == vehicleLabel)) {
             "open contribution identity changed"
         }
-        if (!file.exists()) writeMeta(file, Meta(id, startedMs, 0, 0, 0, "", namespace, "ev_${id}.zip", vehicleLabel))
+        if (!file.exists()) writeMeta(file, Meta(id, startedMs, 0, 0, 0, "", namespace, "ev-contribution.zip", vehicleLabel))
         FileOutputStream(file, true).use { out ->
             out.write((safe + "\n").toByteArray(Charsets.UTF_8)); runCatching { out.fd.sync() }
         }
@@ -274,9 +417,9 @@ class EvContributionQueue(
         val logBytes = entry.file.readBytes()
         FileOutputStream(tmp).use { fos ->
             ZipOutputStream(fos).use { out ->
-                addZip(out, "ev_${entry.id}.log", logBytes)
-                val manifest = "schema=2\nid=${entry.id}\nnamespace=${entry.namespace}\nvehicleLabel=${entry.vehicleLabel}\nstartedBucket=${entry.startedMs / 3_600_000}\ncompletedBucket=${completedMs / 3_600_000}\n"
-                addZip(out, "upload_manifest.log", manifest.toByteArray(Charsets.UTF_8))
+                addZip(out, "telemetry.jsonl", logBytes)
+                val manifest = "schema=2\nvehicleClass=${entry.vehicleLabel.removePrefix("ev-class-")}\nstartedHourBucket=${entry.startedMs / 3_600_000}\ncompletedHourBucket=${completedMs / 3_600_000}\n"
+                addZip(out, "manifest.txt", manifest.toByteArray(Charsets.UTF_8))
             }
             runCatching { fos.fd.sync() }
         }
@@ -404,6 +547,16 @@ class EvContributionQueue(
             if (it.delete()) { accepted.incrementAndGet(); persistCounters() }
         }
         directory.listFiles().orEmpty().filter { it.isFile && it.name.endsWith(".tmp") }.forEach { quarantineFile(it, "crash_tmp") }
+        val publishedIds = directory.listFiles().orEmpty()
+            .filter { it.isFile && it.extension == "zip" }
+            .mapNotNull { zip -> readMeta(zip)?.takeIf { meta ->
+                meta.completedMs > 0 && meta.sha256.matches(Regex("[0-9a-f]{64}")) &&
+                    runCatching { ZipFile(zip).use { }; sha256(zip.readBytes()) == meta.sha256 }.getOrDefault(false)
+            }?.id }
+            .toSet()
+        directory.listFiles().orEmpty().filter { it.isFile && it.extension == "evc" }.forEach { source ->
+            if (readMeta(source)?.id in publishedIds) deleteUnit(source)
+        }
         directory.listFiles().orEmpty().filter { it.isFile && (it.extension == "evc" || it.extension == "zip") }.forEach { file ->
             val meta = readMeta(file)
             val validZip = file.extension != "zip" || (meta?.sha256?.matches(Regex("[0-9a-f]{64}")) == true &&
@@ -491,6 +644,7 @@ class EvContributionUploader(
     private val jitter: (Long) -> Long = { bound -> if (bound <= 0) 0 else Random.nextLong(bound + 1) },
     private val onUnauthorized: () -> Unit = {},
     private val mayMutate: () -> Boolean = { true },
+    private val mutateIfCurrent: ((() -> Outcome) -> Outcome?) = { action -> if (mayMutate()) action() else null },
     private val send: (file: File, idempotencyKey: String) -> Response,
 ) {
     data class Response(val statusCode: Int, val body: String)
@@ -508,12 +662,16 @@ class EvContributionUploader(
         if (!mayMutate()) return Outcome.CANCELLED
         if (response.statusCode == 401) { onUnauthorized(); if (!mayMutate()) return Outcome.CANCELLED; retry(entry, nowMs); return Outcome.UNAUTHORIZED }
         if (response.statusCode == 413 || response.statusCode == 422) {
-            return if (queue.quarantine(entry, response.statusCode.toString())) Outcome.QUARANTINED else retry(entry, nowMs)
+            return mutateIfCurrent {
+                if (queue.quarantine(entry, response.statusCode.toString())) Outcome.QUARANTINED else retry(entry, nowMs)
+            } ?: Outcome.CANCELLED
         }
         val ack = parseAck(response.body)
         if (response.statusCode == 200 && ack?.ok == true && ack.sha256.equals(entry.sha256, true)) {
-            if (!queue.markAccepted(entry)) return retry(entry, nowMs)
-            return if (ack.duplicate) Outcome.ACCEPTED_DUPLICATE else Outcome.ACCEPTED
+            return mutateIfCurrent {
+                if (!queue.markAccepted(entry)) retry(entry, nowMs)
+                else if (ack.duplicate) Outcome.ACCEPTED_DUPLICATE else Outcome.ACCEPTED
+            } ?: Outcome.CANCELLED
         }
         return retry(entry, nowMs)
     }
@@ -528,8 +686,10 @@ class EvContributionUploader(
         val attempts = entry.attempts + 1; val shift = (attempts - 1).coerceAtMost(20)
         val base = (BASE_BACKOFF_MS * (1L shl shift)).coerceAtMost(MAX_BACKOFF_MS)
         val extra = jitter((base / 4).coerceAtLeast(0)).coerceIn(0, MAX_BACKOFF_MS - base)
-        if (!mayMutate()) return Outcome.CANCELLED
-        queue.updateRetry(entry, attempts, nowMs + base + extra); return Outcome.RETRY
+        return mutateIfCurrent {
+            queue.updateRetry(entry, attempts, nowMs + base + extra)
+            Outcome.RETRY
+        } ?: Outcome.CANCELLED
     }
 }
 

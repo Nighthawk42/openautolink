@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.openautolink.app.data.AppPreferences
 import com.openautolink.app.transport.bluetooth.WppConfigBtServer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -543,7 +544,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun deletePendingEvContributions() {
-        com.openautolink.app.diagnostics.EvContributionService.deletePendingEvContributions()
+        viewModelScope.launch(Dispatchers.IO) {
+            com.openautolink.app.diagnostics.EvContributionService.deletePendingEvContributions()
+        }
     }
 
     fun updateSimulateIgnitionButton(enabled: Boolean) {

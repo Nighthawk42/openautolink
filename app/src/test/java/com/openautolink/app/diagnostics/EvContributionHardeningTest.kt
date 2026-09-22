@@ -34,6 +34,31 @@ class EvContributionHardeningTest {
         assertFalse(first.pseudonymousLabel.contains("Chevrolet", true))
     }
 
+    @Test fun `continuous identity rollover closes A and creates distinct immutable B`() {
+        var ids = 0
+        val owner = EvContributionDriveIdentityOwner { "drive-${++ids}" }
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        val a = EvVehicleCalibrationIdentity.from(ControlMessage.VehicleData(
+            carMake = "Maker", carModel = "Model", carYear = "2024", evBatteryCapacityWh = 80_000f,
+        ))!!
+        val b = EvVehicleCalibrationIdentity.from(ControlMessage.VehicleData(
+            carMake = "Maker", carModel = "Model", carYear = "2024", evBatteryCapacityWh = 90_000f,
+        ))!!
+        val started = mutableMapOf<String, Long>()
+        fun tick(identity: EvVehicleCalibrationIdentity, at: Long) {
+            val transition = owner.observe(identity)
+            transition.closeId?.let { q.close(it, at) }
+            val startedAt = started.getOrPut(transition.activeId) { at }
+            q.append(transition.activeId, startedAt, vehicleLine(identity.pseudonymousLabel.removePrefix("ev-class-")), "owner", identity.pseudonymousLabel)
+        }
+        tick(a, 1); tick(a, 2); tick(b, 3)
+        q.close(owner.close()!!, 4)
+
+        assertEquals(listOf("drive-1", "drive-2"), q.pending().map { it.id })
+        assertEquals(2, q.pending().map { it.vehicleLabel }.distinct().size)
+        assertTrue(q.pending().none { it.vehicleLabel.contains("VIN", true) })
+    }
+
     @Test fun `strict record schema rejects wrong types ranges enums and free text`() {
         assertEquals(vehicleLine(), EvContributionPrivacy.requireAllowedJsonLine(vehicleLine()))
         val forecast = """{"schema":2,"type":"forecast","elapsedBucketS":60,"forecastWh":49000,"forecastDistanceM":12000,"forecastQuality":2,"vehicleClass":"0123456789abcdef"}"""
@@ -121,6 +146,162 @@ class EvContributionHardeningTest {
         assertEquals(EvContributionUploader.Outcome.CANCELLED, outcome)
         assertEquals(1, q.pending().size)
         assertEquals(0, q.pending().single().attempts)
+    }
+
+    @Test fun `generation invalidation at mutation barrier leaves queue metadata untouched`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val gate = EvContributionLifecycleGate()
+        val lease = gate.admitUpload { true }!!
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        var outcome: EvContributionUploader.Outcome? = null
+        val worker = thread {
+            outcome = EvContributionUploader(
+                q,
+                mayMutate = { gate.isCurrent(lease) },
+                mutateIfCurrent = { action ->
+                    entered.countDown(); release.await(5, TimeUnit.SECONDS)
+                    gate.withCurrent(lease, action)
+                },
+            ) { _, _ -> EvContributionUploader.Response(422, "{}") }.uploadOldest(10, "owner")
+        }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        gate.invalidate(); release.countDown(); worker.join(5_000)
+
+        assertEquals(EvContributionUploader.Outcome.CANCELLED, outcome)
+        assertEquals(1, q.pending().size)
+        assertEquals(0, q.pending().single().attempts)
+        assertEquals(0, q.counters().quarantined)
+    }
+
+    @Test fun `cancel closes exact blocking request body and later clean attempt succeeds`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val entered = CountDownLatch(1); val released = CountDownLatch(1); val bodyClosed = AtomicBoolean(false)
+        val blockingBody = object : java.io.OutputStream() {
+            override fun write(b: Int) = Unit
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                entered.countDown()
+                released.await(5, TimeUnit.SECONDS)
+                if (bodyClosed.get()) throw java.io.IOException("cancelled")
+            }
+            override fun close() { bodyClosed.set(true); released.countDown() }
+        }
+        val blockedConnection = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = blockingBody
+            override fun getResponseCode() = 200
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        val transport = EvContributionHttpTransport { blockedConnection }
+        val worker = thread { runCatching { transport.send("https://logs.example/upload", "token", "ev-class-test", q.pending().single().file) } }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+
+        transport.cancel(); worker.join(5_000)
+
+        assertTrue(bodyClosed.get())
+        assertFalse(worker.isAlive)
+
+        val wire = java.io.ByteArrayOutputStream()
+        val clean = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = wire
+            override fun getResponseCode() = 200
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        assertEquals(200, EvContributionHttpTransport { clean }.send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ).statusCode)
+        assertTrue(wire.size() > 0)
+    }
+
+    @Test fun `upload check to start is generation owned and invalidation wins barrier`() {
+        val gate = EvContributionLifecycleGate()
+        val checked = CountDownLatch(1); val releaseCheck = CountDownLatch(1)
+        var lease: EvContributionLifecycleGate.Lease? = null
+        val admission = thread {
+            lease = gate.admitUpload {
+                checked.countDown(); releaseCheck.await(5, TimeUnit.SECONDS); true
+            }
+        }
+        assertTrue(checked.await(5, TimeUnit.SECONDS))
+        val invalidated = CountDownLatch(1)
+        val safety = thread { gate.invalidate(); invalidated.countDown() }
+        releaseCheck.countDown(); admission.join(5_000); safety.join(5_000)
+
+        assertTrue(invalidated.await(1, TimeUnit.SECONDS))
+        assertNotNull(lease)
+        assertFalse(gate.isCurrent(lease!!))
+        assertNull(gate.withCurrent(lease!!) { "opened" })
+    }
+
+    @Test fun `capture admitted before revoke cannot append after revoke returns`() {
+        val gate = EvContributionLifecycleGate()
+        val lease = gate.admitCapture { true }!!
+        gate.invalidate()
+        var appended = false
+
+        val result = gate.withCurrent(lease) { appended = true }
+
+        assertNull(result)
+        assertFalse(appended)
+        assertNull(gate.admitCapture { false })
+    }
+
+    @Test fun `delete blocks new capture and upload admission until cleanup releases barrier`() {
+        val gate = EvContributionLifecycleGate()
+        gate.invalidate(blockAdmissions = true)
+        assertNull(gate.admitCapture { true })
+        assertNull(gate.admitUpload { true })
+        gate.resumeAdmissions()
+        assertNotNull(gate.admitCapture { true })
+    }
+
+    @Test fun `validated default network replacement ignores stale loss`() {
+        val tracker = ValidatedDefaultNetworkTracker<String>()
+        assertEquals(ValidatedDefaultNetworkTracker.Change.REPLACED, tracker.capabilities("A", true))
+        assertEquals(ValidatedDefaultNetworkTracker.Change.REPLACED, tracker.capabilities("B", true))
+        assertEquals(ValidatedDefaultNetworkTracker.Change.IGNORED, tracker.lost("A"))
+        assertEquals("B", tracker.current())
+        assertEquals(ValidatedDefaultNetworkTracker.Change.LOST, tracker.lost("B"))
+        assertNull(tracker.current())
+    }
+
+    @Test fun `deadline scheduler keeps earliest generation owned one shot`() {
+        var now = 1_000L
+        data class Pending(val delay: Long, val task: () -> Unit, var cancelled: Boolean = false)
+        val pending = mutableListOf<Pending>()
+        val scheduler = EarliestOneShotDeadline(
+            now = { now },
+            schedule = { delay, task ->
+                val item = Pending(delay, task); pending += item
+                object : EarliestOneShotDeadline.Cancellable { override fun cancel() { item.cancelled = true } }
+            },
+        )
+        var generationCurrent = true
+        var fires = 0
+        assertTrue(scheduler.schedule(100, { generationCurrent }) { fires++ })
+        assertFalse(scheduler.schedule(200, { generationCurrent }) { fires++ })
+        assertTrue(scheduler.schedule(50, { generationCurrent }) { fires++ })
+        assertEquals(2, pending.size)
+        assertTrue(pending.first().cancelled)
+        now += 50; pending.last().task(); pending.last().task()
+        assertEquals(1, fires)
+        generationCurrent = false
+        assertTrue(scheduler.schedule(10, { generationCurrent }) { fires++ })
+        pending.last().task()
+        assertEquals(1, fires)
+    }
+
+    @Test fun `safe parked attestation is fresh only inside bounded restart window`() {
+        assertTrue(EvSafeParkAttestation.isFresh(recordedAtMs = 10_000, nowMs = 10_000 + EvSafeParkAttestation.MAX_AGE_MS))
+        assertFalse(EvSafeParkAttestation.isFresh(recordedAtMs = 10_000, nowMs = 10_001 + EvSafeParkAttestation.MAX_AGE_MS))
+        assertFalse(EvSafeParkAttestation.isFresh(recordedAtMs = 0, nowMs = 10_000))
+        assertFalse(EvSafeParkAttestation.isFresh(recordedAtMs = 20_000, nowMs = 10_000))
     }
 
     @Test fun `event driven drain uploads offline batches oldest first when network later arrives`() {

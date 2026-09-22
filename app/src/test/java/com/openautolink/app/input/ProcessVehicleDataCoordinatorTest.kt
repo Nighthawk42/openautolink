@@ -73,12 +73,30 @@ class ProcessVehicleDataCoordinatorTest {
         assertNull(coordinator.sessionConsumer())
 
         coordinator.attachSessionConsumer { projected += it }
+        assertEquals(listOf(offline), projected)
+
         val online = offline.copy(speedKmh = 20f)
         coordinator.onRawBatch(online)
 
-        assertEquals(listOf(online), projected)
+        assertEquals(listOf(offline, online), projected)
         assertEquals(2, learned.size)
         assertEquals(2, contributed.size)
+    }
+
+    @Test
+    fun `stale attachment cannot detach replacement consumer`() {
+        val first = mutableListOf<ControlMessage.VehicleData>()
+        val second = mutableListOf<ControlMessage.VehicleData>()
+        val coordinator = ProcessVehicleDataCoordinator({ _, _ -> }, {}, { 0L })
+        val firstAttachment = coordinator.attachSessionConsumer { first += it }
+        coordinator.attachSessionConsumer { second += it }
+
+        coordinator.detachSessionConsumer(firstAttachment)
+        val event = ControlMessage.VehicleData(speedKmh = 7f)
+        coordinator.onRawBatch(event)
+
+        assertTrue(first.isEmpty())
+        assertEquals(listOf(event), second)
     }
 
     @Test

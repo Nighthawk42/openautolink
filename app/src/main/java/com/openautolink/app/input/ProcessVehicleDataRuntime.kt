@@ -21,27 +21,47 @@ internal class ProcessVehicleDataCoordinator(
     private val contribute: (ControlMessage.VehicleData) -> Unit,
     private val elapsedRealtime: () -> Long = SystemClock::elapsedRealtime,
 ) {
+    class SessionAttachment internal constructor(internal val id: Long)
+
     private val _latestVehicleData = MutableStateFlow(ControlMessage.VehicleData())
     val latestVehicleData: StateFlow<ControlMessage.VehicleData> = _latestVehicleData.asStateFlow()
 
-    @Volatile private var projectionConsumer: ((ControlMessage.VehicleData) -> Unit)? = null
+    private val consumerLock = Any()
+    private var retainedVehicleData: ControlMessage.VehicleData? = null
+    private var projectionConsumer: ((ControlMessage.VehicleData) -> Unit)? = null
+    private var projectionAttachmentId = 0L
 
     fun onRawBatch(data: ControlMessage.VehicleData) {
-        _latestVehicleData.value = data
-        learn(data, elapsedRealtime())
-        contribute(data)
-        projectionConsumer?.invoke(data)
+        synchronized(consumerLock) {
+            retainedVehicleData = data
+            _latestVehicleData.value = data
+            learn(data, elapsedRealtime())
+            contribute(data)
+            projectionConsumer?.invoke(data)
+        }
     }
 
-    fun attachSessionConsumer(consumer: (ControlMessage.VehicleData) -> Unit) {
-        projectionConsumer = consumer
+    fun attachSessionConsumer(consumer: (ControlMessage.VehicleData) -> Unit): SessionAttachment {
+        synchronized(consumerLock) {
+            projectionConsumer = consumer
+            val attachment = SessionAttachment(++projectionAttachmentId)
+            retainedVehicleData?.let(consumer)
+            return attachment
+        }
     }
 
     fun detachSessionConsumer() {
-        projectionConsumer = null
+        synchronized(consumerLock) { projectionConsumer = null }
     }
 
-    internal fun sessionConsumer(): ((ControlMessage.VehicleData) -> Unit)? = projectionConsumer
+    fun detachSessionConsumer(attachment: SessionAttachment) {
+        synchronized(consumerLock) {
+            if (attachment.id == projectionAttachmentId) projectionConsumer = null
+        }
+    }
+
+    internal fun sessionConsumer(): ((ControlMessage.VehicleData) -> Unit)? =
+        synchronized(consumerLock) { projectionConsumer }
 }
 
 /** Owns exactly one forwarder and never stops it at session boundaries. */
@@ -59,18 +79,29 @@ internal class ProcessVehicleDataOwner(
         forwarder?.start()
     }
 
-    fun attachSessionConsumer(consumer: (ControlMessage.VehicleData) -> Unit) =
+    fun attachSessionConsumer(consumer: (ControlMessage.VehicleData) -> Unit): ProcessVehicleDataCoordinator.SessionAttachment =
         coordinator.attachSessionConsumer(consumer)
 
     fun detachSessionConsumer() = coordinator.detachSessionConsumer()
+
+    fun detachSessionConsumer(attachment: ProcessVehicleDataCoordinator.SessionAttachment) =
+        coordinator.detachSessionConsumer(attachment)
 
     fun onSessionLifecycleBoundary() {
         resetLearnerContinuity()
         detachSessionConsumer()
     }
 
+    fun onSessionLifecycleBoundary(attachment: ProcessVehicleDataCoordinator.SessionAttachment) {
+        resetLearnerContinuity()
+        detachSessionConsumer(attachment)
+    }
+
     val latestVehicleData: StateFlow<ControlMessage.VehicleData>
         get() = coordinator.latestVehicleData
+
+    val isActive: Boolean get() = forwarder?.isActive == true
+    val propertyStatus: Map<String, String> get() = forwarder?.propertyStatus.orEmpty()
 }
 
 /** Application-owned VHAL runtime. SessionManager borrows state/dispatch only. */
@@ -110,15 +141,14 @@ object ProcessVehicleDataRuntime {
 
     fun latestVehicleData(): StateFlow<ControlMessage.VehicleData>? = owner?.latestVehicleData
 
-    fun attachSessionConsumer(consumer: (ControlMessage.VehicleData) -> Unit) {
+    fun isActive(): Boolean = owner?.isActive == true
+
+    fun propertyStatus(): Map<String, String> = owner?.propertyStatus.orEmpty()
+
+    internal fun attachSessionConsumer(consumer: (ControlMessage.VehicleData) -> Unit): ProcessVehicleDataCoordinator.SessionAttachment? =
         owner?.attachSessionConsumer(consumer)
-    }
 
-    fun detachSessionConsumer() {
-        owner?.detachSessionConsumer()
-    }
-
-    fun onSessionLifecycleBoundary() {
-        owner?.onSessionLifecycleBoundary()
+    internal fun onSessionLifecycleBoundary(attachment: ProcessVehicleDataCoordinator.SessionAttachment) {
+        owner?.onSessionLifecycleBoundary(attachment)
     }
 }

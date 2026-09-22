@@ -628,6 +628,7 @@ class SessionManager(
 
     // Vehicle data forwarder
     private var _vehicleDataForwarder: VehicleDataForwarder? = null
+    private var processVehicleAttachment: com.openautolink.app.input.ProcessVehicleDataCoordinator.SessionAttachment? = null
     val vehicleData: StateFlow<ControlMessage.VehicleData>?
         get() = ProcessVehicleDataRuntime.latestVehicleData()
 
@@ -980,8 +981,15 @@ class SessionManager(
 
     @Synchronized
     private fun ensureVehicleDataForwarder(): VehicleDataForwarder? {
-        ProcessVehicleDataRuntime.attachSessionConsumer(::forwardVehicleData)
+        processVehicleAttachment = ProcessVehicleDataRuntime.attachSessionConsumer(::forwardVehicleData)
         return ProcessVehicleDataRuntime.forwarderOrNull()?.also { _vehicleDataForwarder = it }
+    }
+
+    private fun detachProcessVehicleSession() {
+        val attachment = synchronized(this) {
+            processVehicleAttachment.also { processVehicleAttachment = null }
+        }
+        if (attachment != null) ProcessVehicleDataRuntime.onSessionLifecycleBoundary(attachment)
     }
 
     @Volatile private var evTelemetryRequested: Map<String, Any?> = emptyMap()
@@ -2050,7 +2058,7 @@ class SessionManager(
     }
 
     private suspend fun stopWhileLifecycleLocked(cancelObserveJob: Boolean = true) {
-        ProcessVehicleDataRuntime.onSessionLifecycleBoundary()
+        detachProcessVehicleSession()
         clearWirelessSessionAdmission()
         // Let another phone claim the session. Without this the first phone to
         // dial holds it until the app restarts, so a second phone in the car can
@@ -2351,7 +2359,7 @@ class SessionManager(
         }
 
         // 5. Break learner/session continuity without stopping process VHAL.
-        ProcessVehicleDataRuntime.onSessionLifecycleBoundary()
+        detachProcessVehicleSession()
         _imuForwarder?.stop()
 
         // 6. Clear stale navigation state
@@ -3184,7 +3192,7 @@ class SessionManager(
             is ControlMessage.PhoneDisconnected -> {
                 _remoteDiagnostics?.log(DiagnosticLevel.INFO, "session", "Phone disconnected: ${message.reason}")
                 _gnssForwarder?.stop()
-                ProcessVehicleDataRuntime.onSessionLifecycleBoundary()
+                detachProcessVehicleSession()
                 _imuForwarder?.stop()
                 stopDirectLocationForwarding()
                 _navigationDisplay.clear()
@@ -3387,7 +3395,15 @@ class SessionManager(
         logSafetyInfo: Boolean,
     ) {
         val learnerReady = evLearnedEstimator?.activeSnapshot?.value?.usable == true
-        val activation = currentEvLearningActivation(learnerReady)
+        val requestedMode = when {
+            !evTuningEnabled && evUseEpaBaseline -> "epa-baseline"
+            else -> evDrivingMode
+        }
+        val activation = EvLearningActivationPolicy.evaluate(
+            tuningEnabled = evTuningEnabled || evUseEpaBaseline,
+            requestedMode = requestedMode,
+            learnerReady = learnerReady,
+        )
         if (logSafetyInfo) {
             DiagnosticLog.i(
                 "vem_safety",

@@ -10,8 +10,11 @@ import com.openautolink.app.navigation.VehicleEnergyForecast
 import com.openautolink.app.session.SessionState
 import com.openautolink.app.transport.ControlMessage
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -39,11 +42,17 @@ object EvContributionService {
     )
 
     private const val STARTUP_GRACE_MS = 60_000L
+    private const val LOCAL_SAFETY_PREFS = "ev-contribution-safety"
+    private const val LAST_SAFE_PARKED_MS = "last-safe-parked-ms"
     private val initialized = AtomicBoolean(false)
-    private val uploading = AtomicBoolean(false)
-    private val generationFence = EvContributionGenerationFence()
+    private val lifecycle = EvContributionLifecycleGate()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeTransport = AtomicReference<EvContributionHttpTransport?>()
+    private val activeUploadJob = AtomicReference<Job?>()
+    private val reevaluation = EarliestOneShotDeadline(SystemClock::elapsedRealtime) { delayMs, task ->
+        val job = scope.launch { delay(delayMs); task() }
+        EarliestOneShotDeadline.Cancellable { job.cancel() }
+    }
     private val _status = MutableStateFlow(Status())
     val status: StateFlow<Status> = _status.asStateFlow()
 
@@ -53,11 +62,13 @@ object EvContributionService {
     @Volatile private var authFenced = false
     @Volatile private var queue: EvContributionQueue? = null
     @Volatile private var appContext: Context? = null
+    private val driveIdentityOwner = EvContributionDriveIdentityOwner { UUID.randomUUID().toString() }
     @Volatile private var activeId: String? = null
     @Volatile private var activeIdentity: EvVehicleCalibrationIdentity? = null
     @Volatile private var activeStartedMs = 0L
     @Volatile private var processStartedElapsedMs = 0L
     @Volatile private var validatedInternet = false
+    private val networkTracker = ValidatedDefaultNetworkTracker<Network>()
     @Volatile private var rawParked = false
     @Volatile private var rawIgnition: Int? = null
     @Volatile private var projectionState = SessionState.IDLE
@@ -70,11 +81,23 @@ object EvContributionService {
         val app = context.applicationContext
         appContext = app
         processStartedElapsedMs = SystemClock.elapsedRealtime()
+        val safeParkedMs = app.getSharedPreferences(LOCAL_SAFETY_PREFS, Context.MODE_PRIVATE)
+            .getLong(LAST_SAFE_PARKED_MS, 0L)
+        if (EvSafeParkAttestation.isFresh(safeParkedMs, System.currentTimeMillis())) {
+            rawParked = true
+            rawIgnition = 1
+        } else {
+            app.getSharedPreferences(LOCAL_SAFETY_PREFS, Context.MODE_PRIVATE).edit().remove(LAST_SAFE_PARKED_MS).apply()
+        }
         queue = EvContributionQueue(File(app.filesDir, "ev-contributions")).also {
-            val recovered = it.recoverInterrupted(System.currentTimeMillis())
-            it.enforceRetention(System.currentTimeMillis())
+            val recovered = runCatching { it.recoverInterrupted(System.currentTimeMillis()) }
+                .onFailure { error -> DiagnosticLog.w("ev_contribution", "recoveryFailed=${error.javaClass.simpleName}") }
+                .getOrDefault(0)
+            runCatching { it.enforceRetention(System.currentTimeMillis()) }
+                .onFailure { error -> DiagnosticLog.w("ev_contribution", "retentionFailed=${error.javaClass.simpleName}") }
             if (recovered > 0) DiagnosticLog.i("ev_contribution", "recoveredInterrupted=$recovered")
-            publishStatus(it)
+            runCatching { publishStatus(it) }
+                .onFailure { error -> DiagnosticLog.w("ev_contribution", "statusRecoveryFailed=${error.javaClass.simpleName}") }
         }
         installPassiveNetworkObserver(app)
         observeConsent(app)
@@ -92,18 +115,24 @@ object EvContributionService {
                 prefs.logUploadDeviceLabel,
             ) { enabled, encoded, url, secret, label -> ConsentConfig(enabled, encoded, url, secret, label) }
                 .collect { config ->
-                    cancelInFlight("consent-or-endpoint-change")
-                    uploadUrl = config.url
-                    token = config.token
                     val decoded = EvContributionConsentBinding.decode(config.encoded)
                     val valid = config.enabled && decoded?.matches(config.url, config.token) == true
-                    consentBinding = decoded.takeIf { valid }
-                    authFenced = config.enabled && !valid
+                    lifecycle.invalidate(blockAdmissions = true) {
+                        uploadUrl = config.url
+                        token = config.token
+                        consentBinding = decoded.takeIf { valid }
+                        authFenced = config.enabled && !valid
+                        if (!valid) {
+                            driveIdentityOwner.clear()
+                            activeId = null
+                            activeIdentity = null
+                            resetDriveContinuity()
+                        }
+                    }
+                    cancelTransport("consent-or-endpoint-change")
+                    activeUploadJob.get()?.join()
                     if (!valid) {
-                        activeId = null
-                        activeIdentity = null
-                        resetDriveContinuity()
-                        val deleted = queue?.deleteAllArtifacts()
+                        val deleted = lifecycle.exclusive { queue?.deleteAllArtifacts() }
                         _status.value = _status.value.copy(
                             consentValid = false,
                             consentInvalidReason = when {
@@ -116,6 +145,7 @@ object EvContributionService {
                         deleted?.let { DiagnosticLog.i("ev_contribution", "revocationDelete=${it.display()}") }
                     } else {
                         authFenced = false
+                        lifecycle.resumeAdmissions()
                         _status.value = _status.value.copy(consentValid = true, consentInvalidReason = "")
                         DiagnosticLog.i("ev_contribution", "consent=on schema=2 compactEvOnly=true")
                         attemptNaturalDrain("consent-valid")
@@ -132,48 +162,76 @@ object EvContributionService {
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
                 val valid = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) &&
                     capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                val becameValid = valid && !validatedInternet
-                validatedInternet = valid
-                if (becameValid) attemptNaturalDrain("validated-network")
-                if (!valid) cancelInFlight("network-unvalidated")
+                when (networkTracker.capabilities(network, valid)) {
+                    ValidatedDefaultNetworkTracker.Change.REPLACED -> {
+                        lifecycle.invalidate { validatedInternet = true }
+                        cancelTransport("network-replaced")
+                        attemptNaturalDrain("validated-network")
+                    }
+                    ValidatedDefaultNetworkTracker.Change.UNVALIDATED -> {
+                        lifecycle.invalidate { validatedInternet = false }
+                        cancelTransport("network-unvalidated")
+                    }
+                    ValidatedDefaultNetworkTracker.Change.IGNORED -> {
+                        if (valid) attemptNaturalDrain("network-capabilities")
+                    }
+                    ValidatedDefaultNetworkTracker.Change.LOST -> Unit
+                }
             }
 
             override fun onLost(network: Network) {
-                validatedInternet = false
-                cancelInFlight("network-lost")
+                if (networkTracker.lost(network) != ValidatedDefaultNetworkTracker.Change.LOST) return
+                lifecycle.invalidate { validatedInternet = false }
+                cancelTransport("network-lost")
             }
         })
     }
 
     private fun evaluateProcessStartNetwork(context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        val capabilities = cm.activeNetwork?.let(cm::getNetworkCapabilities)
+        val active = cm.activeNetwork
+        val capabilities = active?.let(cm::getNetworkCapabilities)
         validatedInternet = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true &&
             capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        if (active != null && validatedInternet) networkTracker.capabilities(active, true)
         attemptNaturalDrain("process-start")
     }
 
     /** Called for every raw VHAL batch, independently of projection and tuning. */
     @Synchronized
     fun onVehicle(data: ControlMessage.VehicleData, nowElapsedMs: Long = SystemClock.elapsedRealtime()) {
-        rawIgnition = data.ignitionState
         val parked = data.gearRaw == 4 || data.ignitionState == 1 || data.ignitionState == 2
-        rawParked = parked
-        if (!parked && uploading.get()) cancelInFlight("vehicle-moving")
+        if (!parked) {
+            lifecycle.invalidate {
+                rawIgnition = data.ignitionState
+                rawParked = false
+            }
+            appContext?.getSharedPreferences(LOCAL_SAFETY_PREFS, Context.MODE_PRIVATE)
+                ?.edit()?.remove(LAST_SAFE_PARKED_MS)?.apply()
+            cancelTransport("vehicle-moving")
+        } else {
+            rawIgnition = data.ignitionState
+            rawParked = true
+        }
 
         val q = queue ?: return
         val binding = consentBinding
-        if (binding == null || !EvContributionPolicy.mayCapture(binding, uploadUrl, token) || authFenced) return
+        val captureLease = lifecycle.admitCapture {
+            binding != null && EvContributionPolicy.mayCapture(binding, uploadUrl, token) && !authFenced
+        } ?: return
         if (!parked) {
             val identity = EvVehicleCalibrationIdentity.from(data) ?: return
-            if (activeId != null && activeIdentity != identity) {
-                q.close(activeId!!, System.currentTimeMillis())
-                activeId = null
-                resetDriveContinuity()
-            }
-            val id = activeId ?: UUID.randomUUID().toString().also {
-                activeId = it; activeIdentity = identity; activeStartedMs = System.currentTimeMillis()
-            }
+            val previousId = activeId
+            val transition = lifecycle.withCurrent(captureLease) {
+                driveIdentityOwner.observe(identity).also { change ->
+                    change.closeId?.let { closing -> q.close(closing, System.currentTimeMillis()) }
+                }
+            } ?: return
+            if (transition.closeId != null) resetDriveContinuity()
+            val id = transition.activeId
+            activeId = id
+            activeIdentity = identity
+            if (previousId != id) activeStartedMs = System.currentTimeMillis()
             val speed = data.speedKmh?.takeIf(Float::isFinite)
             if (lastTickElapsedMs > 0L && nowElapsedMs > lastTickElapsedMs && nowElapsedMs - lastTickElapsedMs <= 15 * 60_000L && speed != null) {
                 distanceM += ((lastSpeedKmh + speed) / 2.0) * ((nowElapsedMs - lastTickElapsedMs) / 3_600.0)
@@ -196,8 +254,13 @@ object EvContributionService {
                 put("energyBasis", "absolute-wh"); put("estimatorRevision", "rev2")
                 put("vehicleClass", identity.pseudonymousLabel.removePrefix("ev-class-"))
             }.toString()
-            runCatching { q.append(id, activeStartedMs, line, binding.tokenFingerprint, identity.pseudonymousLabel) }
+            runCatching {
+                checkNotNull(lifecycle.withCurrent(captureLease) {
+                    q.append(id, activeStartedMs, line, binding!!.tokenFingerprint, identity.pseudonymousLabel)
+                }) { "capture generation invalidated" }
+            }
                 .onFailure {
+                    driveIdentityOwner.clear()
                     activeId = null; activeIdentity = null; resetDriveContinuity()
                     DiagnosticLog.w("ev_contribution", "captureRejected=${it.javaClass.simpleName}")
                 }
@@ -205,8 +268,13 @@ object EvContributionService {
             return
         }
         activeId?.let { id ->
-            q.close(id, System.currentTimeMillis())
+            lifecycle.withCurrent(captureLease) { q.close(id, System.currentTimeMillis()) } ?: return
+            driveIdentityOwner.close()
             activeId = null; activeIdentity = null; resetDriveContinuity()
+            if (data.ignitionState == 1 || data.ignitionState == 2) {
+                appContext?.getSharedPreferences(LOCAL_SAFETY_PREFS, Context.MODE_PRIVATE)
+                    ?.edit()?.putLong(LAST_SAFE_PARKED_MS, System.currentTimeMillis())?.apply()
+            }
             DiagnosticLog.i("ev_contribution", "closed retained=${q.counters().retained}")
         }
         publishStatus(q)
@@ -217,6 +285,7 @@ object EvContributionService {
     fun onForecast(forecast: VehicleEnergyForecast?) {
         val binding = consentBinding ?: return
         if (forecast == null || !binding.matches(uploadUrl, token)) return
+        val captureLease = lifecycle.admitCapture { consentBinding == binding && !authFenced } ?: return
         val id = activeId ?: return
         val identity = activeIdentity ?: return
         val q = queue ?: return
@@ -227,78 +296,129 @@ object EvContributionService {
             put("forecastQuality", forecast.forecastQuality)
             put("vehicleClass", identity.pseudonymousLabel.removePrefix("ev-class-"))
         }.toString()
-        runCatching { q.append(id, activeStartedMs, line, binding.tokenFingerprint, identity.pseudonymousLabel) }
+        runCatching {
+            checkNotNull(lifecycle.withCurrent(captureLease) {
+                q.append(id, activeStartedMs, line, binding.tokenFingerprint, identity.pseudonymousLabel)
+            }) { "capture generation invalidated" }
+        }
             .onFailure { DiagnosticLog.w("ev_contribution", "forecastRejected=${it.javaClass.simpleName}") }
     }
 
     fun onProjectionStateChanged(state: SessionState) {
-        projectionState = state
-        if (state != SessionState.IDLE) cancelInFlight("projection-$state")
-        else attemptNaturalDrain("projection-idle")
+        if (state != SessionState.IDLE) {
+            lifecycle.invalidate { projectionState = state }
+            cancelTransport("projection-$state")
+        } else {
+            projectionState = state
+            attemptNaturalDrain("projection-idle")
+        }
     }
 
     private fun attemptNaturalDrain(trigger: String) {
         val q = queue ?: return
-        val binding = consentBinding ?: return
         val nowElapsedMs = SystemClock.elapsedRealtime()
-        val state = projectionState
-        val uploadContext = EvContributionPolicy.UploadContext(
-            validatedInternet = validatedInternet,
-            parked = rawParked,
-            idle = activeId == null,
-            startupSensitive = nowElapsedMs - processStartedElapsedMs < STARTUP_GRACE_MS,
-            projectionActive = state != SessionState.IDLE,
-            reconnecting = state == SessionState.CONNECTING,
-        )
-        if (!EvContributionPolicy.mayUpload(true, uploadContext) || authFenced || !binding.matches(uploadUrl, token)) return
+        val graceRemaining = STARTUP_GRACE_MS - (nowElapsedMs - processStartedElapsedMs)
+        if (graceRemaining > 0) {
+            scheduleReevaluation(graceRemaining, "startup-grace")
+            return
+        }
+        val nextRetryMs = q.pending().firstOrNull()?.nextAttemptMs ?: 0L
+        val retryRemaining = nextRetryMs - System.currentTimeMillis()
+        if (retryRemaining > 0) {
+            scheduleReevaluation(retryRemaining, "retry-backoff")
+            return
+        }
+        val uploadLease = lifecycle.admitUpload {
+            val binding = consentBinding
+            val state = projectionState
+            val uploadContext = EvContributionPolicy.UploadContext(
+                validatedInternet = validatedInternet && networkTracker.current() != null,
+                parked = rawParked,
+                idle = activeId == null,
+                startupSensitive = SystemClock.elapsedRealtime() - processStartedElapsedMs < STARTUP_GRACE_MS,
+                projectionActive = state != SessionState.IDLE,
+                reconnecting = state == SessionState.CONNECTING,
+            )
+            binding != null && !authFenced && binding.matches(uploadUrl, token) &&
+                EvContributionPolicy.mayUpload(true, uploadContext)
+        } ?: return
+        val binding = consentBinding ?: run { lifecycle.releaseUpload(uploadLease); return }
         val url = uploadUrl
         val secret = token
         val namespace = binding.tokenFingerprint
-        val attemptGeneration = generationFence.snapshot()
-        if (!uploading.compareAndSet(false, true)) return
-        scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val self = kotlin.coroutines.coroutineContext[Job]
             val transport = EvContributionHttpTransport()
+            if (!lifecycle.isCurrent(uploadLease)) {
+                lifecycle.releaseUpload(uploadLease)
+                return@launch
+            }
             activeTransport.set(transport)
             try {
                 val outcome = EvContributionDrainLoop(q) { queueForAttempt ->
                     EvContributionUploader(
                         queueForAttempt,
                         onUnauthorized = {
-                            authFenced = true
+                            lifecycle.invalidate(blockAdmissions = true) { authFenced = true }
                             _status.value = _status.value.copy(
                                 consentValid = false,
                                 consentInvalidReason = "Server rejected the credential; opt in again",
                             )
-                            cancelInFlight("unauthorized")
+                            cancelTransport("unauthorized")
                             scope.launch { AppPreferences.getInstance(appContext ?: return@launch).setEvContributionConsent(false) }
                         },
-                        mayMutate = { generationFence.isCurrent(attemptGeneration) },
+                        mayMutate = { lifecycle.isCurrent(uploadLease) },
+                        mutateIfCurrent = { action -> lifecycle.withCurrent(uploadLease, action) },
                     ) { file, _ ->
-                        if (!generationFence.isCurrent(attemptGeneration)) return@EvContributionUploader EvContributionUploader.Response(0, "")
+                        if (!lifecycle.isCurrent(uploadLease)) return@EvContributionUploader EvContributionUploader.Response(0, "")
                         val label = q.pending().firstOrNull { it.file == file }?.vehicleLabel ?: "ev-class-unknown"
-                        transport.send(url, secret, label, file)
+                        transport.send(url, secret, label, file) { lifecycle.isCurrent(uploadLease) }
                     }
                 }.drainEligible(System.currentTimeMillis(), namespace)
-                _status.value = _status.value.copy(lastUploadOutcome = "$outcome ($trigger)")
-                DiagnosticLog.i("ev_contribution", "uploadOutcome=$outcome trigger=$trigger")
+                if (lifecycle.isCurrent(uploadLease)) {
+                    _status.value = _status.value.copy(lastUploadOutcome = "$outcome ($trigger)")
+                    DiagnosticLog.i("ev_contribution", "uploadOutcome=$outcome trigger=$trigger")
+                    if (outcome == EvContributionUploader.Outcome.BACKOFF || outcome == EvContributionUploader.Outcome.RETRY) {
+                        val delayMs = (q.pending().firstOrNull()?.nextAttemptMs ?: 0L) - System.currentTimeMillis()
+                        if (delayMs > 0) scheduleReevaluation(delayMs, "retry-backoff")
+                    }
+                }
             } finally {
                 activeTransport.compareAndSet(transport, null)
-                uploading.set(false)
+                lifecycle.releaseUpload(uploadLease)
+                if (self != null) activeUploadJob.compareAndSet(self, null)
                 publishStatus(q)
             }
         }
+        activeUploadJob.set(job)
+        job.start()
     }
 
-    private fun cancelInFlight(reason: String) {
-        generationFence.invalidate()
+    private fun scheduleReevaluation(delayMs: Long, trigger: String) {
+        if (delayMs <= 0) { attemptNaturalDrain(trigger); return }
+        val token = lifecycle.snapshot()
+        reevaluation.schedule(delayMs, { lifecycle.isCurrent(token) }) { attemptNaturalDrain(trigger) }
+    }
+
+    private fun cancelTransport(reason: String) {
+        reevaluation.cancel()
         activeTransport.getAndSet(null)?.cancel()
         DiagnosticLog.d("ev_contribution", "cancelled=$reason")
     }
 
-    fun deletePendingEvContributions(): EvContributionQueue.DeleteResult {
-        cancelInFlight("delete")
-        activeId = null; activeIdentity = null; resetDriveContinuity()
-        val result = queue?.deleteAllArtifacts() ?: EvContributionQueue.DeleteResult(0, 0, 0)
+    suspend fun deletePendingEvContributions(): EvContributionQueue.DeleteResult {
+        lifecycle.invalidate(blockAdmissions = true) {
+            driveIdentityOwner.clear()
+            activeId = null
+            activeIdentity = null
+            resetDriveContinuity()
+        }
+        cancelTransport("delete")
+        activeUploadJob.get()?.join()
+        val result = lifecycle.exclusive {
+            queue?.deleteAllArtifacts() ?: EvContributionQueue.DeleteResult(0, 0, 0)
+        }
+        if (consentBinding?.matches(uploadUrl, token) == true && !authFenced) lifecycle.resumeAdmissions()
         _status.value = _status.value.copy(lastDeleteResult = result.display())
         queue?.let(::publishStatus)
         return result
@@ -334,27 +454,62 @@ internal class EvContributionHttpTransport(
     private val openConnection: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
 ) {
     private val active = AtomicReference<HttpURLConnection?>()
+    private val activeBody = AtomicReference<java.io.OutputStream?>()
 
     fun cancel() {
+        activeBody.getAndSet(null)?.let { runCatching { it.close() } }
         active.getAndSet(null)?.disconnect()
     }
 
-    fun send(url: String, secret: String, label: String, file: File): EvContributionUploader.Response {
+    fun send(
+        url: String,
+        secret: String,
+        label: String,
+        file: File,
+        mayContinue: () -> Boolean = { true },
+    ): EvContributionUploader.Response {
         require(file.isFile && file.length() > 0)
+        check(mayContinue()) { "upload generation is stale" }
         val connection = openConnection(URL(url)).apply {
             requestMethod = "POST"; doOutput = true; instanceFollowRedirects = false; connectTimeout = 10_000; readTimeout = 15_000
             setRequestProperty("Content-Type", "application/zip"); setRequestProperty("X-Upload-Token", secret)
             setRequestProperty("X-Device-Label", label.take(120))
-            setRequestProperty("X-Orig-Name", file.name); setFixedLengthStreamingMode(file.length())
+            setRequestProperty("X-Orig-Name", "ev-contribution.zip"); setFixedLengthStreamingMode(file.length())
         }
+        check(mayContinue()) { "upload generation is stale" }
         check(active.compareAndSet(null, connection)) { "transport already active" }
         return try {
-            connection.outputStream.use { output -> file.inputStream().use { it.copyTo(output) } }
+            check(mayContinue()) { "upload generation is stale" }
+            val output = connection.outputStream
+            check(activeBody.compareAndSet(null, output)) { "request body already active" }
+            if (active.get() !== connection || !mayContinue()) {
+                activeBody.compareAndSet(output, null)
+                runCatching { output.close() }
+                throw java.io.InterruptedIOException("upload cancelled before body")
+            }
+            try {
+                file.inputStream().use { input ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (true) {
+                        check(mayContinue()) { "upload generation is stale" }
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                    }
+                    check(mayContinue()) { "upload generation is stale" }
+                }
+            } finally {
+                activeBody.compareAndSet(output, null)
+                runCatching { output.close() }
+            }
+            check(mayContinue()) { "upload generation is stale" }
             val status = connection.responseCode
             val stream = if (status in 200..399) connection.inputStream else connection.errorStream
             val body = stream?.bufferedReader()?.use { it.readText().take(64 * 1024) }.orEmpty()
+            check(mayContinue()) { "upload generation is stale" }
             EvContributionUploader.Response(status, body)
         } finally {
+            activeBody.getAndSet(null)?.let { runCatching { it.close() } }
             active.compareAndSet(connection, null)
             connection.disconnect()
         }

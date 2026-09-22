@@ -11,6 +11,7 @@ import com.openautolink.app.transport.VehiclePropertyObservation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -142,9 +143,13 @@ class VehicleDataForwarderImpl(
     private var startInFlight = false
     private var desiredActive = false
     private var lifecycleGeneration = 0L
+    private var reconnectAttempt = 0
+    private var reconnectJob: kotlinx.coroutines.Job? = null
+    private var carLifecycleProxy: Any? = null
 
     override fun start() {
         val generation = synchronized(this) {
+            if (!desiredActive) reconnectAttempt = 0
             desiredActive = true
             if (isActive || startInFlight) return
             startInFlight = true
@@ -157,6 +162,7 @@ class VehicleDataForwarderImpl(
         // Run on background thread — Car API calls can block (connect, waitForConnected).
         // Every stage is fenced because stop() may run while this coroutine is blocked.
         scope.launch {
+            var retryScheduled = false
             try {
                 if (!isStartCurrent(generation)) return@launch
                 connectToCar()
@@ -176,20 +182,20 @@ class VehicleDataForwarderImpl(
                 }
                 if (!activated) return@launch
 
+                synchronized(this@VehicleDataForwarderImpl) { reconnectAttempt = 0 }
+
                 Log.i(TAG, "Vehicle data forwarding started")
                 DiagnosticLog.i("vhal", "Vehicle data forwarding started")
                 // Re-emit current data so collectors see isActive=true
                 _latestVehicleData.value = buildVehicleData()
                 startHistoryPoller()
             } catch (e: Exception) {
-                synchronized(this@VehicleDataForwarderImpl) {
-                    if (lifecycleGeneration == generation) desiredActive = false
-                }
+                retryScheduled = scheduleReconnectAfterFailure(generation)
                 val root = e.rootCause()
                 Log.w(TAG, "Failed to start vehicle data forwarding: ${root.message}")
                 DiagnosticLog.w("vhal", "Failed to start: ${root.javaClass.simpleName}: ${root.message}")
             } finally {
-                cleanupAfterStartAttempt(generation)
+                cleanupAfterStartAttempt(generation, retryScheduled)
             }
         }
     }
@@ -198,25 +204,25 @@ class VehicleDataForwarderImpl(
         lifecycleGeneration == generation && desiredActive
     }
 
-    private fun cleanupAfterStartAttempt(generation: Long) {
+    private fun cleanupAfterStartAttempt(generation: Long, retryScheduled: Boolean) {
         var nextGeneration: Long? = null
         var cleanupOutcome: String? = null
         synchronized(this) {
             val stale = lifecycleGeneration != generation || !desiredActive
-            if (stale) {
+            if (stale || retryScheduled) {
                 isActive = false
                 cleanup()
-                cleanupOutcome = if (desiredActive) {
-                    "Stale VHAL start cleaned before queued restart"
-                } else {
-                    "In-flight VHAL start cleaned after stop"
+                cleanupOutcome = when {
+                    retryScheduled -> "Failed VHAL start cleaned before bounded retry"
+                    desiredActive -> "Stale VHAL start cleaned before queued restart"
+                    else -> "In-flight VHAL start cleaned after stop"
                 }
             }
             startInFlight = false
             // stop() followed quickly by start() while the old attempt was blocked
             // leaves desiredActive=true but invalidates the old generation. Relaunch
             // only after that attempt has cleaned up its partially-created Car state.
-            if (desiredActive && !isActive) {
+            if (desiredActive && !isActive && !retryScheduled) {
                 startInFlight = true
                 nextGeneration = ++lifecycleGeneration
             }
@@ -228,11 +234,39 @@ class VehicleDataForwarderImpl(
         nextGeneration?.let(::launchStartAttempt)
     }
 
+    private fun scheduleReconnectAfterFailure(failedGeneration: Long): Boolean {
+        val delayMs = synchronized(this) {
+            if (!desiredActive || lifecycleGeneration != failedGeneration) return false
+            if (reconnectAttempt >= 5) {
+                desiredActive = false
+                DiagnosticLog.w("vhal", "VHAL reconnect attempts exhausted")
+                return true
+            }
+            val attempt = reconnectAttempt++
+            (1_000L shl attempt).coerceAtMost(30_000L)
+        }
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            delay(delayMs)
+            val next = synchronized(this@VehicleDataForwarderImpl) {
+                if (!desiredActive || isActive || startInFlight || lifecycleGeneration != failedGeneration) return@launch
+                startInFlight = true
+                ++lifecycleGeneration
+            }
+            launchStartAttempt(next)
+        }
+        DiagnosticLog.i("vhal", "VHAL reconnect scheduled attempt=$reconnectAttempt delayMs=$delayMs")
+        return true
+    }
+
     override fun stop() {
         val (hadWork, cleanupDeferred) = synchronized(this) {
             val pendingOrActive = isActive || startInFlight || carObject != null
             val deferred = startInFlight
             desiredActive = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+            reconnectAttempt = 0
             lifecycleGeneration++
             // An in-flight attempt owns its partially-created reflection objects;
             // it observes the generation change in finally and cleans them there.
@@ -269,8 +303,8 @@ class VehicleDataForwarderImpl(
             throw IllegalStateException("android.car APIs not available")
         }
 
-        // Try single-arg createCar(Context) first, fall back to createCar(Context, Handler)
-        val car = try {
+        // Prefer the lifecycle-listener API so service death owns one bounded reconnect.
+        val car = createCarWithLifecycle(carClass) ?: try {
             carClass.getMethod("createCar", Context::class.java).invoke(null, context)
         } catch (_: NoSuchMethodException) {
             carClass.getMethod("createCar", Context::class.java, android.os.Handler::class.java)
@@ -310,6 +344,45 @@ class VehicleDataForwarderImpl(
 
         Log.i(TAG, "Connected to Car API via reflection")
         DiagnosticLog.i("vhal", "Connected to Car API")
+    }
+
+    private fun createCarWithLifecycle(carClass: Class<*>): Any? = runCatching {
+        val listenerClass = Class.forName("android.car.Car\$CarServiceLifecycleListener")
+        val listener = java.lang.reflect.Proxy.newProxyInstance(
+            listenerClass.classLoader,
+            arrayOf(listenerClass),
+        ) { proxy, method, args ->
+            when (method.name) {
+                "onLifecycleChanged" -> {
+                    val ready = args?.getOrNull(1) as? Boolean ?: false
+                    if (!ready) onCarServiceLost(args?.firstOrNull())
+                    null
+                }
+                "toString" -> "OalCarServiceLifecycleListener"
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === args?.firstOrNull()
+                else -> null
+            }
+        }
+        val method = carClass.methods.first { candidate ->
+            candidate.name == "createCar" && candidate.parameterTypes.size == 4 &&
+                candidate.parameterTypes.last() == listenerClass
+        }
+        carLifecycleProxy = listener
+        method.invoke(null, context, null, 2_000L, listener)
+    }.getOrNull()
+
+    private fun onCarServiceLost(lostCar: Any?) {
+        val failedGeneration = synchronized(this) {
+            if (!desiredActive || !isActive || carObject !== lostCar) return
+            isActive = false
+            reconnectAttempt = 0
+            cleanup()
+            startInFlight = false
+            ++lifecycleGeneration
+        }
+        DiagnosticLog.w("vhal", "Car service lost; scheduling process-owned reconnect")
+        scheduleReconnectAfterFailure(failedGeneration)
     }
 
     /** Poll isConnected() up to timeoutMs, matching app_v1's waitForConnected pattern. */
@@ -963,6 +1036,7 @@ class VehicleDataForwarderImpl(
         // Do not alter retained numeric values; only retire their diagnostic observations.
         _latestVehicleData.value = _latestVehicleData.value.copy(evObservationMetadata = emptyMap())
         callbackProxy = null
+        carLifecycleProxy = null
         carObject = null
         propertyManager = null
     }

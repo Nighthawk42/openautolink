@@ -58,7 +58,7 @@ class VehicleEnergyReconnectContractTest {
         assertFalse("Reconnect must never stop the process VHAL owner",
             reconnect.contains("_vehicleDataForwarder?.stop()"))
         assertTrue("Reconnect must break learner continuity without stopping VHAL",
-            reconnect.contains("ProcessVehicleDataRuntime.onSessionLifecycleBoundary()"))
+            reconnect.contains("detachProcessVehicleSession()"))
         assertFalse(
             "Reconnect must retain the cached VHAL snapshot for type-23 replay",
             reconnect.contains("_vehicleDataForwarder = null"),
@@ -75,7 +75,7 @@ class VehicleEnergyReconnectContractTest {
             fullStop.contains("_vehicleDataForwarder = null"),
         )
         val revokeSession = fullStop.indexOf("revokeSessionOwnershipLocked()")
-        val continuityBoundary = fullStop.indexOf("ProcessVehicleDataRuntime.onSessionLifecycleBoundary()")
+        val continuityBoundary = fullStop.indexOf("detachProcessVehicleSession()")
         assertTrue("Explicit stop must fence process observations at a lifecycle boundary",
             continuityBoundary >= 0 && revokeSession >= 0)
 
@@ -161,8 +161,18 @@ class VehicleEnergyReconnectContractTest {
         )
         assertTrue(
             "A stale in-flight attempt must clean up rather than activate after stop",
-            start.contains("cleanupAfterStartAttempt(generation)"),
+            start.contains("cleanupAfterStartAttempt(generation, retryScheduled)"),
         )
+        assertTrue("Failed starts must schedule bounded one-shot reconnects",
+            source.contains("scheduleReconnectAfterFailure(generation)") &&
+                source.contains("reconnectAttempt >= 5") && source.contains("delay(delayMs)"))
+        assertTrue("Car service death must flow through the same reconnect owner",
+            source.contains("CarServiceLifecycleListener") &&
+                source.contains("onCarServiceLost") &&
+                source.contains("scheduleReconnectAfterFailure(failedGeneration)"))
+        assertTrue("Failed partial starts must clean before retry to prevent duplicate subscriptions",
+            source.contains("if (stale || retryScheduled)") &&
+                source.contains("Failed VHAL start cleaned before bounded retry"))
     }
 
     @Test

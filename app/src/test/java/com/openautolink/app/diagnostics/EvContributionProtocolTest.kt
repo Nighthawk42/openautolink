@@ -20,7 +20,7 @@ class EvContributionProtocolTest {
         val bytes = first.file.readBytes()
         assertTrue(first.file.name.endsWith(".zip"))
         ZipFile(first.file).use { zip ->
-            assertEquals(setOf("ev_drive.log", "upload_manifest.log"), zip.entries().asSequence().map { it.name }.toSet())
+            assertEquals(setOf("telemetry.jsonl", "manifest.txt"), zip.entries().asSequence().map { it.name }.toSet())
             assertTrue(zip.entries().asSequence().all { !it.name.contains('/') && !it.isDirectory })
         }
         val restored = queue(root).pending().single()
@@ -28,6 +28,42 @@ class EvContributionProtocolTest {
         assertEquals(first.sha256, restored.sha256)
         assertEquals("owner-device", restored.namespace)
         assertFalse(root.walkTopDown().filter { it.isFile }.any { it.readText().contains("raw-secret-token") })
+    }
+
+    @Test fun `crash after zip publication keeps closed unit and removes redundant source`() {
+        val root = dir(); val q = queue(root)
+        q.append("drive", 1, "{\"schema\":2,\"type\":\"vehicle\",\"batteryWh\":50000}", "owner-device")
+        val source = root.listFiles()!!.single { it.extension == "evc" }
+        val sourceMeta = File(root, source.name + ".meta")
+        val sourceBytes = source.readBytes(); val sourceMetaBytes = sourceMeta.readBytes()
+        q.close("drive", 2)
+        source.writeBytes(sourceBytes); sourceMeta.writeBytes(sourceMetaBytes)
+
+        val recreated = queue(root)
+
+        assertEquals(1, recreated.pending().size)
+        assertFalse(source.exists())
+        assertFalse(sourceMeta.exists())
+    }
+
+    @Test fun `wire archive names and strings omit exact epoch and uuid`() {
+        val q = queue()
+        val id = "123e4567-e89b-12d3-a456-426614174000"
+        val epoch = 1_725_555_444_333L
+        q.append(id, epoch, "{\"schema\":2,\"type\":\"vehicle\",\"elapsedBucketS\":60}")
+        q.close(id, epoch + 9_999)
+        val pending = q.pending().single()
+        val text = ZipFile(pending.file).use { zip ->
+            zip.entries().asSequence().joinToString("\n") { entry ->
+                entry.name + "\n" + zip.getInputStream(entry).bufferedReader().use { it.readText() }
+            }
+        }
+        assertFalse(text.contains(id))
+        assertFalse(text.contains(epoch.toString()))
+        assertFalse(text.contains((epoch + 9_999).toString()))
+        assertEquals(setOf("telemetry.jsonl", "manifest.txt"), ZipFile(pending.file).use { zip ->
+            zip.entries().asSequence().map { it.name }.toSet()
+        })
     }
 
     @Test fun `ack contract accepts only exact 200 ok digest and duplicate`() {
@@ -168,7 +204,9 @@ class EvContributionProtocolTest {
         assertEquals("application/zip", connection.getRequestProperty("Content-Type"))
         assertEquals("token-value", connection.getRequestProperty("X-Upload-Token"))
         assertEquals("car", connection.getRequestProperty("X-Device-Label"))
-        assertEquals(pending.file.name, connection.getRequestProperty("X-Orig-Name"))
+        assertEquals("ev-contribution.zip", connection.getRequestProperty("X-Orig-Name"))
+        assertFalse(connection.headerFields.toString().contains(pending.id))
+        assertFalse(connection.headerFields.toString().contains(pending.startedMs.toString()))
         assertEquals(pending.file.length(), connection.configuredFixedLength())
         assertFalse(connection.instanceFollowRedirects)
         assertTrue(disconnected)
