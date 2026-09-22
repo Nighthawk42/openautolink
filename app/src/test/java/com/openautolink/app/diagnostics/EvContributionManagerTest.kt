@@ -48,7 +48,7 @@ class EvContributionManagerTest {
         val root = dir()
         val queue = EvContributionQueue(root, maxBytes = 10_000, maxFiles = 2)
         for (id in listOf("a", "b", "c")) {
-            queue.append(id, id[0].code.toLong(), "{\"schema\":2,\"type\":\"vehicle\",\"safetyHolds\":\"1234567890\"}")
+            queue.append(id, id[0].code.toLong(), "{\"schema\":2,\"type\":\"vehicle\",\"distanceM\":123}")
             queue.close(id, id[0].code.toLong())
         }
         assertEquals(listOf("b", "c"), queue.pending().map { it.id })
@@ -56,7 +56,7 @@ class EvContributionManagerTest {
     }
 
     @Test fun `privacy allowlist rejects coordinates destinations logs and identifiers`() {
-        val allowed = """{"schema":2,"type":"vehicle","batteryWh":50000,"distanceM":42,"forecastWh":49000,"capacityBandKwh":80}"""
+        val allowed = """{"schema":2,"type":"vehicle","batteryWh":50000,"distanceM":42,"capacityBandKwh":80}"""
         assertEquals(allowed, EvContributionPrivacy.requireAllowedJsonLine(allowed))
         for (forbidden in listOf("latitude", "longitude", "destination", "vin", "deviceId", "token", "road", "logcat", "rawLog")) {
             val line = "{\"schema\":2,\"type\":\"vehicle\",\"$forbidden\":\"secret\"}"
@@ -104,7 +104,7 @@ class EvContributionManagerTest {
         val queue = EvContributionQueue(File(root, "compact"), maxBytes = 10_000, maxFiles = 8)
         queue.append("drive", 1, "{\"schema\":2,\"type\":\"vehicle\"}")
         queue.close("drive", 2)
-        assertEquals(1, queue.deletePending())
+        assertTrue(queue.deletePending() >= 2) // immutable ZIP plus its metadata
         assertTrue(queue.pending().isEmpty())
         assertTrue(ordinary.isFile)
     }

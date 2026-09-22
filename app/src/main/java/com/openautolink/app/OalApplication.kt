@@ -41,21 +41,17 @@ class OalApplication : Application() {
         loadPreviousNativeCrash()
         installCrashHandler()
         installNativeCrashHandler()
-        // Start VHAL ignition watcher for the lifetime of the process so the
-        // wake-handling code knows real ignition state before deciding to
-        // auto-connect. Without this, the "ghost wake" AAOS dispatches during
-        // shutdown burns a 45s timeout into a dead WiFi.
-        com.openautolink.app.input.IgnitionMonitor.start(this)
-
         // Independent default-off compact EV contribution runtime. Initialization
-        // performs no network request; uploads are considered only on later parked ticks.
+        // only registers passive observers; it never requests or binds a network.
         com.openautolink.app.diagnostics.EvContributionService.initialize(this)
-        // Shadow learning is process-scoped and independent of the selected outgoing mode.
-        com.openautolink.app.session.SessionManager.installEvLearnedEstimator(
-            com.openautolink.app.data.EvLearnedRateEstimator.getInstance(
-                com.openautolink.app.data.AppPreferences.getInstance(this),
-            ),
+        // One process-owned VHAL source feeds shadow learning and compact capture
+        // even when projection has never started. Sessions only borrow its latest
+        // state and optional AASDK consumer; they never own its subscriptions.
+        val learnedEstimator = com.openautolink.app.data.EvLearnedRateEstimator.getInstance(
+            com.openautolink.app.data.AppPreferences.getInstance(this),
         )
+        com.openautolink.app.session.SessionManager.installEvLearnedEstimator(learnedEstimator)
+        com.openautolink.app.input.ProcessVehicleDataRuntime.initialize(this, learnedEstimator)
 
         // Passive, process-scope pre-wake diagnostics. This must be initialized
         // after the VHAL observer and before Bluetooth advertising so it can

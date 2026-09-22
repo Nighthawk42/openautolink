@@ -531,7 +531,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 com.openautolink.app.diagnostics.EvContributionConsentBinding.create(
                     uiState.value.logUploadUrl,
                     uiState.value.logUploadToken,
-                )?.encode() ?: return@launch
+                )?.encode() ?: run {
+                    com.openautolink.app.diagnostics.EvContributionService.reportConsentInvalid(
+                        "A valid HTTPS upload URL and non-empty token are required",
+                    )
+                    return@launch
+                }
             } else null
             preferences.setEvContributionConsent(enabled, binding)
         }

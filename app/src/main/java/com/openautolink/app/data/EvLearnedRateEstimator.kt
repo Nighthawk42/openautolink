@@ -531,9 +531,13 @@ class EvLearnedRateEstimator private constructor(
         return publishedStates[key] ?: Snapshot()
     }
 
-    /** Breaks delta continuity at projection/session lifecycle boundaries without erasing learning. */
+    /** Breaks delta continuity at producer lifecycle boundaries without erasing learning.
+     * Reset and tick admission share one lock, giving callers a linearized boundary:
+     * every tick is wholly admitted before the reset or observes its new generation. */
     fun resetContinuity() {
-        continuityGeneration.incrementAndGet()
+        synchronized(tickAdmissionLock) {
+            continuityGeneration.incrementAndGet()
+        }
     }
 
     /** Clear learned state and report admission plus durable persistence status. */

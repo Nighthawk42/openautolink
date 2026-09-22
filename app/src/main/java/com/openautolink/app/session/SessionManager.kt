@@ -26,7 +26,7 @@ import com.openautolink.app.input.GnssForwarderImpl
 import com.openautolink.app.input.IgnitionMonitor
 import com.openautolink.app.input.ImuForwarder
 import com.openautolink.app.input.VehicleDataForwarder
-import com.openautolink.app.input.VehicleDataForwarderImpl
+import com.openautolink.app.input.ProcessVehicleDataRuntime
 import com.openautolink.app.media.GmMediaControlPolicy
 import com.openautolink.app.media.OalMediaBrowserService
 import com.openautolink.app.media.OalMediaSessionManager
@@ -629,7 +629,7 @@ class SessionManager(
     // Vehicle data forwarder
     private var _vehicleDataForwarder: VehicleDataForwarder? = null
     val vehicleData: StateFlow<ControlMessage.VehicleData>?
-        get() = _vehicleDataForwarder?.latestVehicleData
+        get() = ProcessVehicleDataRuntime.latestVehicleData()
 
     /**
      * Throttle state for [DiagnosticLog] energy-model spam. The vehicle
@@ -980,21 +980,14 @@ class SessionManager(
 
     @Synchronized
     private fun ensureVehicleDataForwarder(): VehicleDataForwarder? {
-        _vehicleDataForwarder?.let { return it }
-        val ctx = context ?: return null
-        return VehicleDataForwarderImpl(
-            ctx,
-            sendMessage = ::forwardVehicleData,
-            onIgnitionOn = { /* aasdk mode doesn't need ignition-based reconnect */ },
-        ).also { _vehicleDataForwarder = it }
+        ProcessVehicleDataRuntime.attachSessionConsumer(::forwardVehicleData)
+        return ProcessVehicleDataRuntime.forwarderOrNull()?.also { _vehicleDataForwarder = it }
     }
 
     @Volatile private var evTelemetryRequested: Map<String, Any?> = emptyMap()
 
     private fun forwardVehicleData(vd: ControlMessage.VehicleData) {
         val now = SystemClock.elapsedRealtime()
-        evLearnedEstimator?.onVehicleTick(vd, now)
-        com.openautolink.app.diagnostics.EvContributionService.onVehicle(vd)
         val session = aasdkSession ?: return
         if (EvTelemetryRecorder.instance.enabled) {
             val learned = evLearnedEstimator?.activeSnapshot?.value
@@ -1278,9 +1271,7 @@ class SessionManager(
             GnssForwarderImpl(ctx) { _ -> /* NMEA not used in direct mode */ }
         }
 
-        // Create vehicle data forwarder -- sends via AasdkSession
-        _vehicleDataForwarder?.stop()
-        _vehicleDataForwarder = null
+        // Borrow the process-owned VHAL source; never recreate its subscriptions.
         // Reset edge-trigger memory so the first tick of the new session
         // unconditionally publishes nightMode / parking / driving / gear to
         // the phone — the phone has no prior state from us.
@@ -1841,6 +1832,7 @@ class SessionManager(
                         )
                         reconcileTransportSessionState(currentState, reportedState).also {
                             _sessionState.value = it
+                            com.openautolink.app.diagnostics.EvContributionService.onProjectionStateChanged(it)
                             _statusMessage.value = when (it) {
                                 SessionState.IDLE ->
                                     if (attempt > 0) "Reconnecting (attempt $attempt)…"
@@ -1946,7 +1938,7 @@ class SessionManager(
     /** Must be called while holding [sessionStateLock] for the exact current session. */
     private fun startStreamingServicesLocked(session: AasdkSession) {
         startLocationForwarding(session)
-        _vehicleDataForwarder?.start()
+        ensureVehicleDataForwarder()
         _imuForwarder?.start()
     }
 
@@ -2058,7 +2050,7 @@ class SessionManager(
     }
 
     private suspend fun stopWhileLifecycleLocked(cancelObserveJob: Boolean = true) {
-        evLearnedEstimator?.resetContinuity()
+        ProcessVehicleDataRuntime.onSessionLifecycleBoundary()
         clearWirelessSessionAdmission()
         // Let another phone claim the session. Without this the first phone to
         // dial holds it until the app restarts, so a second phone in the car can
@@ -2085,6 +2077,7 @@ class SessionManager(
         val retiringSession = synchronized(sessionStateLock) {
             val current = revokeSessionOwnershipLocked()
             _sessionState.value = SessionState.IDLE
+            com.openautolink.app.diagnostics.EvContributionService.onProjectionStateChanged(SessionState.IDLE)
             _statusMessage.value = "Disconnected"
             current
         }
@@ -2102,11 +2095,7 @@ class SessionManager(
         _hfpPresence = null
         _gnssForwarder?.stop()
         _gnssForwarder = null
-        // Preserve the stopped VHAL owner and its last complete EV snapshot across
-        // ignition sleep. The native wake path restarts this same owner before the
-        // phone's type-23 subscription, so Maps receives current battery data even
-        // when the AAOS process survives and full start() is bypassed.
-        _vehicleDataForwarder?.stop()
+        // The process VHAL owner remains subscribed across session teardown.
         _imuForwarder?.stop()
         _imuForwarder = null
         forecastExpiryJob?.cancel()
@@ -2361,8 +2350,8 @@ class SessionManager(
             coord.volumeOffsetAssistant = volumeOffsetAssistant
         }
 
-        // 5. Pause sensor forwarders — they'll restart when new session reaches STREAMING
-        _vehicleDataForwarder?.stop()
+        // 5. Break learner/session continuity without stopping process VHAL.
+        ProcessVehicleDataRuntime.onSessionLifecycleBoundary()
         _imuForwarder?.stop()
 
         // 6. Clear stale navigation state
@@ -3168,6 +3157,7 @@ class SessionManager(
                             SessionState.STREAMING,
                         )
                         _sessionState.value = SessionState.STREAMING
+                        com.openautolink.app.diagnostics.EvContributionService.onProjectionStateChanged(SessionState.STREAMING)
                         _statusMessage.value = "Streaming"
                         if (startStreamingServices) {
                             startStreamingServicesLocked(sourceSession)
@@ -3194,7 +3184,7 @@ class SessionManager(
             is ControlMessage.PhoneDisconnected -> {
                 _remoteDiagnostics?.log(DiagnosticLevel.INFO, "session", "Phone disconnected: ${message.reason}")
                 _gnssForwarder?.stop()
-                _vehicleDataForwarder?.stop()
+                ProcessVehicleDataRuntime.onSessionLifecycleBoundary()
                 _imuForwarder?.stop()
                 stopDirectLocationForwarding()
                 _navigationDisplay.clear()

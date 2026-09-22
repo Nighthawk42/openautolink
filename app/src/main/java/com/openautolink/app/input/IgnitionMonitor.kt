@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.util.Log
 import com.openautolink.app.diagnostics.DiagnosticLog
+import com.openautolink.app.transport.ControlMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -73,6 +74,45 @@ object IgnitionMonitor {
     fun msSinceIgnitionOff(): Long {
         val stamp = ignitionOffStampMs
         return if (stamp == 0L) Long.MAX_VALUE else SystemClock.elapsedRealtime() - stamp
+    }
+
+    /** Receives ignition and gear from the single process-owned full VHAL source. */
+    fun acceptProcessVehicleData(data: ControlMessage.VehicleData) {
+        data.ignitionState?.let(::acceptIgnitionOn)
+        data.gearRaw?.let { value ->
+            _gearSelection.value = value
+            if (lastLoggedGear != value) {
+                DiagnosticLog.i(TAG, "GEAR_SELECTION → $value [was ${lastLoggedGear ?: "?"}]")
+                if (value == GEAR_PARK && lastLoggedGear != null) DiagnosticLog.i(TAG, "PARKED")
+                lastLoggedGear = value
+            }
+        }
+    }
+
+    /** Preserves the low-latency ignition transition callback from the full source. */
+    fun acceptIgnitionOn(value: Int) {
+        val previous = _ignitionState.value
+        _ignitionState.value = value
+        if (lastLoggedIgnition != value) {
+            val name = when (value) {
+                0 -> "UNDEFINED"; 1 -> "LOCK"; 2 -> "OFF"
+                3 -> "ACC"; 4 -> "ON"; 5 -> "START"; else -> "?"
+            }
+            DiagnosticLog.i(TAG, "IGNITION_STATE → $value ($name) [was ${lastLoggedIgnition ?: "?"}]")
+            if (value == 2 || value == 4 || value == 5) {
+                com.openautolink.app.wake.PreWakeMonitor.reportIgnition(value)
+            }
+            lastLoggedIgnition = value
+        }
+        val wasOn = previous == 4 || previous == 5
+        val isOn = value == 4 || value == 5
+        if (wasOn && !isOn) ignitionOffStampMs = SystemClock.elapsedRealtime()
+        if (!wasOn && isOn) {
+            DiagnosticLog.i(TAG, "Ignition ON — re-arming the Bluetooth advertiser")
+            runCatching {
+                com.openautolink.app.transport.bluetooth.AaWirelessBtControl.ensureAdvertising()
+            }.onFailure { DiagnosticLog.w(TAG, "Advertiser re-arm failed: ${it.message}") }
+        }
     }
 
     fun start(context: Context) {

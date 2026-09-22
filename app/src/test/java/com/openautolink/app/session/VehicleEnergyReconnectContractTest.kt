@@ -36,7 +36,7 @@ class VehicleEnergyReconnectContractTest {
     }
 
     @Test
-    fun `every restart retains the stopped VHAL owner for type 23 replay`() {
+    fun `every restart borrows process VHAL owner for type 23 replay`() {
         val source = sessionManagerSource()
         val start = source.indexOf("private fun prepareNativeSessionStart(session: AasdkSession)")
         val end = source.indexOf("private fun startLocationForwarding", startIndex = start)
@@ -55,8 +55,10 @@ class VehicleEnergyReconnectContractTest {
 
         val reconnect = source.substringAfter("private suspend fun doReconnectAfterCancel(")
             .substringBefore("fun onSystemWake()")
-        assertTrue("Reconnect must pause VHAL while replacing the protocol session",
+        assertFalse("Reconnect must never stop the process VHAL owner",
             reconnect.contains("_vehicleDataForwarder?.stop()"))
+        assertTrue("Reconnect must break learner continuity without stopping VHAL",
+            reconnect.contains("ProcessVehicleDataRuntime.onSessionLifecycleBoundary()"))
         assertFalse(
             "Reconnect must retain the cached VHAL snapshot for type-23 replay",
             reconnect.contains("_vehicleDataForwarder = null"),
@@ -64,8 +66,8 @@ class VehicleEnergyReconnectContractTest {
 
         val fullStop = source.substringAfter("fun stop() {")
             .substringBefore("fun reconnect(")
-        assertTrue(
-            "Ignition/full stop must pause the VHAL owner",
+        assertFalse(
+            "Ignition/full stop must not stop the process VHAL owner",
             fullStop.contains("_vehicleDataForwarder?.stop()"),
         )
         assertFalse(
@@ -73,11 +75,9 @@ class VehicleEnergyReconnectContractTest {
             fullStop.contains("_vehicleDataForwarder = null"),
         )
         val revokeSession = fullStop.indexOf("revokeSessionOwnershipLocked()")
-        val stopForwarder = fullStop.indexOf("_vehicleDataForwarder?.stop()")
-        assertTrue(
-            "Explicit stop must revoke session ownership before the retained VHAL owner can be stopped",
-            revokeSession >= 0 && revokeSession < stopForwarder,
-        )
+        val continuityBoundary = fullStop.indexOf("ProcessVehicleDataRuntime.onSessionLifecycleBoundary()")
+        assertTrue("Explicit stop must fence process observations at a lifecycle boundary",
+            continuityBoundary >= 0 && revokeSession >= 0)
 
         val collectorStart = source.indexOf("private fun bindSessionCollectors(session: AasdkSession)")
         val collectorEnd = source.indexOf("private fun createVideoDecoder", collectorStart)
@@ -116,8 +116,9 @@ class VehicleEnergyReconnectContractTest {
             connectionObserver.contains("startStreamingServicesLocked(session)"),
         )
         assertTrue(
-            "VHAL has exactly one producer-start chokepoint",
-            Regex(Regex.escape("_vehicleDataForwarder?.start()")).findAll(source).count() == 1,
+            "SessionManager must never start the process-owned VHAL source",
+            !source.contains("_vehicleDataForwarder?.start()") &&
+                source.contains("ProcessVehicleDataRuntime.attachSessionConsumer(::forwardVehicleData)"),
         )
         assertTrue(
             "Every control-message effect must remain inside the session ownership lock",

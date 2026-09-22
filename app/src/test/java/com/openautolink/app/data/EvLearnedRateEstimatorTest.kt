@@ -841,4 +841,26 @@ class EvLearnedRateEstimatorTest {
         val status = EvLearnedRateEstimator.applyTick(s, vd, 1_000L)
         assertEquals("skip:noBattery", status)
     }
+
+    @Test
+    fun `lifecycle reset is actor ordered and preserves learned calibration`() = runTest {
+        val estimator = EvLearnedRateEstimator.createForTest(
+            FakeStore(),
+            this,
+            EvLearnedRateEstimator.Config(persistDebounceMs = 60_000L),
+        )
+        estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L)
+        estimator.onVehicleTick(vehicle("A", 49_990, 36f), 6_000L)
+        estimator.awaitIdle()
+        val learned = estimator.activeSnapshot.value.whPerKm
+        assertTrue(learned > 0f)
+
+        estimator.resetContinuity()
+        estimator.onVehicleTick(vehicle("A", 40_000, 36f), 7_000L)
+        estimator.awaitIdle()
+
+        assertEquals("init", estimator.activeSnapshot.value.lastTickStatus)
+        assertEquals(learned, estimator.activeSnapshot.value.whPerKm, 0f)
+        estimator.stop()
+    }
 }

@@ -2693,6 +2693,7 @@ private fun DiagnosticsSettingsTab(
     uiState: SettingsUiState,
     onNavigateToDiagnostics: () -> Unit,
 ) {
+    val contributionStatus by com.openautolink.app.diagnostics.EvContributionService.status.collectAsStateWithLifecycle()
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -2830,13 +2831,21 @@ private fun DiagnosticsSettingsTab(
                 Text("Automatic compact EV contribution", style = MaterialTheme.typography.bodyLarge)
                 Text(
                     "Off by default and separate from manual diagnostic upload. Opt-in is bound to compact schema v2, " +
-                        "the HTTPS server origin, and a fingerprint of the current upload token; changing either pauses it until you opt in again. " +
+                        "the HTTPS server origin, and a fingerprint of the current upload token; changing either revokes consent and deletes retained contribution files until you opt in again. " +
                         "Completed drives are queued as compact ZIPs and sent only after a real Park or ignition-off sample, on validated internet, " +
                         "outside startup and with no active or reconnecting projection. Records use minute time buckets and include battery, distance, " +
                         "forecast, coarse capacity, gear/ignition and EV configuration fields. It includes no destinations, coordinates, VIN, device identifiers, or general logs. " +
-                        "No raw payloads or raw token are stored. " +
-                        "Turning this off preserves pending ZIPs until you delete them below.",
+                        "The upload label is a generic hash of the frozen vehicle class, never the mutable device label. No raw token is stored. " +
+                        "Turning this off deletes every retained contribution artifact but keeps learned calibration.",
                     style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    "Consent: ${if (contributionStatus.consentValid) "valid" else contributionStatus.consentInvalidReason}; " +
+                        "retained=${contributionStatus.retainedCount}; last upload=${contributionStatus.lastUploadOutcome}; " +
+                        "evicted=${contributionStatus.evictedCount}; quarantined=${contributionStatus.quarantinedCount}; " +
+                        "delete=${contributionStatus.lastDeleteResult}",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.testTag("evContributionStatus"),
                 )
                 Button(onClick = viewModel::deletePendingEvContributions) {
                     Text("Delete pending compact contributions")

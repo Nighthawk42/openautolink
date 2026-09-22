@@ -16,18 +16,31 @@ class EvContributionConsentContractTest {
         assertTrue(screen.contains("Automatic compact EV contribution"))
         assertTrue(screen.contains("no destinations, coordinates, VIN, device identifiers, or general logs"))
         assertTrue(screen.contains("deletePendingEvContributions"))
+        assertTrue(screen.contains("evContributionStatus"))
+        assertTrue(screen.contains("consentInvalidReason"))
+        assertTrue(screen.contains("retainedCount"))
+        assertTrue(screen.contains("lastUploadOutcome"))
+        assertTrue(screen.contains("evictedCount"))
+        assertTrue(screen.contains("quarantinedCount"))
+        assertTrue(screen.contains("lastDeleteResult"))
+        assertTrue(screen.contains("never the mutable device label"))
         assertFalse(screen.substringAfter("Automatic compact EV contribution").substringBefore("Log Upload (maintainer)").contains("logUploadEnabled"))
     }
 
     @Test fun `process runtime and vehicle path initialize shadow learner and compact contribution independently`() {
         val app = projectFile("app/src/main/java/com/openautolink/app/OalApplication.kt").readText()
         val session = projectFile("app/src/main/java/com/openautolink/app/session/SessionManager.kt").readText()
+        val runtime = projectFile("app/src/main/java/com/openautolink/app/input/ProcessVehicleDataRuntime.kt").readText()
         val aasdk = projectFile("app/src/main/java/com/openautolink/app/transport/aasdk/AasdkSession.kt").readText()
         assertTrue(app.contains("EvContributionService.initialize(this)"))
-        assertTrue(session.contains("EvContributionService.onVehicle("))
+        assertTrue(app.contains("ProcessVehicleDataRuntime.initialize(this, learnedEstimator)"))
+        assertTrue(runtime.contains("EvContributionService.onVehicle(data)"))
         assertTrue(aasdk.contains("EvContributionService.onForecast(receivedForecast)"))
-        assertTrue(session.contains("evLearnedEstimator?.onVehicleTick(vd, now)"))
-        assertTrue(session.indexOf("evLearnedEstimator?.onVehicleTick(vd, now)") < session.indexOf("sendEnergyModelWithTuning("))
+        assertTrue(runtime.contains("learn = estimator::onVehicleTick"))
+        assertTrue(runtime.contains("IgnitionMonitor.acceptProcessVehicleData(data)"))
+        assertFalse(app.contains("IgnitionMonitor.start(this)"))
+        assertTrue(session.contains("ProcessVehicleDataRuntime.attachSessionConsumer(::forwardVehicleData)"))
+        assertFalse(session.contains("_vehicleDataForwarder?.stop()"))
     }
 
     private fun projectFile(path: String): File {
