@@ -6,6 +6,8 @@ data class VehiclePropertyObservation(
     val receivedElapsedMs: Long,
     val status: Int?,
     val source: String = "vhal",
+    val registrationGeneration: Long? = null,
+    val propertyId: Int? = null,
 )
 
 /**
@@ -184,6 +186,7 @@ sealed class ControlMessage {
         val evMotorTorqueNm: Float? = null,
         // Local diagnostics only; never changes value acceptance or the AA wire protocol.
         val evObservationMetadata: Map<String, VehiclePropertyObservation> = emptyMap(),
+        val vhalRegistrationGeneration: Long? = null,
     ) : ControlMessage()
 
     data class SatelliteInfo(

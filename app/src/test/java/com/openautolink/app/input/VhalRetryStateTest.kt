@@ -33,4 +33,12 @@ class VhalRetryStateTest {
         assertNull(retry.serviceReady())
         assertNull(retry.retryTimerFired(replacement))
     }
+
+    @Test fun `startup requires a meaningful safety or energy subscription`() {
+        assertFalse(VhalSubscriptionReadiness.mayActivate(emptySet()))
+        assertFalse(VhalSubscriptionReadiness.mayActivate(setOf("NIGHT_MODE")))
+        assertTrue(VhalSubscriptionReadiness.mayActivate(setOf("GEAR_SELECTION")))
+        assertTrue(VhalSubscriptionReadiness.mayActivate(setOf("IGNITION_STATE")))
+        assertTrue(VhalSubscriptionReadiness.mayActivate(setOf("EV_BATTERY_LEVEL")))
+    }
 }

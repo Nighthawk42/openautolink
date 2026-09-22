@@ -1,6 +1,7 @@
 package com.openautolink.app.diagnostics
 
 import com.openautolink.app.transport.ControlMessage
+import com.openautolink.app.transport.VehiclePropertyObservation
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
@@ -280,11 +281,63 @@ class EvContributionHardeningTest {
 
     @Test fun `delete blocks new capture and upload admission until cleanup releases barrier`() {
         val gate = EvContributionLifecycleGate()
-        gate.invalidate(blockAdmissions = true)
+        val deletion = gate.beginDestructiveOperation()
         assertNull(gate.admitCapture { true })
         assertNull(gate.admitUpload { true })
-        gate.resumeAdmissions()
+        assertTrue(gate.finishDestructiveOperation(deletion, resumeAdmissions = true))
         assertNotNull(gate.admitCapture { true })
+    }
+
+    @Test fun `older destructive completion cannot reopen or clear latest owner`() {
+        val gate = EvContributionLifecycleGate()
+        val older = gate.beginDestructiveOperation()
+        val newer = gate.beginDestructiveOperation()
+
+        assertFalse(gate.finishDestructiveOperation(older, resumeAdmissions = true))
+        assertNull(gate.admitCapture { true })
+        assertTrue(gate.finishDestructiveOperation(newer, resumeAdmissions = false))
+        assertNull(gate.admitUpload { true })
+        val retry = gate.beginDestructiveOperation()
+        assertTrue(gate.finishDestructiveOperation(retry, resumeAdmissions = true))
+        assertNotNull(gate.admitCapture { true })
+    }
+
+    @Test fun `failed deletion marker survives recreation until verified empty retry`() {
+        val root = dir()
+        var fail = true
+        var q = EvContributionQueue(root, deleteFile = { file -> if (fail) false else file.delete() })
+        q.append("drive", 1, vehicleLine(), "owner")
+        val failed = q.deleteAllArtifacts()
+        assertFalse(q.completeDeletion(failed))
+        assertTrue(q.isDeletionBlocked())
+
+        q = EvContributionQueue(root)
+        assertTrue(q.isDeletionBlocked())
+        fail = false
+        val retry = q.deleteAllArtifacts()
+        assertTrue(q.completeDeletion(retry))
+        assertFalse(EvContributionQueue(root).isDeletionBlocked())
+        assertEquals(EvContributionQueue.StorageUsage(0, 0), q.storageUsage())
+    }
+
+    @Test fun `stale worker finally hands lost trigger to exactly one replacement`() {
+        val gate = EvContributionLifecycleGate()
+        val ownership = EvUploadJobOwnership<String>()
+        val oldLease = gate.admitUpload { true }!!
+        assertTrue(ownership.tryInstall("old"))
+        gate.invalidate() // old worker is stale before its body starts
+        assertFalse(gate.isCurrent(oldLease))
+        assertNull(gate.admitUpload { true }) // replacement network callback loses admission to old owner
+        ownership.markDrainPending()
+
+        gate.releaseUpload(oldLease) // old worker's finally
+        assertTrue(ownership.finish("old"))
+        val replacementLease = gate.admitUpload { true }
+        assertNotNull(replacementLease)
+        assertTrue(ownership.tryInstall("replacement"))
+        gate.releaseUpload(replacementLease!!)
+        assertFalse(ownership.finish("replacement"))
+        assertFalse(ownership.finish("replacement"))
     }
 
     @Test fun `validated default network replacement ignores stale loss`() {
@@ -326,10 +379,47 @@ class EvContributionHardeningTest {
     @Test fun `restart never inherits upload authorization and moving revokes it immediately`() {
         val gate = EvFreshParkGate()
         assertFalse(gate.freshParkObservedThisProcess)
-        assertFalse(gate.observe(gearRaw = 4, ignitionState = null))
-        assertFalse(gate.observe(gearRaw = 8, ignitionState = 4))
-        assertTrue(gate.observe(gearRaw = 4, ignitionState = 2))
-        assertFalse(gate.observe(gearRaw = 8, ignitionState = 4))
+        fun observation(timeMs: Long, status: Int = 0, generation: Long = 1) =
+            VehiclePropertyObservation(timeMs * 1_000_000, timeMs, status, registrationGeneration = generation)
+        assertTrue(gate.observe(ControlMessage.VehicleData(
+            gearRaw = 4,
+            evObservationMetadata = mapOf("GEAR_SELECTION" to observation(1_000)),
+            vhalRegistrationGeneration = 1,
+        ), 1_000))
+        assertTrue("fresh OFF alone is sufficient", gate.observe(ControlMessage.VehicleData(
+            ignitionState = 2,
+            evObservationMetadata = mapOf("IGNITION_STATE" to observation(1_100)),
+            vhalRegistrationGeneration = 1,
+        ), 1_100))
+        assertFalse(gate.observe(ControlMessage.VehicleData(
+            gearRaw = null,
+            ignitionState = 4,
+            evObservationMetadata = mapOf(
+                "GEAR_SELECTION" to observation(1_200, status = 1),
+                "IGNITION_STATE" to observation(1_200),
+            ),
+            vhalRegistrationGeneration = 1,
+        ), 1_200))
+        assertFalse("repeating cached observations in an unrelated batch cannot refresh safety", gate.observe(
+            ControlMessage.VehicleData(
+                gearRaw = 4,
+                ignitionState = 2,
+                evObservationMetadata = mapOf(
+                    "GEAR_SELECTION" to observation(1_200, status = 1),
+                    "IGNITION_STATE" to observation(1_200, status = 1),
+                ),
+                vhalRegistrationGeneration = 1,
+            ),
+            1_300,
+        ))
+        assertFalse("stale observations are rejected", gate.observe(ControlMessage.VehicleData(
+            gearRaw = 4,
+            evObservationMetadata = mapOf("GEAR_SELECTION" to observation(1_000)),
+            vhalRegistrationGeneration = 1,
+        ), 1_000 + EvFreshParkGate.MAX_OBSERVATION_AGE_MS + 1))
+        assertFalse("service registration change clears prior authorization", gate.observe(ControlMessage.VehicleData(
+            vhalRegistrationGeneration = 2,
+        ), 2_000))
     }
 
     @Test fun `failed delete remains blocked until verified empty successful retry`() {

@@ -19,7 +19,9 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.util.Properties
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -120,9 +122,14 @@ class EvContributionGenerationFence {
 /** Single monitor for admission, generation invalidation, and exact upload ownership. */
 class EvContributionLifecycleGate {
     class Lease internal constructor(internal val generation: Long)
+    class DestructiveLease internal constructor(internal val id: Long)
     private var generation = 0L
     private var uploadOwner: Lease? = null
     private var admissionsBlocked = false
+    private var destructiveSequence = 0L
+    private var destructiveOwner: DestructiveLease? = null
+    private val destructiveLeases = linkedSetOf<DestructiveLease>()
+    private var destructiveBatchMayResume = true
 
     @Synchronized
     fun admitCapture(eligible: () -> Boolean): Lease? =
@@ -141,7 +148,29 @@ class EvContributionLifecycleGate {
         return ++generation
     }
 
-    @Synchronized fun resumeAdmissions() { admissionsBlocked = false }
+    @Synchronized
+    fun beginDestructiveOperation(update: () -> Unit = {}): DestructiveLease {
+        update()
+        if (destructiveLeases.isEmpty()) destructiveBatchMayResume = true
+        admissionsBlocked = true
+        generation++
+        return DestructiveLease(++destructiveSequence).also {
+            destructiveOwner = it
+            destructiveLeases += it
+        }
+    }
+
+    @Synchronized
+    fun finishDestructiveOperation(lease: DestructiveLease, resumeAdmissions: Boolean): Boolean {
+        if (!destructiveLeases.remove(lease)) return false
+        destructiveBatchMayResume = destructiveBatchMayResume && resumeAdmissions
+        val wasLatest = destructiveOwner === lease
+        if (destructiveLeases.isEmpty()) {
+            admissionsBlocked = !destructiveBatchMayResume
+            destructiveOwner = null
+        }
+        return wasLatest
+    }
 
     @Synchronized
     fun <T> withCurrent(lease: Lease, action: () -> T): T? =
@@ -158,6 +187,24 @@ class EvContributionLifecycleGate {
     fun releaseUpload(lease: Lease) {
         if (uploadOwner == lease) uploadOwner = null
     }
+}
+
+/** Exact worker ownership plus a completion-owned handoff for triggers rejected while owned. */
+class EvUploadJobOwnership<T : Any> {
+    private val active = AtomicReference<T?>()
+    private val drainPending = AtomicBoolean(false)
+
+    @Synchronized fun tryInstall(owner: T): Boolean = active.compareAndSet(null, owner)
+    @Synchronized fun markDrainPending(): Boolean {
+        if (active.get() == null) return false
+        drainPending.set(true)
+        return true
+    }
+    @Synchronized fun finish(owner: T): Boolean {
+        if (!active.compareAndSet(owner, null)) return false
+        return drainPending.getAndSet(false)
+    }
+    fun current(): T? = active.get()
 }
 
 class ValidatedDefaultNetworkTracker<T : Any> {
@@ -226,13 +273,69 @@ class EarliestOneShotDeadline(
 }
 
 class EvFreshParkGate {
+    companion object { const val MAX_OBSERVATION_AGE_MS = 30_000L }
+
     @Volatile var freshParkObservedThisProcess: Boolean = false
         private set
+    private var registrationGeneration: Long? = null
+    private var gearSafe = false
+    private var ignitionSafe = false
+    private var gearTimestampNanos: Long? = null
+    private var ignitionTimestampNanos: Long? = null
+    private var gearReceiptMs: Long? = null
+    private var ignitionReceiptMs: Long? = null
 
     @Synchronized
-    fun observe(gearRaw: Int?, ignitionState: Int?): Boolean {
-        freshParkObservedThisProcess = gearRaw == 4 && ignitionState in setOf(1, 2)
+    fun observe(data: ControlMessage.VehicleData, nowElapsedMs: Long): Boolean {
+        val batchGeneration = data.vhalRegistrationGeneration
+        if (batchGeneration != null && batchGeneration != registrationGeneration) {
+            registrationGeneration = batchGeneration
+            gearSafe = false
+            ignitionSafe = false
+            gearTimestampNanos = null
+            ignitionTimestampNanos = null
+            gearReceiptMs = null
+            ignitionReceiptMs = null
+        }
+        fun fresh(observation: com.openautolink.app.transport.VehiclePropertyObservation): Boolean {
+            val sourceNanos = observation.timestampElapsedNanos ?: return false
+            val observedGeneration = observation.registrationGeneration ?: return false
+            if (observedGeneration != registrationGeneration || observation.status != 0) return false
+            if (observation.receivedElapsedMs > nowElapsedMs || nowElapsedMs - observation.receivedElapsedMs > MAX_OBSERVATION_AGE_MS) return false
+            val nowNanos = nowElapsedMs * 1_000_000L
+            return sourceNanos <= nowNanos && nowNanos - sourceNanos <= MAX_OBSERVATION_AGE_MS * 1_000_000L
+        }
+        data.evObservationMetadata["GEAR_SELECTION"]?.let { observation ->
+            if (gearReceiptMs == null || observation.receivedElapsedMs > gearReceiptMs!!) {
+                gearReceiptMs = observation.receivedElapsedMs
+                gearTimestampNanos = observation.timestampElapsedNanos
+                gearSafe = fresh(observation) && data.gearRaw == 4
+            }
+        }
+        data.evObservationMetadata["IGNITION_STATE"]?.let { observation ->
+            if (ignitionReceiptMs == null || observation.receivedElapsedMs > ignitionReceiptMs!!) {
+                ignitionReceiptMs = observation.receivedElapsedMs
+                ignitionTimestampNanos = observation.timestampElapsedNanos
+                ignitionSafe = fresh(observation) && data.ignitionState in setOf(1, 2)
+            }
+        }
+        val nowNanos = nowElapsedMs * 1_000_000L
+        if (gearTimestampNanos?.let { nowNanos - it > MAX_OBSERVATION_AGE_MS * 1_000_000L } != false) gearSafe = false
+        if (ignitionTimestampNanos?.let { nowNanos - it > MAX_OBSERVATION_AGE_MS * 1_000_000L } != false) ignitionSafe = false
+        freshParkObservedThisProcess = gearSafe || ignitionSafe
         return freshParkObservedThisProcess
+    }
+
+    @Synchronized
+    fun clear() {
+        registrationGeneration = null
+        gearSafe = false
+        ignitionSafe = false
+        gearTimestampNanos = null
+        ignitionTimestampNanos = null
+        gearReceiptMs = null
+        ignitionReceiptMs = null
+        freshParkObservedThisProcess = false
     }
 }
 
@@ -376,6 +479,7 @@ class EvContributionQueue(
     private data class StorageUnit(val primary: File, val files: List<File>, val timestampMs: Long)
 
     private val stateFile get() = File(directory, "queue-state.properties")
+    private val deletionBlockFile get() = File(directory, ".deletion-blocked")
     private val evicted = AtomicLong(readCounter("evicted"))
     private val accepted = AtomicLong(readCounter("accepted"))
     private val failures = AtomicLong(readCounter("failures"))
@@ -478,7 +582,7 @@ class EvContributionQueue(
     @Synchronized
     fun deleteAllArtifacts(): DeleteResult {
         if (!directory.exists()) return DeleteResult(0, 0, 0)
-        val files = directory.walkBottomUp().filter { it.isFile }.toList()
+        val files = directory.walkBottomUp().filter { it.isFile && it != deletionBlockFile }.toList()
         val bytes = files.sumOf { it.length() }
         var failed = 0
         files.forEach { if (it.exists() && !deleteFile(it)) failed++ }
@@ -488,6 +592,26 @@ class EvContributionQueue(
         }
         syncDirectory(directory)
         return DeleteResult(files.size, bytes, failed)
+    }
+
+    @Synchronized fun isDeletionBlocked(): Boolean = deletionBlockFile.isFile
+
+    /** Persist failure before reopening admissions; clear only after a verified empty pass. */
+    @Synchronized
+    fun completeDeletion(result: DeleteResult): Boolean {
+        val empty = EvDeleteAdmissionPolicy.mayResume(result, storageUsage())
+        ensureDirectory()
+        if (!empty) {
+            FileOutputStream(deletionBlockFile).use { out ->
+                out.write("blocked\n".toByteArray())
+                out.fd.sync()
+            }
+            syncDirectory(directory)
+            return false
+        }
+        if (deletionBlockFile.exists() && !deletionBlockFile.delete()) return false
+        syncDirectory(directory)
+        return true
     }
 
     @Synchronized fun enforceRetention(nowMs: Long) { recoverArtifacts(); retainBounded(nowMs) }

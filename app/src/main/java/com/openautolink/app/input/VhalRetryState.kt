@@ -1,5 +1,13 @@
 package com.openautolink.app.input
 
+object VhalSubscriptionReadiness {
+    private val meaningful = setOf(
+        "PERF_VEHICLE_SPEED", "GEAR_SELECTION", "IGNITION_STATE",
+        "EV_BATTERY_LEVEL", "INFO_EV_BATTERY_CAPACITY", "RANGE_REMAINING",
+    )
+    fun mayActivate(subscribed: Set<String>): Boolean = subscribed.any { it in meaningful }
+}
+
 /** Generation-owned retry policy: attempts are unlimited; only delay is capped. */
 class VhalRetryState(
     private val maxDelayMs: Long = 30_000L,

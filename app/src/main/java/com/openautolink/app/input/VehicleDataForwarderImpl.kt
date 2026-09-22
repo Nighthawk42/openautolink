@@ -144,6 +144,7 @@ class VehicleDataForwarderImpl(
     private var startInFlight = false
     private var desiredActive = false
     private var lifecycleGeneration = 0L
+    private var startFailureGeneration: Long? = null
     private var reconnectAttempt = 0
     private var reconnectJob: kotlinx.coroutines.Job? = null
     private var carLifecycleProxy: Any? = null
@@ -176,7 +177,10 @@ class VehicleDataForwarderImpl(
                 if (!isStartCurrent(generation)) return@launch
                 readStaticVehicleInfo()
                 if (!isStartCurrent(generation)) return@launch
-                registerProperties()
+                val subscribed = registerProperties()
+                check(VhalSubscriptionReadiness.mayActivate(subscribed)) {
+                    "No meaningful safety or energy VHAL property subscribed"
+                }
                 if (!isStartCurrent(generation)) return@launch
 
                 val activated = synchronized(this@VehicleDataForwarderImpl) {
@@ -208,7 +212,7 @@ class VehicleDataForwarderImpl(
     }
 
     private fun isStartCurrent(generation: Long): Boolean = synchronized(this) {
-        lifecycleGeneration == generation && desiredActive
+        lifecycleGeneration == generation && desiredActive && startFailureGeneration != generation
     }
 
     private fun cleanupAfterStartAttempt(generation: Long, failed: Boolean) {
@@ -216,22 +220,24 @@ class VehicleDataForwarderImpl(
         var cleanupOutcome: String? = null
         var retryDelayMs: Long? = null
         synchronized(this) {
+            val attemptFailed = failed || startFailureGeneration == generation
+            if (startFailureGeneration == generation) startFailureGeneration = null
             val stale = lifecycleGeneration != generation || !desiredActive
-            if (stale || failed) {
+            if (stale || attemptFailed) {
                 isActive = false
                 cleanup()
                 cleanupOutcome = when {
-                    failed -> "Failed VHAL start cleaned before bounded retry"
+                    attemptFailed -> "Failed VHAL start cleaned before bounded retry"
                     desiredActive -> "Stale VHAL start cleaned before queued restart"
                     else -> "In-flight VHAL start cleaned after stop"
                 }
             }
             startInFlight = false
-            if (failed && !stale) retryDelayMs = retryState.failedAttemptCleaned(generation)
+            if (attemptFailed && !stale) retryDelayMs = retryState.failedAttemptCleaned(generation)
             // stop() followed quickly by start() while the old attempt was blocked
             // leaves desiredActive=true but invalidates the old generation. Relaunch
             // only after that attempt has cleaned up its partially-created Car state.
-            if (desiredActive && !isActive && (stale || !failed)) {
+            if (desiredActive && !isActive && (stale || !attemptFailed)) {
                 startInFlight = true
                 nextGeneration = retryState.serviceReady()
                 if (nextGeneration != null) lifecycleGeneration = nextGeneration!!
@@ -336,7 +342,7 @@ class VehicleDataForwarderImpl(
 
         // Wait for connection (app_v1 waits up to 2s)
         if (!waitForConnected(car)) {
-            DiagnosticLog.i("vhal", "Car service did not report connected within timeout; continuing best-effort")
+            throw IllegalStateException("Car service did not report connected within timeout")
         }
         carObject = car
 
@@ -377,17 +383,26 @@ class VehicleDataForwarderImpl(
     }.getOrNull()
 
     private fun onCarServiceLost(lostCar: Any?) {
-        val failedGeneration = synchronized(this) {
-            if (!desiredActive || !isActive || carObject !== lostCar) return
-            if (!retryState.serviceLost(lifecycleGeneration)) return
-            isActive = false
-            reconnectAttempt = 0
-            cleanup()
-            startInFlight = false
-            lifecycleGeneration
+        val loss = synchronized(this) {
+            if (!desiredActive) return
+            if (carObject != null && carObject !== lostCar) return
+            val failedGeneration = lifecycleGeneration
+            if (startInFlight) {
+                startFailureGeneration = failedGeneration
+                failedGeneration to false
+            } else {
+                if (!isActive || !retryState.serviceLost(failedGeneration)) return
+                isActive = false
+                reconnectAttempt = 0
+                cleanup()
+                startInFlight = false
+                failedGeneration to true
+            }
         }
-        DiagnosticLog.w("vhal", "Car service lost; scheduling process-owned reconnect")
-        retryState.failedAttemptCleaned(failedGeneration)?.let { scheduleReconnectAfterCleanup(failedGeneration, it) }
+        DiagnosticLog.w("vhal", "Car service lost; startupFailed=${!loss.second}; scheduling process-owned reconnect")
+        if (loss.second) {
+            retryState.failedAttemptCleaned(loss.first)?.let { scheduleReconnectAfterCleanup(loss.first, it) }
+        }
     }
 
     private fun onCarServiceReady(readyCar: Any?) {
@@ -484,8 +499,8 @@ class VehicleDataForwarderImpl(
         return cause?.rootCause() ?: this
     }
 
-    private fun registerProperties() {
-        val pm = propertyManager ?: return
+    private fun registerProperties(): Set<String> {
+        val pm = propertyManager ?: return emptySet()
         val pmClass = pm::class.java
 
         // Resolve callback interface ONCE and create ONE shared proxy (app_v1 pattern)
@@ -493,7 +508,7 @@ class VehicleDataForwarderImpl(
             Class.forName("android.car.hardware.property.CarPropertyManager\$CarPropertyEventCallback")
         } catch (e: ClassNotFoundException) {
             DiagnosticLog.w("vhal", "CarPropertyEventCallback class not found")
-            return
+            return emptySet()
         }
         callbackProxy = createCallbackProxy(callbackInterface)
 
@@ -531,6 +546,7 @@ class VehicleDataForwarderImpl(
         )
 
         var subscribed = 0
+        val subscribedNames = mutableSetOf<String>()
         for (prop in properties) {
             // Resolve property ID from VehiclePropertyIds at runtime (app_v1 pattern)
             val propId = resolveIntConstant("android.car.VehiclePropertyIds", prop.fieldName)
@@ -585,6 +601,7 @@ class VehicleDataForwarderImpl(
             val ok = subscribe(pm, callbackInterface, callbackProxy!!, propId, prop.rateField)
             if (ok) {
                 subscribed++
+                subscribedNames += prop.fieldName
                 _propertyStatus[prop.fieldName] = "subscribed"
                 DiagnosticLog.d("vhal", "${prop.fieldName}: subscribed")
             } else {
@@ -606,6 +623,7 @@ class VehicleDataForwarderImpl(
             _latestVehicleData.value = data
             sendMessage(data)
         }
+        return subscribedNames
     }
 
     /** Create ONE shared callback proxy for all properties (app_v1 pattern). */
@@ -628,6 +646,9 @@ class VehicleDataForwarderImpl(
                 "onErrorEvent" -> {
                     val propertyId = (args?.getOrNull(0) as? Int) ?: -1
                     Log.w(TAG, "Property error callback for $propertyId")
+                    synchronized(this) {
+                        if (generation == registrationGeneration) handleErrorEvent(propertyId)
+                    }
                     null
                 }
                 "toString" -> "VehiclePropertyCallback"
@@ -722,6 +743,8 @@ class VehicleDataForwarderImpl(
                     status = runCatching {
                         propertyValue.javaClass.getMethod("getStatus").invoke(propertyValue) as? Int
                     }.getOrNull(),
+                    registrationGeneration = registrationGeneration,
+                    propertyId = propertyId,
                 )
             }
             if (value == null) return
@@ -750,6 +773,22 @@ class VehicleDataForwarderImpl(
         } catch (e: Throwable) {
             Log.w(TAG, "handleChangeEvent: ${e.rootCause().message}")
         }
+    }
+
+    @Synchronized
+    private fun handleErrorEvent(propertyId: Int) {
+        if (propertyId !in trackedPropertyIds) return
+        val name = VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key ?: return
+        currentValues.remove(propertyId)
+        evObservationMetadata[name] = VehiclePropertyObservation(
+            timestampElapsedNanos = SystemClock.elapsedRealtimeNanos(),
+            receivedElapsedMs = SystemClock.elapsedRealtime(),
+            status = 1,
+            registrationGeneration = registrationGeneration,
+            propertyId = propertyId,
+        )
+        lastSendTime = 0L
+        throttledSend()
     }
 
     /**
@@ -959,6 +998,7 @@ class VehicleDataForwarderImpl(
             evMotorPowerW = motorPowerW,
             evMotorTorqueNm = motorTorqueNm,
             evObservationMetadata = java.util.Collections.unmodifiableMap(observations),
+            vhalRegistrationGeneration = registrationGeneration,
         )
     }
 
@@ -1054,7 +1094,10 @@ class VehicleDataForwarderImpl(
         _propertyStatus.clear()
         evObservationMetadata.clear()
         // Do not alter retained numeric values; only retire their diagnostic observations.
-        _latestVehicleData.value = _latestVehicleData.value.copy(evObservationMetadata = emptyMap())
+        _latestVehicleData.value = _latestVehicleData.value.copy(
+            evObservationMetadata = emptyMap(),
+            vhalRegistrationGeneration = registrationGeneration,
+        )
         callbackProxy = null
         carLifecycleProxy = null
         carObject = null

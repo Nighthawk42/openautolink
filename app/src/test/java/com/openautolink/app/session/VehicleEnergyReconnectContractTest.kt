@@ -176,8 +176,15 @@ class VehicleEnergyReconnectContractTest {
             source.contains("CarServiceLifecycleListener") && source.contains("onCarServiceLost") &&
                 source.contains("onCarServiceReady") && source.contains("retryState.serviceReady()"))
         assertTrue("Failed partial starts must clean before retry to prevent duplicate subscriptions",
-            source.contains("if (stale || failed)") &&
+            source.contains("if (stale || attemptFailed)") &&
                 source.contains("Failed VHAL start cleaned before bounded retry"))
+        val serviceLoss = source.substringAfter("private fun onCarServiceLost")
+            .substringBefore("private fun onCarServiceReady")
+        assertTrue("Service loss during startup must mark that exact generation failed",
+            serviceLoss.contains("if (startInFlight)") &&
+                serviceLoss.contains("startFailureGeneration = failedGeneration"))
+        assertTrue("Startup cannot publish active without a meaningful subscription",
+            source.contains("VhalSubscriptionReadiness.mayActivate(subscribed)"))
     }
 
     @Test

@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
@@ -42,13 +44,13 @@ object EvContributionService {
     )
 
     private const val STARTUP_GRACE_MS = 60_000L
-    private const val LOCAL_SAFETY_PREFS = "ev-contribution-safety"
-    private const val LAST_SAFE_PARKED_MS = "last-safe-parked-ms"
+
     private val initialized = AtomicBoolean(false)
     private val lifecycle = EvContributionLifecycleGate()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeTransport = AtomicReference<EvContributionHttpTransport?>()
-    private val activeUploadJob = AtomicReference<Job?>()
+    private val activeUploadJob = EvUploadJobOwnership<Job>()
+    private val destructiveMutex = Mutex()
     private val reevaluation = EarliestOneShotDeadline(SystemClock::elapsedRealtime) { delayMs, task ->
         val job = scope.launch { delay(delayMs); task() }
         EarliestOneShotDeadline.Cancellable { job.cancel() }
@@ -84,11 +86,16 @@ object EvContributionService {
         val app = context.applicationContext
         appContext = app
         processStartedElapsedMs = SystemClock.elapsedRealtime()
-        freshParkGate.observe(null, null)
+        freshParkGate.clear()
         rawParked = false
         rawIgnition = null
         DiagnosticLog.d("ev_contribution", "processGeneration=${processGeneration.take(8)} freshParkObservedThisProcess=false")
         queue = EvContributionQueue(File(app.filesDir, "ev-contributions")).also {
+            if (it.isDeletionBlocked()) {
+                deletionFailureBlocked = true
+                lifecycle.invalidate(blockAdmissions = true)
+                DiagnosticLog.w("ev_contribution", "durable deletion block restored")
+            }
             val recovered = runCatching { it.recoverInterrupted(System.currentTimeMillis()) }
                 .onFailure { error -> DiagnosticLog.w("ev_contribution", "recoveryFailed=${error.javaClass.simpleName}") }
                 .getOrDefault(0)
@@ -116,7 +123,7 @@ object EvContributionService {
                 .collect { config ->
                     val decoded = EvContributionConsentBinding.decode(config.encoded)
                     val valid = config.enabled && decoded?.matches(config.url, config.token) == true
-                    lifecycle.invalidate(blockAdmissions = true) {
+                    val deletionLease = lifecycle.beginDestructiveOperation {
                         uploadUrl = config.url
                         token = config.token
                         consentBinding = decoded.takeIf { valid }
@@ -129,11 +136,15 @@ object EvContributionService {
                         }
                     }
                     cancelTransport("consent-or-endpoint-change")
-                    activeUploadJob.get()?.join()
+                    activeUploadJob.current()?.join()
                     if (!valid) {
-                        val deleted = lifecycle.exclusive { queue?.deleteAllArtifacts() }
-                        val retained = queue?.storageUsage() ?: EvContributionQueue.StorageUsage(0, 0)
-                        deletionFailureBlocked = deleted != null && !EvDeleteAdmissionPolicy.mayResume(deleted, retained)
+                        val deleted = destructiveMutex.withLock {
+                            lifecycle.exclusive { queue?.deleteAllArtifacts() }
+                        }
+                        val deletionComplete = deleted?.let { queue?.completeDeletion(it) } ?: false
+                        if (lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = false)) {
+                            deletionFailureBlocked = !deletionComplete
+                        }
                         _status.value = _status.value.copy(
                             consentValid = false,
                             consentInvalidReason = when {
@@ -146,7 +157,10 @@ object EvContributionService {
                         deleted?.let { DiagnosticLog.i("ev_contribution", "revocationDelete=${it.display()}") }
                     } else {
                         authFenced = false
-                        if (!deletionFailureBlocked) lifecycle.resumeAdmissions()
+                        lifecycle.finishDestructiveOperation(
+                            deletionLease,
+                            resumeAdmissions = !deletionFailureBlocked && queue?.isDeletionBlocked() != true,
+                        )
                         _status.value = _status.value.copy(consentValid = true, consentInvalidReason = "")
                         DiagnosticLog.i("ev_contribution", "consent=on schema=2 compactEvOnly=true")
                         if (!deletionFailureBlocked) attemptNaturalDrain("consent-valid")
@@ -201,20 +215,16 @@ object EvContributionService {
     /** Called for every raw VHAL batch, independently of projection and tuning. */
     @Synchronized
     fun onVehicle(data: ControlMessage.VehicleData, nowElapsedMs: Long = SystemClock.elapsedRealtime()) {
-        val parked = freshParkGate.observe(data.gearRaw, data.ignitionState)
+        val parked = freshParkGate.observe(data, nowElapsedMs)
         if (!parked) {
             lifecycle.invalidate {
                 rawIgnition = data.ignitionState
                 rawParked = false
             }
-            appContext?.getSharedPreferences(LOCAL_SAFETY_PREFS, Context.MODE_PRIVATE)
-                ?.edit()?.remove(LAST_SAFE_PARKED_MS)?.commit()
             cancelTransport("vehicle-moving")
         } else {
             rawIgnition = data.ignitionState
             rawParked = true
-            appContext?.getSharedPreferences(LOCAL_SAFETY_PREFS, Context.MODE_PRIVATE)
-                ?.edit()?.putLong(LAST_SAFE_PARKED_MS, System.currentTimeMillis())?.commit()
         }
 
         val q = queue ?: return
@@ -284,7 +294,9 @@ object EvContributionService {
     fun onForecast(forecast: VehicleEnergyForecast?) {
         val binding = consentBinding ?: return
         if (forecast == null || !binding.matches(uploadUrl, token)) return
-        val captureLease = lifecycle.admitCapture { consentBinding == binding && !authFenced } ?: return
+        val captureLease = lifecycle.admitCapture {
+            consentBinding == binding && !authFenced && !deletionFailureBlocked
+        } ?: return
         val id = activeId ?: return
         val identity = activeIdentity ?: return
         val q = queue ?: return
@@ -341,7 +353,12 @@ object EvContributionService {
             )
             binding != null && !authFenced && !deletionFailureBlocked && binding.matches(uploadUrl, token) &&
                 EvContributionPolicy.mayUpload(true, uploadContext)
-        } ?: return
+        } ?: run {
+            if (activeUploadJob.current() != null && !activeUploadJob.markDrainPending()) {
+                scope.launch { attemptNaturalDrain("worker-finish-race") }
+            }
+            return
+        }
         val binding = consentBinding ?: run { lifecycle.releaseUpload(uploadLease); return }
         val url = uploadUrl
         val secret = token
@@ -349,12 +366,9 @@ object EvContributionService {
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val self = kotlin.coroutines.coroutineContext[Job]
             val transport = EvContributionHttpTransport()
-            if (!lifecycle.isCurrent(uploadLease)) {
-                lifecycle.releaseUpload(uploadLease)
-                return@launch
-            }
-            activeTransport.set(transport)
             try {
+                if (!lifecycle.isCurrent(uploadLease)) return@launch
+                activeTransport.set(transport)
                 val outcome = EvContributionDrainLoop(q) { queueForAttempt ->
                     EvContributionUploader(
                         queueForAttempt,
@@ -385,12 +399,20 @@ object EvContributionService {
                 }
             } finally {
                 activeTransport.compareAndSet(transport, null)
-                if (self != null) activeUploadJob.compareAndSet(self, null)
                 lifecycle.releaseUpload(uploadLease)
                 publishStatus(q)
+                if (self != null && activeUploadJob.finish(self)) {
+                    scope.launch { attemptNaturalDrain("worker-finished-pending") }
+                }
             }
         }
-        check(activeUploadJob.compareAndSet(null, job)) { "upload worker ownership already held" }
+        if (!activeUploadJob.tryInstall(job)) {
+            lifecycle.releaseUpload(uploadLease)
+            if (!activeUploadJob.markDrainPending()) {
+                scope.launch { attemptNaturalDrain("worker-install-race") }
+            }
+            return
+        }
         job.start()
     }
 
@@ -407,25 +429,33 @@ object EvContributionService {
     }
 
     suspend fun deletePendingEvContributions(): EvContributionQueue.DeleteResult {
-        lifecycle.invalidate(blockAdmissions = true) {
+        val deletionLease = lifecycle.beginDestructiveOperation {
             driveIdentityOwner.clear()
             activeId = null
             activeIdentity = null
             resetDriveContinuity()
         }
-        cancelTransport("delete")
-        activeUploadJob.get()?.join()
-        val result = lifecycle.exclusive {
-            queue?.deleteAllArtifacts() ?: EvContributionQueue.DeleteResult(0, 0, 0)
+        var leaseFinished = false
+        try {
+            cancelTransport("delete")
+            activeUploadJob.current()?.join()
+            val result = destructiveMutex.withLock {
+                lifecycle.exclusive {
+                    queue?.deleteAllArtifacts() ?: EvContributionQueue.DeleteResult(0, 0, 0)
+                }
+            }
+            val deletionComplete = queue?.completeDeletion(result) ?: true
+            val verifiedResult = if (deletionComplete) result else result.copy(failures = result.failures.coerceAtLeast(1))
+            val resume = deletionComplete && consentBinding?.matches(uploadUrl, token) == true && !authFenced
+            val latest = lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = resume)
+            leaseFinished = true
+            if (latest) deletionFailureBlocked = !deletionComplete
+            _status.value = _status.value.copy(lastDeleteResult = verifiedResult.display())
+            queue?.let(::publishStatus)
+            return verifiedResult
+        } finally {
+            if (!leaseFinished) lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = false)
         }
-        val usage = queue?.storageUsage() ?: EvContributionQueue.StorageUsage(0, 0)
-        deletionFailureBlocked = !EvDeleteAdmissionPolicy.mayResume(result, usage)
-        if (!deletionFailureBlocked &&
-            consentBinding?.matches(uploadUrl, token) == true && !authFenced
-        ) lifecycle.resumeAdmissions()
-        _status.value = _status.value.copy(lastDeleteResult = result.display())
-        queue?.let(::publishStatus)
-        return result
     }
 
     fun reportConsentInvalid(reason: String) {

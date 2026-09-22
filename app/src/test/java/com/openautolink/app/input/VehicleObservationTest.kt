@@ -2,7 +2,9 @@ package com.openautolink.app.input
 
 import com.openautolink.app.transport.ControlMessage
 import com.openautolink.app.transport.VehiclePropertyObservation
+import com.openautolink.app.diagnostics.EvFreshParkGate
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -260,5 +262,33 @@ class VehicleObservationTest {
         }
         writer.join()
         failure.get()?.let { throw it }
+    }
+
+    @Test fun productionForwarderSafetyMetadataRevokesOnUnavailableAndReconnect() {
+        io.mockk.mockkStatic(android.os.SystemClock::class)
+        try {
+            var now = 1_000L
+            io.mockk.every { android.os.SystemClock.elapsedRealtime() } answers { now }
+            val forwarder = forwarder()
+            val tracked = forwarder.javaClass.getDeclaredField("trackedPropertyIds").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            (tracked.get(forwarder) as MutableSet<Int>).addAll(listOf(0x11400400, 0x11400409))
+            event(forwarder, PropertyValue(0x11400400, 4, 1_000_000_000L, 0))
+            event(forwarder, PropertyValue(0x11400409, 2, 1_000_000_000L, 0))
+            val gate = EvFreshParkGate()
+            assertTrue(gate.observe(snapshot(forwarder), now))
+
+            now = 1_100L
+            event(forwarder, PropertyValue(0x11400400, null, 1_100_000_000L, 1))
+            event(forwarder, PropertyValue(0x11400409, null, 1_100_000_000L, 1))
+            event(forwarder, PropertyValue(batteryId, 42f, 1_100_000_000L, 0))
+            assertEquals(4, snapshot(forwarder).gearRaw) // value cache remains, authority does not
+            assertFalse(gate.observe(snapshot(forwarder), now))
+
+            forwarder.javaClass.getDeclaredMethod("cleanup").apply { isAccessible = true }.invoke(forwarder)
+            assertFalse(gate.observe(forwarder.latestVehicleData.value, now))
+        } finally {
+            io.mockk.unmockkStatic(android.os.SystemClock::class)
+        }
     }
 }
