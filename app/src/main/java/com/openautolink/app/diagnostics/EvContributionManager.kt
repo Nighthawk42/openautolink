@@ -280,6 +280,7 @@ class EvFreshParkGate {
     private var registrationGeneration: Long? = null
     private var gearSafe = false
     private var ignitionSafe = false
+    private var latestUnsafeSequence = 0L
     private var gearObservation: com.openautolink.app.transport.VehiclePropertyObservation? = null
     private var ignitionObservation: com.openautolink.app.transport.VehiclePropertyObservation? = null
 
@@ -290,6 +291,7 @@ class EvFreshParkGate {
             registrationGeneration = batchGeneration
             gearSafe = false
             ignitionSafe = false
+            latestUnsafeSequence = 0L
             gearObservation = null
             ignitionObservation = null
         }
@@ -308,12 +310,14 @@ class EvFreshParkGate {
             if (newer(observation, gearObservation)) {
                 gearObservation = observation
                 gearSafe = fresh(observation) && data.gearRaw == 4
+                if (!gearSafe) latestUnsafeSequence = maxOf(latestUnsafeSequence, observation.sequence)
             }
         }
         data.evObservationMetadata["IGNITION_STATE"]?.let { observation ->
             if (newer(observation, ignitionObservation)) {
                 ignitionObservation = observation
                 ignitionSafe = fresh(observation) && data.ignitionState in setOf(1, 2)
+                if (!ignitionSafe) latestUnsafeSequence = maxOf(latestUnsafeSequence, observation.sequence)
             }
         }
         freshParkObservedThisProcess = authorization(nowElapsedMs)
@@ -325,6 +329,7 @@ class EvFreshParkGate {
         fun current(observation: com.openautolink.app.transport.VehiclePropertyObservation?, safe: Boolean): Boolean {
             if (!safe || observation == null || !observation.subscriptionActive || observation.status != 0) return false
             if (observation.registrationGeneration != registrationGeneration) return false
+            if (observation.sequence <= latestUnsafeSequence) return false
             val source = observation.timestampElapsedNanos ?: return false
             if (observation.receivedElapsedMs > currentElapsedRealtime || currentElapsedRealtime - observation.receivedElapsedMs >= MAX_OBSERVATION_AGE_MS) return false
             val nowNanos = currentElapsedRealtime * 1_000_000L
@@ -340,6 +345,7 @@ class EvFreshParkGate {
         registrationGeneration = null
         gearSafe = false
         ignitionSafe = false
+        latestUnsafeSequence = 0L
         gearObservation = null
         ignitionObservation = null
         freshParkObservedThisProcess = false
@@ -803,6 +809,7 @@ class EvContributionUploader(
     private val queue: EvContributionQueue,
     private val jitter: (Long) -> Long = { bound -> if (bound <= 0) 0 else Random.nextLong(bound + 1) },
     private val onUnauthorized: () -> Unit = {},
+    private val mayTransmit: () -> Boolean = { true },
     private val mayMutate: () -> Boolean = { true },
     private val mutateIfCurrent: ((() -> Outcome) -> Outcome?) = { action -> if (mayMutate()) action() else null },
     private val send: (file: File, idempotencyKey: String) -> Response,
@@ -815,6 +822,7 @@ class EvContributionUploader(
         val entry = queue.pending().firstOrNull() ?: return Outcome.EMPTY
         if (authorizedNamespace != null && entry.namespace != authorizedNamespace) return Outcome.OWNER_MISMATCH
         if (nowMs < entry.nextAttemptMs) return Outcome.BACKOFF
+        if (!mayTransmit()) return Outcome.CANCELLED
         val response = runCatching { send(entry.file, entry.id) }.getOrElse {
             if (!mayMutate()) return Outcome.CANCELLED
             Response(0, "")

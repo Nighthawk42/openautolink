@@ -12,6 +12,10 @@ import java.util.concurrent.atomic.AtomicReference
 
 class VehicleObservationTest {
     interface Callback { fun onChangeEvent(value: Any) }
+    interface ErrorCallback {
+        fun onChangeEvent(value: Any)
+        fun onErrorEvent(propertyId: Int, areaId: Int)
+    }
     @Test fun retiredProxyCannotOverwriteNewRegistration() {
         val f = forwarder()
         val proxy = f.javaClass.getDeclaredMethod("createCallbackProxy", Class::class.java)
@@ -41,6 +45,134 @@ class VehicleObservationTest {
         fun getValue() = value
         fun getTimestamp() = timestamp
         fun getStatus() = status
+    }
+
+    @Test fun synchronousSafetyCallbackDuringSubscriptionBeatsOlderInitialRead() {
+        val forwarder = forwarder()
+        val gearId = 0x11400400
+        val initialRead = forwarder.javaClass.getDeclaredMethod("handleInitialRead", Any::class.java)
+            .apply { isAccessible = true }
+        val begin = forwarder.javaClass.getDeclaredMethod(
+            "beginSafetySubscription", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType,
+        ).apply { isAccessible = true }
+        val commit = forwarder.javaClass.getDeclaredMethod(
+            "commitSafetySubscription", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType,
+        ).apply { isAccessible = true }
+        val proxy = forwarder.javaClass.getDeclaredMethod("createCallbackProxy", Class::class.java)
+            .apply { isAccessible = true }.invoke(forwarder, Callback::class.java) as Callback
+        val generation = forwarder.javaClass.getDeclaredField("registrationGeneration")
+            .apply { isAccessible = true }.getLong(forwarder)
+
+        initialRead.invoke(forwarder, PropertyValue(gearId, 4, 1_000_000_000L, 0))
+        begin.invoke(forwarder, gearId, generation)
+        proxy.onChangeEvent(PropertyValue(gearId, 8, 1_100_000_000L, 0))
+        commit.invoke(forwarder, gearId, generation)
+
+        val data = snapshot(forwarder)
+        assertEquals(8, data.gearRaw)
+        assertEquals(1_100_000_000L, data.evObservationMetadata.getValue("GEAR_SELECTION").timestampElapsedNanos)
+        assertTrue(data.evObservationMetadata.getValue("GEAR_SELECTION").subscriptionActive)
+    }
+
+    @Test fun synchronousSafetyErrorDuringSubscriptionRevokesOlderInitialRead() {
+        val forwarder = forwarder()
+        val gearId = 0x11400400
+        val initialRead = forwarder.javaClass.getDeclaredMethod("handleInitialRead", Any::class.java)
+            .apply { isAccessible = true }
+        val begin = forwarder.javaClass.getDeclaredMethod(
+            "beginSafetySubscription", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType,
+        ).apply { isAccessible = true }
+        val commit = forwarder.javaClass.getDeclaredMethod(
+            "commitSafetySubscription", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType,
+        ).apply { isAccessible = true }
+        val proxy = forwarder.javaClass.getDeclaredMethod("createCallbackProxy", Class::class.java)
+            .apply { isAccessible = true }.invoke(forwarder, ErrorCallback::class.java) as ErrorCallback
+        val generation = forwarder.javaClass.getDeclaredField("registrationGeneration")
+            .apply { isAccessible = true }.getLong(forwarder)
+
+        initialRead.invoke(forwarder, PropertyValue(gearId, 4, 1_000_000_000L, 0))
+        begin.invoke(forwarder, gearId, generation)
+        proxy.onErrorEvent(gearId, 0)
+        commit.invoke(forwarder, gearId, generation)
+
+        val data = snapshot(forwarder)
+        assertEquals(null, data.gearRaw)
+        assertEquals(1, data.evObservationMetadata.getValue("GEAR_SELECTION").status)
+        assertTrue(data.evObservationMetadata.getValue("GEAR_SELECTION").subscriptionActive)
+    }
+
+    @Test fun rejectedSafetySubscriptionPurgesBufferedCallbackAndRetiredGenerationCannotQualify() {
+        val forwarder = forwarder()
+        val gearId = 0x11400400
+        val begin = forwarder.javaClass.getDeclaredMethod(
+            "beginSafetySubscription", Int::class.javaPrimitiveType, Long::class.javaPrimitiveType,
+        ).apply { isAccessible = true }
+        val proxy = forwarder.javaClass.getDeclaredMethod("createCallbackProxy", Class::class.java)
+            .apply { isAccessible = true }.invoke(forwarder, Callback::class.java) as Callback
+        val generation = forwarder.javaClass.getDeclaredField("registrationGeneration")
+            .apply { isAccessible = true }.getLong(forwarder)
+        begin.invoke(forwarder, gearId, generation)
+        proxy.onChangeEvent(PropertyValue(gearId, 4, 1_000_000_000L, 0))
+
+        forwarder.javaClass.getDeclaredMethod("rejectSafetySubscription", Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(forwarder, gearId)
+        forwarder.javaClass.getDeclaredMethod("cleanup").apply { isAccessible = true }.invoke(forwarder)
+        proxy.onChangeEvent(PropertyValue(gearId, 4, 2_000_000_000L, 0))
+
+        assertEquals(null, snapshot(forwarder).gearRaw)
+        assertFalse(snapshot(forwarder).evObservationMetadata.containsKey("GEAR_SELECTION"))
+    }
+
+    @Test fun safetyTransitionsBypassOrdinaryThrottleAndImmediatelyRevokeAuthorization() {
+        io.mockk.mockkStatic(android.os.SystemClock::class)
+        try {
+            var now = 1_000L
+            io.mockk.every { android.os.SystemClock.elapsedRealtime() } answers { now }
+            val published = mutableListOf<ControlMessage.VehicleData>()
+            val forwarder = VehicleDataForwarderImpl(io.mockk.mockk(relaxed = true), published::add)
+            @Suppress("UNCHECKED_CAST")
+            val tracked = forwarder.javaClass.getDeclaredField("trackedPropertyIds").apply { isAccessible = true }
+                .get(forwarder) as MutableSet<Int>
+            tracked.addAll(listOf(0x11400400, 0x11400409))
+            event(forwarder, PropertyValue(0x11400400, 4, 1_000_000_000L, 0))
+            event(forwarder, PropertyValue(0x11400409, 2, 1_000_000_000L, 0))
+            val gate = EvFreshParkGate()
+            assertTrue(gate.observe(published.last(), now))
+
+            now = 1_100L
+            event(forwarder, PropertyValue(0x11400400, 8, 1_100_000_000L, 0))
+
+            assertEquals(8, published.last().gearRaw)
+            assertFalse(gate.observe(published.last(), now))
+        } finally {
+            io.mockk.unmockkStatic(android.os.SystemClock::class)
+        }
+    }
+
+    @Test fun safetyNullAvailabilityBypassesThrottleAndImmediatelyRevokesAuthorization() {
+        io.mockk.mockkStatic(android.os.SystemClock::class)
+        try {
+            var now = 1_000L
+            io.mockk.every { android.os.SystemClock.elapsedRealtime() } answers { now }
+            val published = mutableListOf<ControlMessage.VehicleData>()
+            val forwarder = VehicleDataForwarderImpl(io.mockk.mockk(relaxed = true), published::add)
+            @Suppress("UNCHECKED_CAST")
+            val tracked = forwarder.javaClass.getDeclaredField("trackedPropertyIds").apply { isAccessible = true }
+                .get(forwarder) as MutableSet<Int>
+            tracked.addAll(listOf(0x11400400, 0x11400409))
+            event(forwarder, PropertyValue(0x11400400, 4, 1_000_000_000L, 0))
+            event(forwarder, PropertyValue(0x11400409, 2, 1_000_000_000L, 0))
+            val gate = EvFreshParkGate()
+            assertTrue(gate.observe(published.last(), now))
+
+            now = 1_100L
+            event(forwarder, PropertyValue(0x11400400, null, 1_100_000_000L, 1))
+
+            assertEquals(null, published.last().gearRaw)
+            assertFalse(gate.observe(published.last(), now))
+        } finally {
+            io.mockk.unmockkStatic(android.os.SystemClock::class)
+        }
     }
 
     @Test fun initialSafetyReadIsNotAuthoritativeUntilExactSubscriptionSucceeds() {
@@ -316,7 +448,7 @@ class VehicleObservationTest {
             event(forwarder, PropertyValue(0x11400400, null, 1_100_000_000L, 1))
             event(forwarder, PropertyValue(0x11400409, null, 1_100_000_000L, 1))
             event(forwarder, PropertyValue(batteryId, 42f, 1_100_000_000L, 0))
-            assertEquals(4, snapshot(forwarder).gearRaw) // value cache remains, authority does not
+            assertEquals(null, snapshot(forwarder).gearRaw) // safety values fail closed on unavailability
             assertFalse(gate.observe(snapshot(forwarder), now))
 
             forwarder.javaClass.getDeclaredMethod("cleanup").apply { isAccessible = true }.invoke(forwarder)

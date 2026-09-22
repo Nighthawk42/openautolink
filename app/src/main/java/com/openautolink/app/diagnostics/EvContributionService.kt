@@ -401,12 +401,31 @@ object EvContributionService {
                             cancelTransport("unauthorized")
                             scope.launch { AppPreferences.getInstance(appContext ?: return@launch).setEvContributionConsent(false) }
                         },
-                        mayMutate = { lifecycle.isCurrent(uploadLease) },
-                        mutateIfCurrent = { action -> lifecycle.withCurrent(uploadLease, action) },
+                        mayTransmit = {
+                            lifecycle.isCurrent(uploadLease) &&
+                                freshParkGate.authorization(SystemClock.elapsedRealtime())
+                        },
+                        mayMutate = {
+                            lifecycle.isCurrent(uploadLease) &&
+                                freshParkGate.authorization(SystemClock.elapsedRealtime())
+                        },
+                        mutateIfCurrent = { action ->
+                            lifecycle.withCurrent(uploadLease) {
+                                if (freshParkGate.authorization(SystemClock.elapsedRealtime())) action()
+                                else EvContributionUploader.Outcome.CANCELLED
+                            }
+                        },
                     ) { file, _ ->
-                        if (!lifecycle.isCurrent(uploadLease)) return@EvContributionUploader EvContributionUploader.Response(0, "")
+                        val transmissionAuthorized = lifecycle.isCurrent(uploadLease) &&
+                            freshParkGate.authorization(SystemClock.elapsedRealtime())
+                        if (!transmissionAuthorized) {
+                            return@EvContributionUploader EvContributionUploader.Response(0, "")
+                        }
                         val label = q.pending().firstOrNull { it.file == file }?.vehicleLabel ?: "ev-class-unknown"
-                        transport.send(url, secret, label, file) { lifecycle.isCurrent(uploadLease) }
+                        transport.send(url, secret, label, file) {
+                            lifecycle.isCurrent(uploadLease) &&
+                                freshParkGate.authorization(SystemClock.elapsedRealtime())
+                        }
                     }
                 }.drainEligible(System.currentTimeMillis(), namespace)
                 if (lifecycle.isCurrent(uploadLease)) {
@@ -513,9 +532,17 @@ object EvContributionService {
     )
 }
 
+internal object EvContributionDeadline {
+    fun interface Cancellable { fun cancel() }
+}
+
 internal class EvContributionHttpTransport(
     private val attemptTimeoutMs: Long = 30_000L,
     private val monotonicNow: java.util.function.LongSupplier = java.util.function.LongSupplier { SystemClock.elapsedRealtime() },
+    private val scheduleDeadline: (Long, () -> Unit) -> EvContributionDeadline.Cancellable = { delayMs, task ->
+        val future = watchdog.schedule({ task() }, delayMs, TimeUnit.MILLISECONDS)
+        EvContributionDeadline.Cancellable { future.cancel(false) }
+    },
     private val openConnection: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
 ) {
     companion object {
@@ -524,14 +551,44 @@ internal class EvContributionHttpTransport(
             Thread(runnable, "ev-upload-deadline").apply { isDaemon = true }
         }
     }
-    private val active = AtomicReference<HttpURLConnection?>()
-    private val activeBody = AtomicReference<java.io.OutputStream?>()
-    private val activeResponse = AtomicReference<InputStream?>()
+
+    private class Attempt(val owner: Thread) {
+        val connection = AtomicReference<HttpURLConnection?>()
+        val body = AtomicReference<java.io.OutputStream?>()
+        val response = AtomicReference<InputStream?>()
+        val cancelled = AtomicBoolean(false)
+
+        fun bind(connection: HttpURLConnection) {
+            check(this.connection.compareAndSet(null, connection)) { "attempt connection already bound" }
+            if (cancelled.get()) {
+                connection.disconnect()
+                throw InterruptedIOException("upload cancelled during connection creation")
+            }
+        }
+
+        fun cancel() {
+            cancelled.set(true)
+            connection.get()?.disconnect()
+            owner.interrupt()
+        }
+
+        fun cleanup() {
+            // Active cancellation must reach disconnect before a hostile stream
+            // close can block. Only this attempt's immutable handles are touched.
+            connection.get()?.disconnect()
+            // disconnect owns cancellation cleanup. Never invoke an untrusted
+            // stream close from the watchdog/cancel path or from worker teardown;
+            // a close that ignores disconnect would otherwise pin deletion.
+            body.set(null)
+            response.set(null)
+            connection.set(null)
+        }
+    }
+
+    private val activeAttempt = AtomicReference<Attempt?>()
 
     fun cancel() {
-        activeBody.getAndSet(null)?.let { runCatching { it.close() } }
-        activeResponse.getAndSet(null)?.let { runCatching { it.close() } }
-        active.getAndSet(null)?.disconnect()
+        activeAttempt.get()?.cancel()
     }
 
     fun send(
@@ -543,38 +600,53 @@ internal class EvContributionHttpTransport(
     ): EvContributionUploader.Response {
         require(file.isFile && file.length() > 0)
         require(attemptTimeoutMs > 0)
-        check(mayContinue()) { "upload generation is stale" }
         val deadline = monotonicNow.asLong + attemptTimeoutMs
+        val attempt = Attempt(Thread.currentThread())
+        check(activeAttempt.compareAndSet(null, attempt)) { "transport already active" }
+
         fun checkDeadline() {
+            if (attempt.cancelled.get()) throw InterruptedIOException("EV upload attempt cancelled")
             if (monotonicNow.asLong >= deadline) throw java.net.SocketTimeoutException("EV upload attempt deadline exceeded")
             if (!mayContinue()) throw InterruptedIOException("upload generation is stale")
         }
-        val connection = openConnection(URL(url)).apply {
-            requestMethod = "POST"; doOutput = true; instanceFollowRedirects = false
-            connectTimeout = minOf(10_000L, attemptTimeoutMs).toInt()
-            readTimeout = minOf(15_000L, attemptTimeoutMs).toInt()
-            setRequestProperty("Content-Type", "application/zip"); setRequestProperty("X-Upload-Token", secret)
-            setRequestProperty("X-Device-Label", label.take(120))
-            setRequestProperty("X-Orig-Name", "ev-contribution.zip"); setFixedLengthStreamingMode(file.length())
+        fun remainingTimeout(capMs: Long): Int {
+            checkDeadline()
+            return minOf(capMs, (deadline - monotonicNow.asLong).coerceAtLeast(1L)).toInt()
         }
-        checkDeadline()
-        check(active.compareAndSet(null, connection)) { "transport already active" }
-        val deadlineTask = watchdog.schedule({
-            if (active.compareAndSet(connection, null)) {
-                activeBody.getAndSet(null)?.let { runCatching { it.close() } }
-                activeResponse.getAndSet(null)?.let { runCatching { it.close() } }
-                connection.disconnect()
-            }
-        }, attemptTimeoutMs, TimeUnit.MILLISECONDS)
+
+        val deadlineTask = scheduleDeadline((deadline - monotonicNow.asLong).coerceAtLeast(0L)) {
+            if (activeAttempt.get() === attempt) attempt.cancel()
+        }
         return try {
             checkDeadline()
+            val target = URL(url)
+            checkDeadline()
+            val connection = openConnection(target)
+            attempt.bind(connection)
+            checkDeadline()
+
+            connection.requestMethod = "POST"
+            checkDeadline()
+            connection.doOutput = true
+            checkDeadline()
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = remainingTimeout(10_000L)
+            connection.readTimeout = remainingTimeout(15_000L)
+            connection.setRequestProperty("Content-Type", "application/zip")
+            checkDeadline()
+            connection.setRequestProperty("X-Upload-Token", secret)
+            checkDeadline()
+            connection.setRequestProperty("X-Device-Label", label.take(120))
+            checkDeadline()
+            connection.setRequestProperty("X-Orig-Name", "ev-contribution.zip")
+            checkDeadline()
+            connection.setFixedLengthStreamingMode(file.length())
+            checkDeadline()
+
             val output = connection.outputStream
-            check(activeBody.compareAndSet(null, output)) { "request body already active" }
-            if (active.get() !== connection || !mayContinue()) {
-                activeBody.compareAndSet(output, null)
-                runCatching { output.close() }
-                throw java.io.InterruptedIOException("upload cancelled before body")
-            }
+            check(attempt.body.compareAndSet(null, output)) { "request body already active" }
+            checkDeadline()
+            var bodyComplete = false
             try {
                 file.inputStream().use { input ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -586,44 +658,56 @@ internal class EvContributionHttpTransport(
                         output.write(buffer, 0, count)
                         checkDeadline()
                     }
-                    checkDeadline()
                 }
+                checkDeadline()
+                bodyComplete = true
             } finally {
-                activeBody.compareAndSet(output, null)
-                runCatching { output.close() }
+                if (bodyComplete) {
+                    attempt.body.compareAndSet(output, null)
+                    output.close()
+                }
             }
+
             checkDeadline()
+            connection.readTimeout = remainingTimeout(15_000L)
             val status = connection.responseCode
+            checkDeadline()
             val stream = if (status in 200..399) connection.inputStream else connection.errorStream
             val body = if (stream == null) "" else {
-                check(activeResponse.compareAndSet(null, stream)) { "response stream already active" }
+                check(attempt.response.compareAndSet(null, stream)) { "response stream already active" }
+                val bytes = java.io.ByteArrayOutputStream()
+                var responseComplete = false
                 try {
-                    stream.use { input ->
-                        val bytes = java.io.ByteArrayOutputStream()
-                        val buffer = ByteArray(4 * 1024)
-                        while (true) {
-                            checkDeadline()
-                            val count = input.read(buffer)
-                            if (count < 0) break
-                            checkDeadline()
-                            if (bytes.size() + count > MAX_RESPONSE_BYTES) throw IOException("EV upload response exceeds 64 KiB")
-                            bytes.write(buffer, 0, count)
-                        }
-                        bytes.toString(Charsets.UTF_8.name())
+                    val buffer = ByteArray(4 * 1024)
+                    while (true) {
+                        checkDeadline()
+                        val count = stream.read(buffer)
+                        if (count < 0) break
+                        checkDeadline()
+                        if (bytes.size() + count > MAX_RESPONSE_BYTES) throw IOException("EV upload response exceeds 64 KiB")
+                        bytes.write(buffer, 0, count)
                     }
+                    checkDeadline()
+                    responseComplete = true
+                    bytes.toString(Charsets.UTF_8.name())
                 } finally {
-                    activeResponse.compareAndSet(stream, null)
-                    runCatching { stream.close() }
+                    if (responseComplete) {
+                        attempt.response.compareAndSet(stream, null)
+                        stream.close()
+                    }
                 }
             }
             checkDeadline()
             EvContributionUploader.Response(status, body)
+        } catch (interrupted: InterruptedException) {
+            throw InterruptedIOException("EV upload attempt interrupted").apply { initCause(interrupted) }
         } finally {
-            deadlineTask.cancel(false)
-            activeBody.getAndSet(null)?.let { runCatching { it.close() } }
-            activeResponse.getAndSet(null)?.let { runCatching { it.close() } }
-            active.compareAndSet(connection, null)
-            connection.disconnect()
+            deadlineTask.cancel()
+            attempt.cleanup()
+            activeAttempt.compareAndSet(attempt, null)
+            // A watchdog interrupt is attempt-owned; do not leak it into a later
+            // sequential attempt on the same worker thread.
+            Thread.interrupted()
         }
     }
 }

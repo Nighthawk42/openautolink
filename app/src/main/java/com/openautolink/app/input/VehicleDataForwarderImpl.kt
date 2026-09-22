@@ -100,6 +100,12 @@ class VehicleDataForwarderImpl(
     // Guarded with the forwarder monitor, alongside value updates and batch snapshots.
     private val evObservationMetadata = mutableMapOf<String, VehiclePropertyObservation>()
     private val observationSequence = AtomicLong()
+    private data class BufferedSafetyObservation(
+        val value: Any?,
+        val observation: VehiclePropertyObservation,
+    )
+    private val pendingSafetySubscriptions = mutableMapOf<Int, Long>()
+    private val bufferedSafetyObservations = mutableMapOf<Int, BufferedSafetyObservation>()
     private var lastSendTime = 0L
 
     // HistoryProvider polling cache (Finding F.2). Refreshed every 5s on a
@@ -596,11 +602,20 @@ class VehicleDataForwarderImpl(
                 DiagnosticLog.d("vhal", "${prop.fieldName}: initial read: ${t.rootCause().javaClass.simpleName}: ${t.rootCause().message}")
             }
 
+            // A platform may synchronously deliver the current value from inside
+            // subscribe(). Fence and buffer that callback before invoking it so
+            // the older initial read cannot overwrite a newer safety observation.
+            val subscriptionGeneration = registrationGeneration
+            beginSafetySubscription(propId, subscriptionGeneration)
             // Subscribe using shared callback (app_v1's subscribe pattern)
             val ok = subscribe(pm, callbackInterface, callbackProxy!!, propId, prop.rateField)
             if (ok) {
                 trackedPropertyIds.add(propId)
-                initialPropertyValue?.let { promoteSubscribedInitialRead(propId, it) }
+                if (isSafetyProperty(propId)) {
+                    commitSafetySubscription(propId, subscriptionGeneration)
+                } else {
+                    initialPropertyValue?.let { promoteSubscribedInitialRead(propId, it) }
+                }
                 subscribed++
                 subscribedNames += prop.fieldName
                 _propertyStatus[prop.fieldName] = "subscribed"
@@ -641,7 +656,9 @@ class VehicleDataForwarderImpl(
             when (method.name) {
                 "onChangeEvent" -> {
                     synchronized(this) {
-                        if (generation == registrationGeneration) args?.firstOrNull()?.let(::handleChangeEvent)
+                        if (generation == registrationGeneration) {
+                            args?.firstOrNull()?.let { handleCallbackChange(generation, it) }
+                        }
                     }
                     null
                 }
@@ -649,7 +666,7 @@ class VehicleDataForwarderImpl(
                     val propertyId = (args?.getOrNull(0) as? Int) ?: -1
                     Log.w(TAG, "Property error callback for $propertyId")
                     synchronized(this) {
-                        if (generation == registrationGeneration) handleErrorEvent(propertyId)
+                        if (generation == registrationGeneration) handleCallbackError(generation, propertyId)
                     }
                     null
                 }
@@ -745,11 +762,87 @@ class VehicleDataForwarderImpl(
         handleChangeEvent(propertyValue)
     }
 
+    private fun isSafetyProperty(propertyId: Int): Boolean =
+        propertyId == VEHICLE_PROPERTY_ID_FALLBACK["GEAR_SELECTION"] ||
+            propertyId == VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
+
+    @Synchronized
+    private fun beginSafetySubscription(propertyId: Int, generation: Long) {
+        if (!isSafetyProperty(propertyId) || generation != registrationGeneration) return
+        pendingSafetySubscriptions[propertyId] = generation
+        bufferedSafetyObservations.remove(propertyId)
+    }
+
+    @Synchronized
+    private fun commitSafetySubscription(propertyId: Int, generation: Long) {
+        if (!isSafetyProperty(propertyId) || generation != registrationGeneration ||
+            pendingSafetySubscriptions[propertyId] != generation
+        ) return
+        pendingSafetySubscriptions.remove(propertyId)
+        trackedPropertyIds.add(propertyId)
+        val name = VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key ?: return
+        val initial = evObservationMetadata[name]
+        val buffered = bufferedSafetyObservations.remove(propertyId)
+        val newest = when {
+            buffered == null -> initial?.let { BufferedSafetyObservation(currentValues[propertyId], it) }
+            initial == null || buffered.observation.sequence > initial.sequence -> buffered
+            else -> BufferedSafetyObservation(currentValues[propertyId], initial)
+        } ?: return
+        applySafetyObservation(
+            propertyId,
+            newest.value,
+            newest.observation.copy(
+                registrationGeneration = generation,
+                subscriptionActive = true,
+            ),
+        )
+        publishImmediate()
+    }
+
+    @Synchronized
+    private fun handleCallbackChange(generation: Long, propertyValue: Any) {
+        val propertyId = runCatching {
+            propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int
+        }.getOrNull() ?: return
+        if (isSafetyProperty(propertyId) && pendingSafetySubscriptions[propertyId] == generation) {
+            val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+            val observation = observationFrom(propertyValue, propertyId, authoritative = true)
+                .copy(registrationGeneration = generation)
+            val previous = bufferedSafetyObservations[propertyId]
+            if (previous == null || observation.sequence > previous.observation.sequence) {
+                bufferedSafetyObservations[propertyId] = BufferedSafetyObservation(value, observation)
+            }
+            return
+        }
+        handleChangeEvent(propertyValue)
+    }
+
+    @Synchronized
+    private fun handleCallbackError(generation: Long, propertyId: Int) {
+        if (isSafetyProperty(propertyId) && pendingSafetySubscriptions[propertyId] == generation) {
+            val observation = VehiclePropertyObservation(
+                timestampElapsedNanos = SystemClock.elapsedRealtimeNanos(),
+                receivedElapsedMs = SystemClock.elapsedRealtime(),
+                status = 1,
+                registrationGeneration = generation,
+                propertyId = propertyId,
+                subscriptionActive = true,
+                sequence = observationSequence.incrementAndGet(),
+            )
+            val previous = bufferedSafetyObservations[propertyId]
+            if (previous == null || observation.sequence > previous.observation.sequence) {
+                bufferedSafetyObservations[propertyId] = BufferedSafetyObservation(null, observation)
+            }
+            return
+        }
+        handleErrorEvent(propertyId)
+    }
+
     @Synchronized
     private fun rejectSafetySubscription(propertyId: Int) {
-        val safety = propertyId == VEHICLE_PROPERTY_ID_FALLBACK["GEAR_SELECTION"] ||
-            propertyId == VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
-        if (!safety) return
+        if (!isSafetyProperty(propertyId)) return
+        pendingSafetySubscriptions.remove(propertyId)
+        bufferedSafetyObservations.remove(propertyId)
         trackedPropertyIds.remove(propertyId)
         currentValues.remove(propertyId)
         VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let(evObservationMetadata::remove)
@@ -775,38 +868,64 @@ class VehicleDataForwarderImpl(
         try {
             val propertyId = propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int ?: return
             if (propertyId !in trackedPropertyIds) return
-            // Observe raw availability without filtering currentValues or changing prediction.
-            // Reflection failures are independent: a missing timestamp must not hide status.
+            // Observe raw availability without filtering ordinary telemetry values.
+            // Safety values are fail-closed and published immediately.
             val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+            val observation = observationFrom(propertyValue, propertyId, authoritative = true)
+            if (isSafetyProperty(propertyId)) {
+                applySafetyObservation(propertyId, value, observation)
+                if (value != null && observation.status == 0) {
+                    DiagnosticLog.d("vhal", "prop 0x${propertyId.toString(16)}: $value")
+                    processSafetyEdge(propertyId, value)
+                }
+                publishImmediate()
+                return
+            }
             VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let { name ->
-                evObservationMetadata[name] = observationFrom(propertyValue, propertyId, authoritative = true)
+                evObservationMetadata[name] = observation
             }
             if (value == null) return
             DiagnosticLog.d("vhal", "prop 0x${propertyId.toString(16)}: $value")
-
-            // Detect ignition state transitions to ON(4)/START(5) for wake signaling
-            val ignitionId = VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
-            if (propertyId == ignitionId && value is Int) {
-                val prev = previousIgnitionState
-                previousIgnitionState = value
-                // IGNITION_STATE: 0=UNDEFINED, 1=LOCK, 2=OFF, 3=ACC, 4=ON, 5=START
-                if (prev != null && prev < 4 && value >= 4) {
-                    Log.i(TAG, "Ignition ON detected (was $prev, now $value)")
-                    DiagnosticLog.i("vhal", "Ignition ON detected ($prev → $value)")
-                    onIgnitionOn?.invoke(value)
-                }
-            }
-
-            // Edge-log a small set of life-cycle-relevant transitions at INFO
-            // so postmortem captures show when the car's state actually changed
-            // (vs the high-cadence DEBUG line above which is one-per-tick).
             edgeLog(propertyId, value)
-
             currentValues[propertyId] = value
             throttledSend()
         } catch (e: Throwable) {
             Log.w(TAG, "handleChangeEvent: ${e.rootCause().message}")
         }
+    }
+
+    @Synchronized
+    private fun applySafetyObservation(
+        propertyId: Int,
+        value: Any?,
+        observation: VehiclePropertyObservation,
+    ) {
+        val name = VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key ?: return
+        evObservationMetadata[name] = observation
+        if (value != null && observation.status == 0) currentValues[propertyId] = value
+        else currentValues.remove(propertyId)
+    }
+
+    private fun processSafetyEdge(propertyId: Int, value: Any) {
+        val ignitionId = VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
+        if (propertyId == ignitionId && value is Int) {
+            val prev = previousIgnitionState
+            previousIgnitionState = value
+            if (prev != null && prev < 4 && value >= 4) {
+                Log.i(TAG, "Ignition ON detected (was $prev, now $value)")
+                DiagnosticLog.i("vhal", "Ignition ON detected ($prev → $value)")
+                onIgnitionOn?.invoke(value)
+            }
+        }
+        edgeLog(propertyId, value)
+    }
+
+    @Synchronized
+    private fun publishImmediate() {
+        lastSendTime = System.currentTimeMillis()
+        val data = buildVehicleData()
+        _latestVehicleData.value = data
+        sendMessage(data)
     }
 
     @Synchronized
@@ -823,8 +942,10 @@ class VehicleDataForwarderImpl(
             subscriptionActive = true,
             sequence = observationSequence.incrementAndGet(),
         )
-        lastSendTime = 0L
-        throttledSend()
+        if (isSafetyProperty(propertyId)) publishImmediate() else {
+            lastSendTime = 0L
+            throttledSend()
+        }
     }
 
     /**
@@ -1126,6 +1247,8 @@ class VehicleDataForwarderImpl(
         }
 
         trackedPropertyIds.clear()
+        pendingSafetySubscriptions.clear()
+        bufferedSafetyObservations.clear()
         currentValues.clear()
         _propertyStatus.clear()
         evObservationMetadata.clear()
