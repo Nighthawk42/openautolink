@@ -8,6 +8,8 @@ data class VehiclePropertyObservation(
     val source: String = "vhal",
     val registrationGeneration: Long? = null,
     val propertyId: Int? = null,
+    val subscriptionActive: Boolean = false,
+    val sequence: Long = 0,
 )
 
 /**

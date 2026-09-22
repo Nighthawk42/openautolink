@@ -380,7 +380,12 @@ class EvContributionHardeningTest {
         val gate = EvFreshParkGate()
         assertFalse(gate.freshParkObservedThisProcess)
         fun observation(timeMs: Long, status: Int = 0, generation: Long = 1) =
-            VehiclePropertyObservation(timeMs * 1_000_000, timeMs, status, registrationGeneration = generation)
+            VehiclePropertyObservation(
+                timeMs * 1_000_000, timeMs, status,
+                registrationGeneration = generation,
+                subscriptionActive = true,
+                sequence = timeMs,
+            )
         assertTrue(gate.observe(ControlMessage.VehicleData(
             gearRaw = 4,
             evObservationMetadata = mapOf("GEAR_SELECTION" to observation(1_000)),
@@ -437,6 +442,158 @@ class EvContributionHardeningTest {
         assertEquals(0, retry.failures)
         assertEquals(0, q.storageUsage().units)
         assertTrue(EvDeleteAdmissionPolicy.mayResume(retry, q.storageUsage()))
+    }
+
+    @Test fun `upload authorization expires at exact monotonic boundary and same millisecond newer event wins`() {
+        val gate = EvFreshParkGate()
+        fun observation(timeMs: Long, status: Int = 0, sequence: Long) = VehiclePropertyObservation(
+            timestampElapsedNanos = timeMs * 1_000_000,
+            receivedElapsedMs = timeMs,
+            status = status,
+            registrationGeneration = 7,
+            propertyId = 0x11400400,
+            subscriptionActive = true,
+            sequence = sequence,
+        )
+        assertTrue(gate.observe(ControlMessage.VehicleData(
+            gearRaw = 4,
+            evObservationMetadata = mapOf("GEAR_SELECTION" to observation(1_000, sequence = 1)),
+            vhalRegistrationGeneration = 7,
+        ), 1_000))
+        assertTrue(gate.authorization(30_999))
+        assertFalse(gate.authorization(31_000))
+        assertFalse(gate.authorization(31_001))
+
+        assertFalse(gate.observe(ControlMessage.VehicleData(
+            gearRaw = 4,
+            evObservationMetadata = mapOf("GEAR_SELECTION" to observation(1_000, status = 1, sequence = 2)),
+            vhalRegistrationGeneration = 7,
+        ), 1_000))
+        assertTrue(gate.observe(ControlMessage.VehicleData(
+            gearRaw = 4,
+            evObservationMetadata = mapOf("GEAR_SELECTION" to observation(31_001, sequence = 3)),
+            vhalRegistrationGeneration = 7,
+        ), 31_001))
+        assertTrue(gate.authorization(31_001))
+    }
+
+    @Test fun `delete intent is durable before IO and unchecked partial failure survives recreation`() {
+        val root = dir()
+        var deletes = 0
+        var q = EvContributionQueue(root, deleteFile = { file ->
+            deletes++
+            if (deletes == 1) file.delete() else throw IllegalStateException("injected partial deletion")
+        })
+        q.append("a", 1, vehicleLine(), "owner")
+        q.append("b", 2, vehicleLine(), "owner")
+        assertTrue(q.beginDeletion())
+        val result = q.deleteAllArtifacts()
+        assertTrue(result.failures > 0)
+        q = EvContributionQueue(root)
+        assertTrue(q.isDeletionBlocked())
+    }
+
+    @Test fun `bounded HTTP rejects oversized response and later retry succeeds`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val oversized = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+            override fun getInputStream() = ByteArray(64 * 1024 + 1) { 'x'.code.toByte() }.inputStream()
+        }
+        assertThrows(java.io.IOException::class.java) {
+            EvContributionHttpTransport(attemptTimeoutMs = 1_000, openConnection = { oversized }).send(
+                "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+            )
+        }
+
+        val clean = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        assertEquals(200, EvContributionHttpTransport(attemptTimeoutMs = 1_000, openConnection = { clean }).send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ).statusCode)
+    }
+
+    @Test fun `overall HTTP deadline closes blocked body and permits later attempt`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val closed = CountDownLatch(1)
+        val blocked = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() { closed.countDown() }
+            override fun getOutputStream() = object : java.io.OutputStream() {
+                @Volatile var stopped = false
+                override fun write(b: Int) = Unit
+                override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                    while (!stopped) Thread.sleep(5)
+                    throw java.io.InterruptedIOException("closed")
+                }
+                override fun close() { stopped = true; closed.countDown() }
+            }
+            override fun getResponseCode() = 200
+        }
+        val transport = EvContributionHttpTransport(
+            attemptTimeoutMs = 100,
+            monotonicNow = java.util.function.LongSupplier { System.nanoTime() / 1_000_000 },
+            openConnection = { blocked },
+        )
+        val worker = thread { runCatching { transport.send("https://logs.example/upload", "token", "ev-class-test", q.pending().single().file) } }
+        assertTrue(closed.await(2, TimeUnit.SECONDS))
+        worker.join(2_000)
+        assertFalse(worker.isAlive)
+
+        val clean = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        assertEquals(200, EvContributionHttpTransport(openConnection = { clean }).send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ).statusCode)
+    }
+
+    @Test fun `overall HTTP deadline stops trickle response`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val closed = AtomicBoolean(false)
+        val trickle = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() { closed.set(true) }
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+            override fun getInputStream() = object : java.io.InputStream() {
+                override fun read(): Int {
+                    if (closed.get()) throw java.io.InterruptedIOException("closed")
+                    Thread.sleep(30)
+                    return 'x'.code
+                }
+                override fun close() { closed.set(true) }
+            }
+        }
+        val started = System.nanoTime()
+        assertThrows(java.io.IOException::class.java) {
+            EvContributionHttpTransport(
+                attemptTimeoutMs = 100,
+                monotonicNow = java.util.function.LongSupplier { System.nanoTime() / 1_000_000 },
+                openConnection = { trickle },
+            ).send("https://logs.example/upload", "token", "ev-class-test", q.pending().single().file)
+        }
+        assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 2_000)
+        assertTrue(closed.get())
     }
 
     @Test fun `event driven drain uploads offline batches oldest first when network later arrives`() {

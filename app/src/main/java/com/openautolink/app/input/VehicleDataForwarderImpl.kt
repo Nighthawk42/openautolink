@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Monitors VHAL properties via the AAOS Car API using reflection.
@@ -98,6 +99,7 @@ class VehicleDataForwarderImpl(
     private val currentValues = ConcurrentHashMap<Int, Any>()
     // Guarded with the forwarder monitor, alongside value updates and batch snapshots.
     private val evObservationMetadata = mutableMapOf<String, VehiclePropertyObservation>()
+    private val observationSequence = AtomicLong()
     private var lastSendTime = 0L
 
     // HistoryProvider polling cache (Finding F.2). Refreshed every 5s on a
@@ -577,19 +579,16 @@ class VehicleDataForwarderImpl(
                 continue
             }
 
-            // Add to tracked set BEFORE initial read so handleChangeEvent doesn't discard it.
-            // Static properties (e.g., INFO_EV_BATTERY_CAPACITY) never get callback updates,
-            // so the initial read is their only chance to populate currentValues.
-            trackedPropertyIds.add(propId)
-
             // Read initial value
+            var initialPropertyValue: Any? = null
             try {
                 val pv = pmClass.getMethod("getProperty", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
                     .invoke(pm, propId, 0)
+                initialPropertyValue = pv
                 if (pv != null) {
                     val initVal = try { pv.javaClass.getMethod("getValue").invoke(pv) } catch (_: Throwable) { null }
                     DiagnosticLog.d("vhal", "${prop.fieldName}: initial read = $initVal")
-                    handleChangeEvent(pv)
+                    handleInitialRead(pv)
                 } else {
                     DiagnosticLog.d("vhal", "${prop.fieldName}: initial read returned null")
                 }
@@ -600,11 +599,14 @@ class VehicleDataForwarderImpl(
             // Subscribe using shared callback (app_v1's subscribe pattern)
             val ok = subscribe(pm, callbackInterface, callbackProxy!!, propId, prop.rateField)
             if (ok) {
+                trackedPropertyIds.add(propId)
+                initialPropertyValue?.let { promoteSubscribedInitialRead(propId, it) }
                 subscribed++
                 subscribedNames += prop.fieldName
                 _propertyStatus[prop.fieldName] = "subscribed"
                 DiagnosticLog.d("vhal", "${prop.fieldName}: subscribed")
             } else {
+                rejectSafetySubscription(propId)
                 _propertyStatus[prop.fieldName] = "rejected"
                 DiagnosticLog.w("vhal", "${prop.fieldName}: subscription rejected")
             }
@@ -726,26 +728,58 @@ class VehicleDataForwarderImpl(
 
     /** Handle property change event — extracts propertyId from event (app_v1 pattern). */
     @Synchronized
+    private fun handleInitialRead(propertyValue: Any) {
+        val propertyId = runCatching {
+            propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int
+        }.getOrNull() ?: return
+        val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+        if (value != null) currentValues[propertyId] = value
+        VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let { name ->
+            evObservationMetadata[name] = observationFrom(propertyValue, propertyId, authoritative = false)
+        }
+    }
+
+    @Synchronized
+    private fun promoteSubscribedInitialRead(propertyId: Int, propertyValue: Any) {
+        trackedPropertyIds.add(propertyId)
+        handleChangeEvent(propertyValue)
+    }
+
+    @Synchronized
+    private fun rejectSafetySubscription(propertyId: Int) {
+        val safety = propertyId == VEHICLE_PROPERTY_ID_FALLBACK["GEAR_SELECTION"] ||
+            propertyId == VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
+        if (!safety) return
+        trackedPropertyIds.remove(propertyId)
+        currentValues.remove(propertyId)
+        VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let(evObservationMetadata::remove)
+    }
+
+    private fun observationFrom(propertyValue: Any, propertyId: Int, authoritative: Boolean): VehiclePropertyObservation {
+        val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+        return VehiclePropertyObservation(
+            timestampElapsedNanos = if (value == null) null else runCatching {
+                propertyValue.javaClass.getMethod("getTimestamp").invoke(propertyValue) as? Long
+            }.getOrNull(),
+            receivedElapsedMs = SystemClock.elapsedRealtime(),
+            status = runCatching { propertyValue.javaClass.getMethod("getStatus").invoke(propertyValue) as? Int }.getOrNull(),
+            registrationGeneration = registrationGeneration.takeIf { authoritative },
+            propertyId = propertyId,
+            subscriptionActive = authoritative,
+            sequence = observationSequence.incrementAndGet(),
+        )
+    }
+
+    @Synchronized
     private fun handleChangeEvent(propertyValue: Any) {
         try {
             val propertyId = propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int ?: return
             if (propertyId !in trackedPropertyIds) return
             // Observe raw availability without filtering currentValues or changing prediction.
             // Reflection failures are independent: a missing timestamp must not hide status.
-            val receivedElapsedMs = SystemClock.elapsedRealtime()
             val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
             VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let { name ->
-                evObservationMetadata[name] = VehiclePropertyObservation(
-                    timestampElapsedNanos = if (value == null) null else runCatching {
-                        propertyValue.javaClass.getMethod("getTimestamp").invoke(propertyValue) as? Long
-                    }.getOrNull(),
-                    receivedElapsedMs = receivedElapsedMs,
-                    status = runCatching {
-                        propertyValue.javaClass.getMethod("getStatus").invoke(propertyValue) as? Int
-                    }.getOrNull(),
-                    registrationGeneration = registrationGeneration,
-                    propertyId = propertyId,
-                )
+                evObservationMetadata[name] = observationFrom(propertyValue, propertyId, authoritative = true)
             }
             if (value == null) return
             DiagnosticLog.d("vhal", "prop 0x${propertyId.toString(16)}: $value")
@@ -786,6 +820,8 @@ class VehicleDataForwarderImpl(
             status = 1,
             registrationGeneration = registrationGeneration,
             propertyId = propertyId,
+            subscriptionActive = true,
+            sequence = observationSequence.incrementAndGet(),
         )
         lastSendTime = 0L
         throttledSend()
@@ -1093,11 +1129,9 @@ class VehicleDataForwarderImpl(
         currentValues.clear()
         _propertyStatus.clear()
         evObservationMetadata.clear()
-        // Do not alter retained numeric values; only retire their diagnostic observations.
-        _latestVehicleData.value = _latestVehicleData.value.copy(
-            evObservationMetadata = emptyMap(),
-            vhalRegistrationGeneration = registrationGeneration,
-        )
+        val retired = buildVehicleData()
+        _latestVehicleData.value = retired
+        sendMessage(retired)
         callbackProxy = null
         carLifecycleProxy = null
         carObject = null

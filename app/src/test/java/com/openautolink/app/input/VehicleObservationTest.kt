@@ -43,6 +43,40 @@ class VehicleObservationTest {
         fun getStatus() = status
     }
 
+    @Test fun initialSafetyReadIsNotAuthoritativeUntilExactSubscriptionSucceeds() {
+        val forwarder = forwarder()
+        val gearId = 0x11400400
+        val ignitionId = 0x11400409
+        val initialRead = forwarder.javaClass.getDeclaredMethod("handleInitialRead", Any::class.java)
+            .apply { isAccessible = true }
+        val promote = forwarder.javaClass.getDeclaredMethod("promoteSubscribedInitialRead", Int::class.javaPrimitiveType, Any::class.java)
+            .apply { isAccessible = true }
+
+        initialRead.invoke(forwarder, PropertyValue(gearId, 4, 1_000_000_000L, 0))
+        initialRead.invoke(forwarder, PropertyValue(ignitionId, 2, 1_000_000_000L, 0))
+        var data = snapshot(forwarder)
+        assertEquals(4, data.gearRaw)
+        assertEquals(2, data.ignitionState)
+        assertFalse(data.evObservationMetadata.getValue("GEAR_SELECTION").subscriptionActive)
+        assertEquals(null, data.evObservationMetadata.getValue("GEAR_SELECTION").registrationGeneration)
+        assertFalse(data.evObservationMetadata.getValue("IGNITION_STATE").subscriptionActive)
+
+        forwarder.javaClass.getDeclaredMethod("rejectSafetySubscription", Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(forwarder, gearId)
+        data = snapshot(forwarder)
+        assertEquals(null, data.gearRaw)
+        assertFalse(data.evObservationMetadata.containsKey("GEAR_SELECTION"))
+
+        promote.invoke(forwarder, ignitionId, PropertyValue(ignitionId, 2, 1_100_000_000L, 0))
+        data = snapshot(forwarder)
+        assertTrue(data.evObservationMetadata.getValue("IGNITION_STATE").subscriptionActive)
+        assertEquals(data.vhalRegistrationGeneration, data.evObservationMetadata.getValue("IGNITION_STATE").registrationGeneration)
+        @Suppress("UNCHECKED_CAST")
+        val tracked = forwarder.javaClass.getDeclaredField("trackedPropertyIds").apply { isAccessible = true }.get(forwarder) as Set<Int>
+        assertFalse(gearId in tracked)
+        assertTrue(ignitionId in tracked)
+    }
+
     private fun forwarder(): VehicleDataForwarderImpl {
         val result = VehicleDataForwarderImpl(io.mockk.mockk(relaxed = true), {})
         val tracked = result.javaClass.getDeclaredField("trackedPropertyIds").apply { isAccessible = true }

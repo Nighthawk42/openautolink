@@ -280,10 +280,8 @@ class EvFreshParkGate {
     private var registrationGeneration: Long? = null
     private var gearSafe = false
     private var ignitionSafe = false
-    private var gearTimestampNanos: Long? = null
-    private var ignitionTimestampNanos: Long? = null
-    private var gearReceiptMs: Long? = null
-    private var ignitionReceiptMs: Long? = null
+    private var gearObservation: com.openautolink.app.transport.VehiclePropertyObservation? = null
+    private var ignitionObservation: com.openautolink.app.transport.VehiclePropertyObservation? = null
 
     @Synchronized
     fun observe(data: ControlMessage.VehicleData, nowElapsedMs: Long): Boolean {
@@ -292,38 +290,49 @@ class EvFreshParkGate {
             registrationGeneration = batchGeneration
             gearSafe = false
             ignitionSafe = false
-            gearTimestampNanos = null
-            ignitionTimestampNanos = null
-            gearReceiptMs = null
-            ignitionReceiptMs = null
+            gearObservation = null
+            ignitionObservation = null
         }
         fun fresh(observation: com.openautolink.app.transport.VehiclePropertyObservation): Boolean {
             val sourceNanos = observation.timestampElapsedNanos ?: return false
             val observedGeneration = observation.registrationGeneration ?: return false
-            if (observedGeneration != registrationGeneration || observation.status != 0) return false
-            if (observation.receivedElapsedMs > nowElapsedMs || nowElapsedMs - observation.receivedElapsedMs > MAX_OBSERVATION_AGE_MS) return false
+            if (!observation.subscriptionActive || observedGeneration != registrationGeneration || observation.status != 0) return false
+            if (observation.receivedElapsedMs > nowElapsedMs || nowElapsedMs - observation.receivedElapsedMs >= MAX_OBSERVATION_AGE_MS) return false
             val nowNanos = nowElapsedMs * 1_000_000L
-            return sourceNanos <= nowNanos && nowNanos - sourceNanos <= MAX_OBSERVATION_AGE_MS * 1_000_000L
+            return sourceNanos <= nowNanos && nowNanos - sourceNanos < MAX_OBSERVATION_AGE_MS * 1_000_000L
         }
+        fun newer(candidate: com.openautolink.app.transport.VehiclePropertyObservation, prior: com.openautolink.app.transport.VehiclePropertyObservation?): Boolean =
+            prior == null || candidate.receivedElapsedMs > prior.receivedElapsedMs ||
+                (candidate.receivedElapsedMs == prior.receivedElapsedMs && candidate.sequence > prior.sequence)
         data.evObservationMetadata["GEAR_SELECTION"]?.let { observation ->
-            if (gearReceiptMs == null || observation.receivedElapsedMs > gearReceiptMs!!) {
-                gearReceiptMs = observation.receivedElapsedMs
-                gearTimestampNanos = observation.timestampElapsedNanos
+            if (newer(observation, gearObservation)) {
+                gearObservation = observation
                 gearSafe = fresh(observation) && data.gearRaw == 4
             }
         }
         data.evObservationMetadata["IGNITION_STATE"]?.let { observation ->
-            if (ignitionReceiptMs == null || observation.receivedElapsedMs > ignitionReceiptMs!!) {
-                ignitionReceiptMs = observation.receivedElapsedMs
-                ignitionTimestampNanos = observation.timestampElapsedNanos
+            if (newer(observation, ignitionObservation)) {
+                ignitionObservation = observation
                 ignitionSafe = fresh(observation) && data.ignitionState in setOf(1, 2)
             }
         }
-        val nowNanos = nowElapsedMs * 1_000_000L
-        if (gearTimestampNanos?.let { nowNanos - it > MAX_OBSERVATION_AGE_MS * 1_000_000L } != false) gearSafe = false
-        if (ignitionTimestampNanos?.let { nowNanos - it > MAX_OBSERVATION_AGE_MS * 1_000_000L } != false) ignitionSafe = false
-        freshParkObservedThisProcess = gearSafe || ignitionSafe
+        freshParkObservedThisProcess = authorization(nowElapsedMs)
         return freshParkObservedThisProcess
+    }
+
+    @Synchronized
+    fun authorization(currentElapsedRealtime: Long): Boolean {
+        fun current(observation: com.openautolink.app.transport.VehiclePropertyObservation?, safe: Boolean): Boolean {
+            if (!safe || observation == null || !observation.subscriptionActive || observation.status != 0) return false
+            if (observation.registrationGeneration != registrationGeneration) return false
+            val source = observation.timestampElapsedNanos ?: return false
+            if (observation.receivedElapsedMs > currentElapsedRealtime || currentElapsedRealtime - observation.receivedElapsedMs >= MAX_OBSERVATION_AGE_MS) return false
+            val nowNanos = currentElapsedRealtime * 1_000_000L
+            return source <= nowNanos && nowNanos - source < MAX_OBSERVATION_AGE_MS * 1_000_000L
+        }
+        return (current(gearObservation, gearSafe) || current(ignitionObservation, ignitionSafe)).also {
+            freshParkObservedThisProcess = it
+        }
     }
 
     @Synchronized
@@ -331,10 +340,8 @@ class EvFreshParkGate {
         registrationGeneration = null
         gearSafe = false
         ignitionSafe = false
-        gearTimestampNanos = null
-        ignitionTimestampNanos = null
-        gearReceiptMs = null
-        ignitionReceiptMs = null
+        gearObservation = null
+        ignitionObservation = null
         freshParkObservedThisProcess = false
     }
 }
@@ -479,14 +486,15 @@ class EvContributionQueue(
     private data class StorageUnit(val primary: File, val files: List<File>, val timestampMs: Long)
 
     private val stateFile get() = File(directory, "queue-state.properties")
-    private val deletionBlockFile get() = File(directory, ".deletion-blocked")
+    // Deliberately outside the queue root: recursive queue deletion can never erase intent.
+    private val deletionBlockFile get() = File(directory.parentFile ?: directory, ".${directory.name}.deletion-blocked")
     private val evicted = AtomicLong(readCounter("evicted"))
     private val accepted = AtomicLong(readCounter("accepted"))
     private val failures = AtomicLong(readCounter("failures"))
 
     init {
         require(maxBytes > 0); require(maxFiles > 0); require(maxAgeMs > 0)
-        runCatching { recoverArtifacts() }
+        if (!isDeletionBlocked()) runCatching { recoverArtifacts() }
     }
 
     @Synchronized
@@ -582,11 +590,15 @@ class EvContributionQueue(
     @Synchronized
     fun deleteAllArtifacts(): DeleteResult {
         if (!directory.exists()) return DeleteResult(0, 0, 0)
-        val files = directory.walkBottomUp().filter { it.isFile && it != deletionBlockFile }.toList()
-        val bytes = files.sumOf { it.length() }
+        val files = runCatching { directory.walkBottomUp().filter { it.isFile }.toList() }
+            .getOrElse { return DeleteResult(0, 0, 1) }
+        val bytes = runCatching { files.sumOf { it.length() } }.getOrDefault(0)
         var failed = 0
-        files.forEach { if (it.exists() && !deleteFile(it)) failed++ }
-        directory.walkBottomUp().filter { it.isDirectory && it != directory }.forEach { it.delete() }
+        files.forEach { file ->
+            if (file.exists() && runCatching { deleteFile(file) }.getOrDefault(false).not()) failed++
+        }
+        runCatching { directory.walkBottomUp().filter { it.isDirectory && it != directory }.forEach { it.delete() } }
+            .onFailure { failed++ }
         if (failed == 0 && directory.walkTopDown().none { it.isFile }) {
             evicted.set(0); accepted.set(0); failures.set(0)
         }
@@ -596,21 +608,31 @@ class EvContributionQueue(
 
     @Synchronized fun isDeletionBlocked(): Boolean = deletionBlockFile.isFile
 
+    /** Synchronously commits the fence before any destructive queue I/O. */
+    @Synchronized
+    fun beginDeletion(): Boolean = runCatching {
+        val parent = deletionBlockFile.parentFile ?: return false
+        check(parent.isDirectory || parent.mkdirs()) { "cannot create deletion marker parent" }
+        val tmp = File(parent, deletionBlockFile.name + ".tmp")
+        FileOutputStream(tmp).use { out ->
+            out.write("blocked\n".toByteArray())
+            out.fd.sync()
+        }
+        check(atomicMove(tmp, deletionBlockFile, throwOnFailure = false)) { "cannot publish deletion marker" }
+        syncDirectory(parent)
+        true
+    }.getOrDefault(false)
+
     /** Persist failure before reopening admissions; clear only after a verified empty pass. */
     @Synchronized
     fun completeDeletion(result: DeleteResult): Boolean {
         val empty = EvDeleteAdmissionPolicy.mayResume(result, storageUsage())
-        ensureDirectory()
         if (!empty) {
-            FileOutputStream(deletionBlockFile).use { out ->
-                out.write("blocked\n".toByteArray())
-                out.fd.sync()
-            }
-            syncDirectory(directory)
+            if (!deletionBlockFile.exists()) beginDeletion()
             return false
         }
         if (deletionBlockFile.exists() && !deletionBlockFile.delete()) return false
-        syncDirectory(directory)
+        syncDirectory(deletionBlockFile.parentFile ?: directory)
         return true
     }
 

@@ -27,6 +27,11 @@ import kotlinx.serialization.json.put
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.io.IOException
+import java.io.InputStream
+import java.io.InterruptedIOException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -91,16 +96,19 @@ object EvContributionService {
         rawIgnition = null
         DiagnosticLog.d("ev_contribution", "processGeneration=${processGeneration.take(8)} freshParkObservedThisProcess=false")
         queue = EvContributionQueue(File(app.filesDir, "ev-contributions")).also {
-            if (it.isDeletionBlocked()) {
+            val deletionBlockedAtStartup = it.isDeletionBlocked()
+            if (deletionBlockedAtStartup) {
                 deletionFailureBlocked = true
                 lifecycle.invalidate(blockAdmissions = true)
                 DiagnosticLog.w("ev_contribution", "durable deletion block restored")
             }
-            val recovered = runCatching { it.recoverInterrupted(System.currentTimeMillis()) }
+            val recovered = if (deletionBlockedAtStartup) 0 else runCatching { it.recoverInterrupted(System.currentTimeMillis()) }
                 .onFailure { error -> DiagnosticLog.w("ev_contribution", "recoveryFailed=${error.javaClass.simpleName}") }
                 .getOrDefault(0)
-            runCatching { it.enforceRetention(System.currentTimeMillis()) }
-                .onFailure { error -> DiagnosticLog.w("ev_contribution", "retentionFailed=${error.javaClass.simpleName}") }
+            if (!deletionBlockedAtStartup) {
+                runCatching { it.enforceRetention(System.currentTimeMillis()) }
+                    .onFailure { error -> DiagnosticLog.w("ev_contribution", "retentionFailed=${error.javaClass.simpleName}") }
+            }
             if (recovered > 0) DiagnosticLog.i("ev_contribution", "recoveredInterrupted=$recovered")
             runCatching { publishStatus(it) }
                 .onFailure { error -> DiagnosticLog.w("ev_contribution", "statusRecoveryFailed=${error.javaClass.simpleName}") }
@@ -121,51 +129,61 @@ object EvContributionService {
                 prefs.logUploadDeviceLabel,
             ) { enabled, encoded, url, secret, label -> ConsentConfig(enabled, encoded, url, secret, label) }
                 .collect { config ->
-                    val decoded = EvContributionConsentBinding.decode(config.encoded)
-                    val valid = config.enabled && decoded?.matches(config.url, config.token) == true
-                    val deletionLease = lifecycle.beginDestructiveOperation {
-                        uploadUrl = config.url
-                        token = config.token
-                        consentBinding = decoded.takeIf { valid }
-                        authFenced = config.enabled && !valid
-                        if (!valid) {
-                            driveIdentityOwner.clear()
-                            activeId = null
-                            activeIdentity = null
-                            resetDriveContinuity()
+                    destructiveMutex.withLock {
+                        val decoded = EvContributionConsentBinding.decode(config.encoded)
+                        val valid = config.enabled && decoded?.matches(config.url, config.token) == true
+                        val deletionLease = lifecycle.beginDestructiveOperation {
+                            uploadUrl = config.url
+                            token = config.token
+                            consentBinding = decoded.takeIf { valid }
+                            authFenced = config.enabled && !valid
+                            if (!valid) {
+                                driveIdentityOwner.clear()
+                                activeId = null
+                                activeIdentity = null
+                                resetDriveContinuity()
+                            }
+                        }
+                        var finished = false
+                        try {
+                            cancelTransport("consent-or-endpoint-change")
+                            activeUploadJob.current()?.join()
+                            val q = queue
+                            val mustDelete = !valid || q?.isDeletionBlocked() == true
+                            var deleted: EvContributionQueue.DeleteResult? = null
+                            val deletionComplete = if (mustDelete && q != null) {
+                                if (!q.beginDeletion()) {
+                                    deleted = EvContributionQueue.DeleteResult(0, 0, 1)
+                                    false
+                                } else {
+                                    deleted = lifecycle.exclusive { q.deleteAllArtifacts() }
+                                    q.completeDeletion(checkNotNull(deleted))
+                                }
+                            } else !mustDelete
+                            val currentValid = consentBinding?.matches(uploadUrl, token) == true && !authFenced
+                            val resume = currentValid && deletionComplete && q?.isDeletionBlocked() != true
+                            lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = resume)
+                            finished = true
+                            deletionFailureBlocked = !deletionComplete || q?.isDeletionBlocked() == true
+                            _status.value = _status.value.copy(
+                                consentValid = currentValid,
+                                consentInvalidReason = if (currentValid) "" else when {
+                                    !config.enabled -> "Not opted in"
+                                    decoded == null -> "Consent binding is missing or obsolete"
+                                    else -> "Endpoint or credential changed; opt in again"
+                                },
+                                lastDeleteResult = deleted?.display() ?: _status.value.lastDeleteResult,
+                            )
+                            deleted?.let { DiagnosticLog.i("ev_contribution", "serializedDelete=${it.display()}") }
+                            if (resume) {
+                                DiagnosticLog.i("ev_contribution", "consent=on schema=2 compactEvOnly=true")
+                                attemptNaturalDrain("consent-valid")
+                            }
+                            q?.let(::publishStatus)
+                        } finally {
+                            if (!finished) lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = false)
                         }
                     }
-                    cancelTransport("consent-or-endpoint-change")
-                    activeUploadJob.current()?.join()
-                    if (!valid) {
-                        val deleted = destructiveMutex.withLock {
-                            lifecycle.exclusive { queue?.deleteAllArtifacts() }
-                        }
-                        val deletionComplete = deleted?.let { queue?.completeDeletion(it) } ?: false
-                        if (lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = false)) {
-                            deletionFailureBlocked = !deletionComplete
-                        }
-                        _status.value = _status.value.copy(
-                            consentValid = false,
-                            consentInvalidReason = when {
-                                !config.enabled -> "Not opted in"
-                                decoded == null -> "Consent binding is missing or obsolete"
-                                else -> "Endpoint or credential changed; opt in again"
-                            },
-                            lastDeleteResult = deleted?.display() ?: _status.value.lastDeleteResult,
-                        )
-                        deleted?.let { DiagnosticLog.i("ev_contribution", "revocationDelete=${it.display()}") }
-                    } else {
-                        authFenced = false
-                        lifecycle.finishDestructiveOperation(
-                            deletionLease,
-                            resumeAdmissions = !deletionFailureBlocked && queue?.isDeletionBlocked() != true,
-                        )
-                        _status.value = _status.value.copy(consentValid = true, consentInvalidReason = "")
-                        DiagnosticLog.i("ev_contribution", "consent=on schema=2 compactEvOnly=true")
-                        if (!deletionFailureBlocked) attemptNaturalDrain("consent-valid")
-                    }
-                    queue?.let(::publishStatus)
                 }
         }
     }
@@ -342,14 +360,16 @@ object EvContributionService {
         val uploadLease = lifecycle.admitUpload {
             val binding = consentBinding
             val state = projectionState
+            val admissionNow = SystemClock.elapsedRealtime()
+            val freshParkAuthorization = freshParkGate.authorization(admissionNow)
             val uploadContext = EvContributionPolicy.UploadContext(
                 validatedInternet = validatedInternet && networkTracker.current() != null,
-                parked = rawParked,
+                parked = rawParked && freshParkAuthorization,
                 idle = activeId == null,
-                startupSensitive = SystemClock.elapsedRealtime() - processStartedElapsedMs < STARTUP_GRACE_MS,
+                startupSensitive = admissionNow - processStartedElapsedMs < STARTUP_GRACE_MS,
                 projectionActive = state != SessionState.IDLE,
                 reconnecting = state == SessionState.CONNECTING,
-                freshParkObservedThisProcess = freshParkGate.freshParkObservedThisProcess,
+                freshParkObservedThisProcess = freshParkAuthorization,
             )
             binding != null && !authFenced && !deletionFailureBlocked && binding.matches(uploadUrl, token) &&
                 EvContributionPolicy.mayUpload(true, uploadContext)
@@ -428,7 +448,7 @@ object EvContributionService {
         DiagnosticLog.d("ev_contribution", "cancelled=$reason")
     }
 
-    suspend fun deletePendingEvContributions(): EvContributionQueue.DeleteResult {
+    suspend fun deletePendingEvContributions(): EvContributionQueue.DeleteResult = destructiveMutex.withLock {
         val deletionLease = lifecycle.beginDestructiveOperation {
             driveIdentityOwner.clear()
             activeId = null
@@ -439,20 +459,29 @@ object EvContributionService {
         try {
             cancelTransport("delete")
             activeUploadJob.current()?.join()
-            val result = destructiveMutex.withLock {
-                lifecycle.exclusive {
-                    queue?.deleteAllArtifacts() ?: EvContributionQueue.DeleteResult(0, 0, 0)
-                }
+            val q = queue
+            val result = if (q == null) {
+                EvContributionQueue.DeleteResult(0, 0, 0)
+            } else if (!q.beginDeletion()) {
+                EvContributionQueue.DeleteResult(0, 0, 1)
+            } else {
+                lifecycle.exclusive { q.deleteAllArtifacts() }
             }
-            val deletionComplete = queue?.completeDeletion(result) ?: true
+            val deletionComplete = q?.let { result.failures == 0 && it.completeDeletion(result) } ?: true
             val verifiedResult = if (deletionComplete) result else result.copy(failures = result.failures.coerceAtLeast(1))
-            val resume = deletionComplete && consentBinding?.matches(uploadUrl, token) == true && !authFenced
-            val latest = lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = resume)
+            val currentValid = consentBinding?.matches(uploadUrl, token) == true && !authFenced
+            val resume = deletionComplete && currentValid && q?.isDeletionBlocked() != true
+            lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = resume)
             leaseFinished = true
-            if (latest) deletionFailureBlocked = !deletionComplete
+            deletionFailureBlocked = !deletionComplete || q?.isDeletionBlocked() == true
             _status.value = _status.value.copy(lastDeleteResult = verifiedResult.display())
-            queue?.let(::publishStatus)
-            return verifiedResult
+            q?.let(::publishStatus)
+            verifiedResult
+        } catch (failure: Throwable) {
+            deletionFailureBlocked = true
+            _status.value = _status.value.copy(lastDeleteResult = "files=0 bytes=0 failures=1")
+            DiagnosticLog.w("ev_contribution", "deleteFailed=${failure.javaClass.simpleName}")
+            EvContributionQueue.DeleteResult(0, 0, 1)
         } finally {
             if (!leaseFinished) lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = false)
         }
@@ -485,13 +514,23 @@ object EvContributionService {
 }
 
 internal class EvContributionHttpTransport(
+    private val attemptTimeoutMs: Long = 30_000L,
+    private val monotonicNow: java.util.function.LongSupplier = java.util.function.LongSupplier { SystemClock.elapsedRealtime() },
     private val openConnection: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
 ) {
+    companion object {
+        private const val MAX_RESPONSE_BYTES = 64 * 1024
+        private val watchdog = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "ev-upload-deadline").apply { isDaemon = true }
+        }
+    }
     private val active = AtomicReference<HttpURLConnection?>()
     private val activeBody = AtomicReference<java.io.OutputStream?>()
+    private val activeResponse = AtomicReference<InputStream?>()
 
     fun cancel() {
         activeBody.getAndSet(null)?.let { runCatching { it.close() } }
+        activeResponse.getAndSet(null)?.let { runCatching { it.close() } }
         active.getAndSet(null)?.disconnect()
     }
 
@@ -503,17 +542,32 @@ internal class EvContributionHttpTransport(
         mayContinue: () -> Boolean = { true },
     ): EvContributionUploader.Response {
         require(file.isFile && file.length() > 0)
+        require(attemptTimeoutMs > 0)
         check(mayContinue()) { "upload generation is stale" }
+        val deadline = monotonicNow.asLong + attemptTimeoutMs
+        fun checkDeadline() {
+            if (monotonicNow.asLong >= deadline) throw java.net.SocketTimeoutException("EV upload attempt deadline exceeded")
+            if (!mayContinue()) throw InterruptedIOException("upload generation is stale")
+        }
         val connection = openConnection(URL(url)).apply {
-            requestMethod = "POST"; doOutput = true; instanceFollowRedirects = false; connectTimeout = 10_000; readTimeout = 15_000
+            requestMethod = "POST"; doOutput = true; instanceFollowRedirects = false
+            connectTimeout = minOf(10_000L, attemptTimeoutMs).toInt()
+            readTimeout = minOf(15_000L, attemptTimeoutMs).toInt()
             setRequestProperty("Content-Type", "application/zip"); setRequestProperty("X-Upload-Token", secret)
             setRequestProperty("X-Device-Label", label.take(120))
             setRequestProperty("X-Orig-Name", "ev-contribution.zip"); setFixedLengthStreamingMode(file.length())
         }
-        check(mayContinue()) { "upload generation is stale" }
+        checkDeadline()
         check(active.compareAndSet(null, connection)) { "transport already active" }
+        val deadlineTask = watchdog.schedule({
+            if (active.compareAndSet(connection, null)) {
+                activeBody.getAndSet(null)?.let { runCatching { it.close() } }
+                activeResponse.getAndSet(null)?.let { runCatching { it.close() } }
+                connection.disconnect()
+            }
+        }, attemptTimeoutMs, TimeUnit.MILLISECONDS)
         return try {
-            check(mayContinue()) { "upload generation is stale" }
+            checkDeadline()
             val output = connection.outputStream
             check(activeBody.compareAndSet(null, output)) { "request body already active" }
             if (active.get() !== connection || !mayContinue()) {
@@ -525,25 +579,49 @@ internal class EvContributionHttpTransport(
                 file.inputStream().use { input ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                     while (true) {
-                        check(mayContinue()) { "upload generation is stale" }
+                        checkDeadline()
                         val count = input.read(buffer)
                         if (count < 0) break
+                        checkDeadline()
                         output.write(buffer, 0, count)
+                        checkDeadline()
                     }
-                    check(mayContinue()) { "upload generation is stale" }
+                    checkDeadline()
                 }
             } finally {
                 activeBody.compareAndSet(output, null)
                 runCatching { output.close() }
             }
-            check(mayContinue()) { "upload generation is stale" }
+            checkDeadline()
             val status = connection.responseCode
             val stream = if (status in 200..399) connection.inputStream else connection.errorStream
-            val body = stream?.bufferedReader()?.use { it.readText().take(64 * 1024) }.orEmpty()
-            check(mayContinue()) { "upload generation is stale" }
+            val body = if (stream == null) "" else {
+                check(activeResponse.compareAndSet(null, stream)) { "response stream already active" }
+                try {
+                    stream.use { input ->
+                        val bytes = java.io.ByteArrayOutputStream()
+                        val buffer = ByteArray(4 * 1024)
+                        while (true) {
+                            checkDeadline()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            checkDeadline()
+                            if (bytes.size() + count > MAX_RESPONSE_BYTES) throw IOException("EV upload response exceeds 64 KiB")
+                            bytes.write(buffer, 0, count)
+                        }
+                        bytes.toString(Charsets.UTF_8.name())
+                    }
+                } finally {
+                    activeResponse.compareAndSet(stream, null)
+                    runCatching { stream.close() }
+                }
+            }
+            checkDeadline()
             EvContributionUploader.Response(status, body)
         } finally {
+            deadlineTask.cancel(false)
             activeBody.getAndSet(null)?.let { runCatching { it.close() } }
+            activeResponse.getAndSet(null)?.let { runCatching { it.close() } }
             active.compareAndSet(connection, null)
             connection.disconnect()
         }
