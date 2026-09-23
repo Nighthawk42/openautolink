@@ -31,6 +31,8 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.InterruptedIOException
 import java.util.concurrent.Executors
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -410,10 +412,16 @@ object EvContributionService {
                                 freshParkGate.authorization(SystemClock.elapsedRealtime())
                         },
                         mutateIfCurrent = { action ->
+                            // Global lock order is lifecycle -> freshParkGate. Vehicle
+                            // revocation never nests the inverse order.
                             lifecycle.withCurrent(uploadLease) {
-                                if (freshParkGate.authorization(SystemClock.elapsedRealtime())) action()
-                                else EvContributionUploader.Outcome.CANCELLED
-                            }
+                                val currentBinding = consentBinding
+                                val consentCurrent = currentBinding === binding && !authFenced && !deletionFailureBlocked &&
+                                    currentBinding.matches(uploadUrl, token)
+                                if (!consentCurrent) EvContributionUploader.Outcome.CANCELLED
+                                else freshParkGate.mutateIfAuthorized(SystemClock.elapsedRealtime(), action)
+                                    ?: EvContributionUploader.Outcome.CANCELLED
+                            } ?: EvContributionUploader.Outcome.CANCELLED
                         },
                     ) { file, _ ->
                         val transmissionAuthorized = lifecycle.isCurrent(uploadLease) &&
@@ -543,6 +551,14 @@ internal class EvContributionHttpTransport(
         val future = watchdog.schedule({ task() }, delayMs, TimeUnit.MILLISECONDS)
         EvContributionDeadline.Cancellable { future.cancel(false) }
     },
+    private val requestCancellation: (HttpURLConnection) -> Unit = { connection ->
+        try {
+            cancellationExecutor.execute { runCatching { connection.disconnect() } }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // The single bounded teardown lane is already occupied. Never run a
+            // potentially hostile disconnect on the caller/deadline thread.
+        }
+    },
     private val openConnection: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
 ) {
     companion object {
@@ -550,35 +566,47 @@ internal class EvContributionHttpTransport(
         private val watchdog = Executors.newSingleThreadScheduledExecutor { runnable ->
             Thread(runnable, "ev-upload-deadline").apply { isDaemon = true }
         }
+        private val cancellationExecutor = ThreadPoolExecutor(
+            0, 1, 30L, TimeUnit.SECONDS,
+            ArrayBlockingQueue(1),
+            { runnable -> Thread(runnable, "ev-upload-cancel").apply { isDaemon = true } },
+            ThreadPoolExecutor.AbortPolicy(),
+        )
     }
 
-    private class Attempt(val owner: Thread) {
+    private class Attempt(
+        val owner: Thread,
+        private val requestCancellation: (HttpURLConnection) -> Unit,
+    ) {
         val connection = AtomicReference<HttpURLConnection?>()
         val body = AtomicReference<java.io.OutputStream?>()
         val response = AtomicReference<InputStream?>()
         val cancelled = AtomicBoolean(false)
+        private val cancellationRequested = AtomicBoolean(false)
+
+        private fun requestBoundCancellation() {
+            val bound = connection.get() ?: return
+            if (cancellationRequested.compareAndSet(false, true)) requestCancellation(bound)
+        }
 
         fun bind(connection: HttpURLConnection) {
             check(this.connection.compareAndSet(null, connection)) { "attempt connection already bound" }
             if (cancelled.get()) {
-                connection.disconnect()
+                requestBoundCancellation()
                 throw InterruptedIOException("upload cancelled during connection creation")
             }
         }
 
         fun cancel() {
-            cancelled.set(true)
-            connection.get()?.disconnect()
+            if (!cancelled.compareAndSet(false, true)) return
+            requestBoundCancellation()
             owner.interrupt()
         }
 
         fun cleanup() {
-            // Active cancellation must reach disconnect before a hostile stream
-            // close can block. Only this attempt's immutable handles are touched.
-            connection.get()?.disconnect()
-            // disconnect owns cancellation cleanup. Never invoke an untrusted
-            // stream close from the watchdog/cancel path or from worker teardown;
-            // a close that ignores disconnect would otherwise pin deletion.
+            // No close/disconnect is invoked here: cleanup runs on the upload
+            // worker and must remain bounded even for hostile URLConnection
+            // implementations. Cancellation alone owns asynchronous disconnect.
             body.set(null)
             response.set(null)
             connection.set(null)
@@ -601,7 +629,7 @@ internal class EvContributionHttpTransport(
         require(file.isFile && file.length() > 0)
         require(attemptTimeoutMs > 0)
         val deadline = monotonicNow.asLong + attemptTimeoutMs
-        val attempt = Attempt(Thread.currentThread())
+        val attempt = Attempt(Thread.currentThread(), requestCancellation)
         check(activeAttempt.compareAndSet(null, attempt)) { "transport already active" }
 
         fun checkDeadline() {
@@ -646,7 +674,6 @@ internal class EvContributionHttpTransport(
             val output = connection.outputStream
             check(attempt.body.compareAndSet(null, output)) { "request body already active" }
             checkDeadline()
-            var bodyComplete = false
             try {
                 file.inputStream().use { input ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -660,12 +687,12 @@ internal class EvContributionHttpTransport(
                     }
                 }
                 checkDeadline()
-                bodyComplete = true
             } finally {
-                if (bodyComplete) {
-                    attempt.body.compareAndSet(output, null)
-                    output.close()
-                }
+                // Fixed-length mode plus the exact byte count allows
+                // getResponseCode() to finalize the request. OutputStream.close
+                // is deliberately avoided because arbitrary implementations may
+                // block forever even after disconnect/interrupt.
+                attempt.body.compareAndSet(output, null)
             }
 
             checkDeadline()
@@ -676,7 +703,6 @@ internal class EvContributionHttpTransport(
             val body = if (stream == null) "" else {
                 check(attempt.response.compareAndSet(null, stream)) { "response stream already active" }
                 val bytes = java.io.ByteArrayOutputStream()
-                var responseComplete = false
                 try {
                     val buffer = ByteArray(4 * 1024)
                     while (true) {
@@ -688,13 +714,11 @@ internal class EvContributionHttpTransport(
                         bytes.write(buffer, 0, count)
                     }
                     checkDeadline()
-                    responseComplete = true
                     bytes.toString(Charsets.UTF_8.name())
                 } finally {
-                    if (responseComplete) {
-                        attempt.response.compareAndSet(stream, null)
-                        stream.close()
-                    }
+                    // EOF completes the bounded response; do not call a hostile
+                    // response close on the upload worker.
+                    attempt.response.compareAndSet(stream, null)
                 }
             }
             checkDeadline()

@@ -4,6 +4,8 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
+import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipFile
 
 class EvContributionProtocolTest {
@@ -232,7 +234,63 @@ class EvContributionProtocolTest {
         assertFalse(connection.headerFields.toString().contains(pending.startedMs.toString()))
         assertEquals(pending.file.length(), connection.configuredFixedLength())
         assertFalse(connection.instanceFollowRedirects)
-        assertTrue(disconnected)
+        assertFalse("successful cleanup must not synchronously disconnect", disconnected)
+    }
+
+    @Test fun `real fixed length HttpURLConnection server accepts exact body and deduplicates replay`() {
+        val q = queue(); val pending = closed(q)
+        val requests = AtomicInteger()
+        val acceptedBodies = mutableListOf<ByteArray>()
+        val server = ServerSocket(0, 2, java.net.InetAddress.getLoopbackAddress())
+        val serverThread = kotlin.concurrent.thread(name = "ev-exact-server") {
+            repeat(2) {
+                server.accept().use { socket ->
+                    val input = socket.getInputStream().buffered()
+                    val headers = mutableListOf<String>()
+                    val line = StringBuilder()
+                    var previous = -1
+                    while (true) {
+                        val value = input.read()
+                        if (value < 0) error("unexpected request EOF")
+                        if (previous == '\r'.code && value == '\n'.code) {
+                            val header = line.substring(0, line.length - 1)
+                            line.clear()
+                            if (header.isEmpty()) break
+                            headers += header
+                        } else line.append(value.toChar())
+                        previous = value
+                    }
+                    val length = headers.first { it.startsWith("Content-Length:", true) }
+                        .substringAfter(':').trim().toInt()
+                    val body = ByteArray(length)
+                    var offset = 0
+                    while (offset < body.size) {
+                        val count = input.read(body, offset, body.size - offset)
+                        if (count < 0) error("short fixed-length request")
+                        offset += count
+                    }
+                    synchronized(acceptedBodies) { acceptedBodies += body }
+                    val duplicate = requests.getAndIncrement() > 0
+                    val ack = "{\"ok\":true,\"duplicate\":$duplicate,\"sha256\":\"${sha256(body)}\"}".toByteArray()
+                    val response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${ack.size}\r\nConnection: close\r\n\r\n".toByteArray() + ack
+                    socket.getOutputStream().apply { write(response); flush() }
+                }
+            }
+        }
+        try {
+            val url = "http://127.0.0.1:${server.localPort}/upload"
+            val first = EvContributionHttpTransport().send(url, "token", "ev-class-test", pending.file)
+            val second = EvContributionHttpTransport().send(url, "token", "ev-class-test", pending.file)
+            serverThread.join(2_000)
+            assertFalse(serverThread.isAlive)
+            assertEquals(200, first.statusCode)
+            assertFalse(first.body.contains("\"duplicate\":true"))
+            assertTrue(second.body.contains("\"duplicate\":true"))
+            assertEquals(2, requests.get())
+            assertTrue(acceptedBodies.all { it.contentEquals(pending.file.readBytes()) })
+        } finally {
+            server.close()
+        }
     }
 
     @Test fun `retention enforces age and persists visible eviction counters`() {

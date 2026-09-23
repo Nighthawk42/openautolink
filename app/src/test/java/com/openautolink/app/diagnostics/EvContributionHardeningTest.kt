@@ -11,6 +11,7 @@ import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 class EvContributionHardeningTest {
@@ -173,6 +174,106 @@ class EvContributionHardeningTest {
         assertEquals(1, q.pending().size)
         assertEquals(0, q.pending().single().attempts)
         assertEquals(0, q.counters().quarantined)
+    }
+
+    private fun assertSafetyRevocationWinsAcceptance(revoke: (EvFreshParkGate) -> Long) {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("a", 1, vehicleLine(), "owner"); q.close("a", 2)
+        q.append("b", 3, vehicleLine(), "owner"); q.close("b", 4)
+        val lifecycle = EvContributionLifecycleGate()
+        val lease = lifecycle.admitUpload { true }!!
+        val safety = EvFreshParkGate()
+        var nowElapsed = 1_000L
+        val parked = VehiclePropertyObservation(
+            timestampElapsedNanos = nowElapsed * 1_000_000,
+            receivedElapsedMs = nowElapsed,
+            status = 0,
+            registrationGeneration = 11,
+            propertyId = 0x11400400,
+            subscriptionActive = true,
+            sequence = 1,
+        )
+        assertTrue(safety.observe(ControlMessage.VehicleData(
+            gearRaw = 4,
+            evObservationMetadata = mapOf("GEAR_SELECTION" to parked),
+            vhalRegistrationGeneration = 11,
+        ), nowElapsed))
+        val oldCheckPassed = CountDownLatch(1)
+        val allowMutation = CountDownLatch(1)
+        val sent = mutableListOf<String>()
+        var outcome: EvContributionUploader.Outcome? = null
+        val worker = thread {
+            outcome = EvContributionDrainLoop(q) { queue ->
+                EvContributionUploader(
+                    queue,
+                    mayTransmit = { safety.authorization(nowElapsed) },
+                    mayMutate = { true },
+                    mutateIfCurrent = { action ->
+                        oldCheckPassed.countDown()
+                        allowMutation.await(5, TimeUnit.SECONDS)
+                        lifecycle.withCurrent(lease) {
+                            safety.mutateIfAuthorized(nowElapsed, action)
+                                ?: EvContributionUploader.Outcome.CANCELLED
+                        }
+                    },
+                ) { _, id ->
+                    sent += id
+                    val entry = queue.pending().first { it.id == id }
+                    EvContributionUploader.Response(200, "{\"ok\":true,\"sha256\":\"${entry.sha256}\"}")
+                }
+            }.drainEligible(10, "owner")
+        }
+        assertTrue(oldCheckPassed.await(5, TimeUnit.SECONDS))
+        nowElapsed = revoke(safety)
+        allowMutation.countDown()
+        worker.join(5_000)
+
+        assertEquals(EvContributionUploader.Outcome.CANCELLED, outcome)
+        assertEquals(listOf("a"), sent)
+        assertEquals(listOf("a", "b"), q.pending().map { it.id })
+        assertEquals(0, q.counters().accepted)
+    }
+
+    @Test fun `drive revocation ordered after old check wins atomic queue acceptance`() {
+        assertSafetyRevocationWinsAcceptance { safety ->
+            safety.observe(ControlMessage.VehicleData(
+                gearRaw = 8,
+                evObservationMetadata = mapOf("GEAR_SELECTION" to VehiclePropertyObservation(
+                    timestampElapsedNanos = 1_001_000_000,
+                    receivedElapsedMs = 1_001,
+                    status = 0,
+                    registrationGeneration = 11,
+                    propertyId = 0x11400400,
+                    subscriptionActive = true,
+                    sequence = 2,
+                )),
+                vhalRegistrationGeneration = 11,
+            ), 1_001)
+            1_001L
+        }
+    }
+
+    @Test fun `unavailable revocation ordered after old check wins atomic queue acceptance`() {
+        assertSafetyRevocationWinsAcceptance { safety ->
+            safety.observe(ControlMessage.VehicleData(
+                gearRaw = 4,
+                evObservationMetadata = mapOf("GEAR_SELECTION" to VehiclePropertyObservation(
+                    timestampElapsedNanos = 1_001_000_000,
+                    receivedElapsedMs = 1_001,
+                    status = 1,
+                    registrationGeneration = 11,
+                    propertyId = 0x11400400,
+                    subscriptionActive = true,
+                    sequence = 2,
+                )),
+                vhalRegistrationGeneration = 11,
+            ), 1_001)
+            1_001L
+        }
+    }
+
+    @Test fun `exact expiry ordered after old check wins atomic queue acceptance`() {
+        assertSafetyRevocationWinsAcceptance { 1_000L + EvFreshParkGate.MAX_OBSERVATION_AGE_MS }
     }
 
     @Test fun `invalidated upload retains exact worker ownership until worker releases`() {
@@ -797,6 +898,7 @@ class EvContributionHardeningTest {
         q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
         val watchdogs = mutableListOf<() -> Unit>()
         val bEntered = CountDownLatch(1)
+        val bDisconnectCalled = CountDownLatch(1)
         val bDisconnected = AtomicBoolean(false)
         val a = object : HttpURLConnection(URL("https://logs.example/upload")) {
             override fun connect() = Unit
@@ -809,7 +911,7 @@ class EvContributionHardeningTest {
         val b = object : HttpURLConnection(URL("https://logs.example/upload")) {
             override fun connect() = Unit
             override fun usingProxy() = false
-            override fun disconnect() { bDisconnected.set(true) }
+            override fun disconnect() { bDisconnected.set(true); bDisconnectCalled.countDown() }
             override fun getOutputStream() = object : java.io.OutputStream() {
                 override fun write(value: Int) = Unit
                 override fun write(bytes: ByteArray, offset: Int, length: Int) {
@@ -842,7 +944,192 @@ class EvContributionHardeningTest {
         transport.cancel()
         replacement.join(2_000)
         assertFalse(replacement.isAlive)
+        assertTrue(bDisconnectCalled.await(1, TimeUnit.SECONDS))
         assertTrue(bDisconnected.get())
+    }
+
+    @Test fun `completed fixed length body never invokes hostile output close`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val closeEntered = CountDownLatch(1)
+        val wire = java.io.ByteArrayOutputStream()
+        val body = object : java.io.OutputStream() {
+            override fun write(value: Int) { wire.write(value) }
+            override fun write(bytes: ByteArray, offset: Int, length: Int) { wire.write(bytes, offset, length) }
+            override fun close() {
+                closeEntered.countDown()
+                while (true) try { Thread.sleep(10_000) } catch (_: InterruptedException) { }
+            }
+        }
+        val connection = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = body
+            override fun getResponseCode() = 200
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        var response: EvContributionUploader.Response? = null
+        val worker = thread { response = EvContributionHttpTransport(openConnection = { connection }).send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ) }
+        worker.join(1_000)
+        assertFalse("successful upload must not wait on output close", worker.isAlive)
+        assertEquals(200, response?.statusCode)
+        assertEquals(q.pending().single().file.length(), wire.size().toLong())
+        assertEquals(1L, closeEntered.count)
+    }
+
+    @Test fun `completed response never invokes hostile stream close`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val closeEntered = CountDownLatch(1)
+        val responseStream = object : java.io.ByteArrayInputStream("{}".toByteArray()) {
+            override fun close() {
+                closeEntered.countDown()
+                while (true) try { Thread.sleep(10_000) } catch (_: InterruptedException) { }
+            }
+        }
+        val connection = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+            override fun getInputStream() = responseStream
+        }
+        var response: EvContributionUploader.Response? = null
+        val worker = thread { response = EvContributionHttpTransport(openConnection = { connection }).send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ) }
+        worker.join(1_000)
+        assertFalse("successful upload must not wait on response close", worker.isAlive)
+        assertEquals("{}", response?.body)
+        assertEquals(1L, closeEntered.count)
+    }
+
+    @Test fun `deadline and explicit cancel request exact attempt cancellation once`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val entered = CountDownLatch(1)
+        val released = CountDownLatch(1)
+        val disconnects = AtomicInteger()
+        val connection = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() { disconnects.incrementAndGet(); released.countDown() }
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode(): Int { entered.countDown(); released.await(5, TimeUnit.SECONDS); return 200 }
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        lateinit var deadline: () -> Unit
+        val transport = EvContributionHttpTransport(
+            openConnection = { connection },
+            scheduleDeadline = { _, task -> deadline = task; EvContributionDeadline.Cancellable { } },
+        )
+        val worker = thread { runCatching { transport.send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ) } }
+        assertTrue(entered.await(1, TimeUnit.SECONDS))
+        val explicit = thread { transport.cancel() }
+        val timed = thread { deadline() }
+        explicit.join(); timed.join(); worker.join(2_000)
+        assertFalse(worker.isAlive)
+        assertEquals("one exact-owner disconnect despite racing cancellation", 1, disconnects.get())
+    }
+
+    @Test fun `cancel before connection bind requests teardown exactly once`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val opening = CountDownLatch(1)
+        val releaseOpen = CountDownLatch(1)
+        val cancellations = AtomicInteger()
+        val connection = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+        }
+        val transport = EvContributionHttpTransport(
+            requestCancellation = { cancellations.incrementAndGet() },
+            openConnection = {
+                opening.countDown()
+                while (true) {
+                    try {
+                        if (releaseOpen.await(10, TimeUnit.MILLISECONDS)) break
+                    } catch (_: InterruptedException) {
+                        // Model connection creation that ignores interruption.
+                    }
+                }
+                connection
+            },
+        )
+        val worker = thread { runCatching { transport.send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ) } }
+        assertTrue(opening.await(1, TimeUnit.SECONDS))
+        val first = thread { transport.cancel() }
+        val second = thread { transport.cancel() }
+        first.join(); second.join()
+        releaseOpen.countDown()
+        worker.join(1_000)
+        assertFalse(worker.isAlive)
+        assertEquals(1, cancellations.get())
+    }
+
+    @Test fun `hostile disconnect stays on one bounded shared lane and later request succeeds`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val disconnectEntered = CountDownLatch(1)
+        val releaseDisconnect = CountDownLatch(1)
+        val baseline = Thread.getAllStackTraces().keys.count { it.isAlive && it.name == "ev-upload-cancel" }
+        repeat(5) {
+            val responseEntered = CountDownLatch(1)
+            val connection = object : HttpURLConnection(URL("https://logs.example/upload")) {
+                override fun connect() = Unit
+                override fun usingProxy() = false
+                override fun disconnect() {
+                    disconnectEntered.countDown()
+                    while (!releaseDisconnect.await(10, TimeUnit.MILLISECONDS)) { /* ignore interruption */ }
+                }
+                override fun getOutputStream() = java.io.ByteArrayOutputStream()
+                override fun getResponseCode(): Int {
+                    responseEntered.countDown()
+                    try {
+                        while (true) Thread.sleep(10_000)
+                    } catch (interrupted: InterruptedException) {
+                        throw java.io.InterruptedIOException("cancelled").apply { initCause(interrupted) }
+                    }
+                }
+            }
+            val transport = EvContributionHttpTransport(openConnection = { connection })
+            val worker = thread { runCatching { transport.send(
+                "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+            ) } }
+            assertTrue(responseEntered.await(1, TimeUnit.SECONDS))
+            val started = System.nanoTime()
+            transport.cancel()
+            assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 500)
+            worker.join(1_000)
+            assertFalse(worker.isAlive)
+        }
+        assertTrue(disconnectEntered.await(1, TimeUnit.SECONDS))
+        val live = Thread.getAllStackTraces().keys.count { it.isAlive && it.name == "ev-upload-cancel" }
+        assertTrue("bounded cancellation must add at most one shared thread", live <= maxOf(1, baseline))
+
+        val clean = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        assertEquals(200, EvContributionHttpTransport(openConnection = { clean }).send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ).statusCode)
+        releaseDisconnect.countDown()
     }
 
     @Test fun `event driven drain uploads offline batches oldest first when network later arrives`() {

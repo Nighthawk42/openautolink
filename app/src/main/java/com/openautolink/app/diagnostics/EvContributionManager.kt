@@ -340,6 +340,17 @@ class EvFreshParkGate {
         }
     }
 
+    /**
+     * Re-checks monotonic freshness and commits [mutation] under the same monitor
+     * used by observe/clear. Callers composing this with the lifecycle gate must
+     * acquire lifecycle first, then this safety gate; no safety-gate callback may
+     * acquire lifecycle. Thus an unsafe observation/expiry either precedes the
+     * commit and rejects it, or is ordered after the completed commit.
+     */
+    @Synchronized
+    fun <T> mutateIfAuthorized(currentElapsedRealtime: Long, mutation: () -> T): T? =
+        if (authorization(currentElapsedRealtime)) mutation() else null
+
     @Synchronized
     fun clear() {
         registrationGeneration = null
