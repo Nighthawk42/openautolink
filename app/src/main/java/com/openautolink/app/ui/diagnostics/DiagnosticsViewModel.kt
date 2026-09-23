@@ -223,9 +223,6 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     private val audioManager = application.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val sessionManager = SessionManager.getInstance(viewModelScope, application, audioManager)
 
-    // Standalone vehicle data forwarder for diagnostics display — independent of session
-    private var diagnosticVehicleForwarder: com.openautolink.app.input.VehicleDataForwarder? = null
-
     private val _system = MutableStateFlow(gatherSystemInfo(application))
     private val _network = MutableStateFlow(DiagnosticsUiState().network)
     private val _streaming = MutableStateFlow(DiagnosticsUiState().streaming)
@@ -327,19 +324,12 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
             }
         }
 
-        // Observe vehicle data for car tab — standalone instance, no session required
-        // (matches app_v1 pattern where VehiclePropertyMonitor was independent)
-        val forwarder = com.openautolink.app.input.VehicleDataForwarderImpl(
-            application,
-            sendMessage = { /* no-op sender — diagnostics only, no bridge forwarding */ }
-        )
-        diagnosticVehicleForwarder = forwarder
-        forwarder.start()
-
+        // Observe the single process-owned VHAL runtime; diagnostics never creates
+        // another Car subscription or forwarder.
         viewModelScope.launch {
-            forwarder.latestVehicleData.collect { vd ->
+            com.openautolink.app.input.ProcessVehicleDataRuntime.latestVehicleData()?.collect { vd ->
                 _car.value = withMapsForecast(CarInfo(
-                    isActive = forwarder.isActive,
+                    isActive = com.openautolink.app.input.ProcessVehicleDataRuntime.isActive(),
                     speedKmh = vd.speedKmh,
                     gear = vd.gear,
                     parkingBrake = vd.parkingBrake,
@@ -375,7 +365,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                     tractionControlActive = vd.tractionControlActive,
                     evMotorPowerW = vd.evMotorPowerW,
                     evMotorTorqueNm = vd.evMotorTorqueNm,
-                    propertyStatus = forwarder.propertyStatus,
+                    propertyStatus = com.openautolink.app.input.ProcessVehicleDataRuntime.propertyStatus(),
                 ), sessionManager.vehicleEnergyForecast.value)
             }
         }
@@ -1110,8 +1100,6 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         stopLocalHotspot()
         stopP2pProbe()
         stopPhoneDiscovery()
-        diagnosticVehicleForwarder?.stop()
-        diagnosticVehicleForwarder = null
         com.openautolink.app.diagnostics.DiagnosticLog.stopLocalCapture()
     }
 

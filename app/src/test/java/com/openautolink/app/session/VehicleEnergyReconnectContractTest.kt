@@ -36,7 +36,7 @@ class VehicleEnergyReconnectContractTest {
     }
 
     @Test
-    fun `every restart retains the stopped VHAL owner for type 23 replay`() {
+    fun `every restart borrows process VHAL owner for type 23 replay`() {
         val source = sessionManagerSource()
         val start = source.indexOf("private fun prepareNativeSessionStart(session: AasdkSession)")
         val end = source.indexOf("private fun startLocationForwarding", startIndex = start)
@@ -55,8 +55,10 @@ class VehicleEnergyReconnectContractTest {
 
         val reconnect = source.substringAfter("private suspend fun doReconnectAfterCancel(")
             .substringBefore("fun onSystemWake()")
-        assertTrue("Reconnect must pause VHAL while replacing the protocol session",
+        assertFalse("Reconnect must never stop the process VHAL owner",
             reconnect.contains("_vehicleDataForwarder?.stop()"))
+        assertTrue("Reconnect must break learner continuity without stopping VHAL",
+            reconnect.contains("detachProcessVehicleSession()"))
         assertFalse(
             "Reconnect must retain the cached VHAL snapshot for type-23 replay",
             reconnect.contains("_vehicleDataForwarder = null"),
@@ -64,8 +66,8 @@ class VehicleEnergyReconnectContractTest {
 
         val fullStop = source.substringAfter("fun stop() {")
             .substringBefore("fun reconnect(")
-        assertTrue(
-            "Ignition/full stop must pause the VHAL owner",
+        assertFalse(
+            "Ignition/full stop must not stop the process VHAL owner",
             fullStop.contains("_vehicleDataForwarder?.stop()"),
         )
         assertFalse(
@@ -73,11 +75,9 @@ class VehicleEnergyReconnectContractTest {
             fullStop.contains("_vehicleDataForwarder = null"),
         )
         val revokeSession = fullStop.indexOf("revokeSessionOwnershipLocked()")
-        val stopForwarder = fullStop.indexOf("_vehicleDataForwarder?.stop()")
-        assertTrue(
-            "Explicit stop must revoke session ownership before the retained VHAL owner can be stopped",
-            revokeSession >= 0 && revokeSession < stopForwarder,
-        )
+        val continuityBoundary = fullStop.indexOf("detachProcessVehicleSession()")
+        assertTrue("Explicit stop must fence process observations at a lifecycle boundary",
+            continuityBoundary >= 0 && revokeSession >= 0)
 
         val collectorStart = source.indexOf("private fun bindSessionCollectors(session: AasdkSession)")
         val collectorEnd = source.indexOf("private fun createVideoDecoder", collectorStart)
@@ -116,8 +116,9 @@ class VehicleEnergyReconnectContractTest {
             connectionObserver.contains("startStreamingServicesLocked(session)"),
         )
         assertTrue(
-            "VHAL has exactly one producer-start chokepoint",
-            Regex(Regex.escape("_vehicleDataForwarder?.start()")).findAll(source).count() == 1,
+            "SessionManager must never start the process-owned VHAL source",
+            !source.contains("_vehicleDataForwarder?.start()") &&
+                source.contains("ProcessVehicleDataRuntime.attachSessionConsumer(::forwardVehicleData)"),
         )
         assertTrue(
             "Every control-message effect must remain inside the session ownership lock",
@@ -160,8 +161,30 @@ class VehicleEnergyReconnectContractTest {
         )
         assertTrue(
             "A stale in-flight attempt must clean up rather than activate after stop",
-            start.contains("cleanupAfterStartAttempt(generation)"),
+            start.contains("cleanupAfterStartAttempt(generation, failed)"),
         )
+        val cleanup = source.substring(
+            source.indexOf("private fun cleanupAfterStartAttempt"),
+            source.indexOf("private fun scheduleReconnectAfterCleanup"),
+        )
+        assertTrue("Failed starts must clean before scheduling one-shot reconnects",
+            cleanup.indexOf("startInFlight = false") < cleanup.indexOf("scheduleReconnectAfterCleanup"))
+        assertTrue("Retry delay is capped, but total attempts must not be capped",
+            source.contains("VhalRetryState()") && source.contains("delay(delayMs)") &&
+                !source.contains("reconnectAttempt >= 5") && !source.contains("reconnect attempts exhausted"))
+        assertTrue("Car service lifecycle must reset or schedule through the same retry owner",
+            source.contains("CarServiceLifecycleListener") && source.contains("onCarServiceLost") &&
+                source.contains("onCarServiceReady") && source.contains("retryState.serviceReady()"))
+        assertTrue("Failed partial starts must clean before retry to prevent duplicate subscriptions",
+            source.contains("if (stale || attemptFailed)") &&
+                source.contains("Failed VHAL start cleaned before bounded retry"))
+        val serviceLoss = source.substringAfter("private fun onCarServiceLost")
+            .substringBefore("private fun onCarServiceReady")
+        assertTrue("Service loss during startup must mark that exact generation failed",
+            serviceLoss.contains("if (startInFlight)") &&
+                serviceLoss.contains("startFailureGeneration = failedGeneration"))
+        assertTrue("Startup cannot publish active without a meaningful subscription",
+            source.contains("VhalSubscriptionReadiness.mayActivate(subscribed)"))
     }
 
     @Test

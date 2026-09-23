@@ -262,7 +262,7 @@ class EvLearnedRateEstimatorTest {
         estimator.awaitIdle()
 
         assertTrue(estimator.activeSnapshot.value.lastTickStatus.startsWith("ok:bd"))
-        assertEquals("COMPLETED", withTimeout(1_000L) { estimator.reset("Test|Model|2024") }.toString())
+        assertEquals("COMPLETED", withTimeout(1_000L) { estimator.reset("Test|Model|2024|cap60000-65000|rev2|absolute-wh") }.toString())
         assertTrue(withTimeout(1_000L) { estimator.stop() }.finalSaveSucceeded)
         assertTrue(Json.parseToJsonElement(store.raw).jsonObject.isEmpty())
     }
@@ -336,7 +336,7 @@ class EvLearnedRateEstimatorTest {
 
         loadGate.complete(Unit)
         estimator.awaitIdle()
-        assertEquals(0.05f, estimator.snapshotFor("Test|A|2024").sampleKm, 0.0001f)
+        assertEquals(0.05f, estimator.snapshotFor("Test|A|2024|cap60000-65000|rev2|absolute-wh").sampleKm, 0.0001f)
 
         estimator.onVehicleTick(vehicle("B", 40_000, 36f), 7_000L)
         estimator.onVehicleTick(vehicle("A", 49_960, 36f), 12_000L)
@@ -344,7 +344,7 @@ class EvLearnedRateEstimatorTest {
         assertEquals(
             "switching away and back must not bridge another vehicle",
             0.05f,
-            estimator.snapshotFor("Test|A|2024").sampleKm,
+            estimator.snapshotFor("Test|A|2024|cap60000-65000|rev2|absolute-wh").sampleKm,
             0.0001f,
         )
         estimator.stop()
@@ -400,8 +400,8 @@ class EvLearnedRateEstimatorTest {
     fun `eviction caused by an init tick is persisted`() = runTest {
         val store = FakeStore(
             raw = """{
-                "Test|A|2024":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":0},
-                "Test|B|2024":{"whPerKm":201.0,"sampleKm":2.0,"lastUpdateMs":101}
+                "Test|A|2024|cap60000-65000|rev2|absolute-wh":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":0},
+                "Test|B|2024|cap60000-65000|rev2|absolute-wh":{"whPerKm":201.0,"sampleKm":2.0,"lastUpdateMs":101}
             }""".trimIndent(),
         )
         val estimator = EvLearnedRateEstimator.createForTest(
@@ -420,8 +420,8 @@ class EvLearnedRateEstimatorTest {
         estimator.awaitIdle()
 
         val persisted = Json.parseToJsonElement(store.raw).jsonObject
-        assertFalse(persisted.containsKey("Test|A|2024"))
-        assertTrue(persisted.containsKey("Test|B|2024"))
+        assertFalse(persisted.containsKey("Test|A|2024|cap60000-65000|rev2|absolute-wh"))
+        assertTrue(persisted.containsKey("Test|B|2024|cap60000-65000|rev2|absolute-wh"))
         estimator.stop()
     }
 
@@ -439,9 +439,9 @@ class EvLearnedRateEstimatorTest {
         estimator.awaitIdle()
 
         assertEquals(2, estimator.runtimeState.value.stateEntryCount)
-        assertEquals(null, estimator.snapshotFor("Test|A|2024").key)
-        assertEquals("Test|B|2024", estimator.snapshotFor("Test|B|2024").key)
-        assertEquals("Test|C|2024", estimator.snapshotFor("Test|C|2024").key)
+        assertEquals(null, estimator.snapshotFor("Test|A|2024|cap60000-65000|rev2|absolute-wh").key)
+        assertEquals("Test|B|2024|cap60000-65000|rev2|absolute-wh", estimator.snapshotFor("Test|B|2024|cap60000-65000|rev2|absolute-wh").key)
+        assertEquals("Test|C|2024|cap60000-65000|rev2|absolute-wh", estimator.snapshotFor("Test|C|2024|cap60000-65000|rev2|absolute-wh").key)
         estimator.stop()
     }
 
@@ -449,15 +449,15 @@ class EvLearnedRateEstimatorTest {
     @Test
     fun `reset reports durable completion instead of fire and forget`() = runTest {
         val store = FakeStore(
-            raw = """{"Test|A|2024":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":100}}""",
+            raw = """{"Test|A|2024|cap60000-65000|rev2|absolute-wh":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":100}}""",
         )
         val estimator = EvLearnedRateEstimator.createForTest(store, this)
         estimator.awaitIdle()
 
-        val result = estimator.reset("Test|A|2024")
+        val result = estimator.reset("Test|A|2024|cap60000-65000|rev2|absolute-wh")
 
         assertEquals("COMPLETED", result.toString())
-        assertFalse(Json.parseToJsonElement(store.raw).jsonObject.containsKey("Test|A|2024"))
+        assertFalse(Json.parseToJsonElement(store.raw).jsonObject.containsKey("Test|A|2024|cap60000-65000|rev2|absolute-wh"))
         estimator.stop()
     }
 
@@ -471,7 +471,7 @@ class EvLearnedRateEstimatorTest {
         runCurrent()
         assertTrue(estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L))
 
-        val result = estimator.reset("Test|A|2024")
+        val result = estimator.reset("Test|A|2024|cap60000-65000|rev2|absolute-wh")
 
         assertEquals("REJECTED_BUSY", result.toString())
         loadGate.complete(Unit)
@@ -520,8 +520,8 @@ class EvLearnedRateEstimatorTest {
 
         val result = stopping.await()
         assertTrue(result.finalSaveSucceeded)
-        assertTrue(Json.parseToJsonElement(store.raw).jsonObject.containsKey("Test|A|2024"))
-        assertFalse(Json.parseToJsonElement(store.raw).jsonObject.containsKey("Test|B|2024"))
+        assertTrue(Json.parseToJsonElement(store.raw).jsonObject.containsKey("Test|A|2024|cap60000-65000|rev2|absolute-wh"))
+        assertFalse(Json.parseToJsonElement(store.raw).jsonObject.containsKey("Test|B|2024|cap60000-65000|rev2|absolute-wh"))
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -600,6 +600,7 @@ class EvLearnedRateEstimatorTest {
     private fun vehicle(model: String, batteryWh: Int, speedKmh: Float) =
         ControlMessage.VehicleData(
             evBatteryLevelWh = batteryWh.toFloat(),
+            evBatteryCapacityWh = 60_000f,
             speedKmh = speedKmh,
             carMake = "Test",
             carModel = model,
@@ -612,6 +613,7 @@ class EvLearnedRateEstimatorTest {
         observations: Map<String, VehiclePropertyObservation> = emptyMap(),
     ) = ControlMessage.VehicleData(
         evBatteryLevelWh = batteryWh,
+        evBatteryCapacityWh = 60_000f,
         speedKmh = speedKmh,
         evObservationMetadata = observations,
         carMake = "Test",
@@ -655,7 +657,7 @@ class EvLearnedRateEstimatorTest {
         estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L)
         estimator.onVehicleTick(vehicle("A", 49_980, 36f), 6_000L)
         estimator.awaitIdle()
-        estimator.reset("Test|A|2024")
+        estimator.reset("Test|A|2024|cap60000-65000|rev2|absolute-wh")
         estimator.awaitIdle()
         assertTrue(store.writes.isEmpty())
 
@@ -676,10 +678,10 @@ class EvLearnedRateEstimatorTest {
     fun persistedMapHasDeterministicEntryAndByteBounds() = runTest {
         val store = FakeStore(
             raw = """{
-                "Test|A|2024":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":100},
-                "Test|B|2024":{"whPerKm":201.0,"sampleKm":2.0,"lastUpdateMs":101},
-                "Test|C|2024":{"whPerKm":202.0,"sampleKm":2.0,"lastUpdateMs":102},
-                "Test|D|2024":{"whPerKm":203.0,"sampleKm":2.0,"lastUpdateMs":103}
+                "Test|A|2024|cap60000-65000|rev2|absolute-wh":{"whPerKm":200.0,"sampleKm":2.0,"lastUpdateMs":100},
+                "Test|B|2024|cap60000-65000|rev2|absolute-wh":{"whPerKm":201.0,"sampleKm":2.0,"lastUpdateMs":101},
+                "Test|C|2024|cap60000-65000|rev2|absolute-wh":{"whPerKm":202.0,"sampleKm":2.0,"lastUpdateMs":102},
+                "Test|D|2024|cap60000-65000|rev2|absolute-wh":{"whPerKm":203.0,"sampleKm":2.0,"lastUpdateMs":103}
             }""".trimIndent(),
         )
         val estimator = EvLearnedRateEstimator.createForTest(
@@ -692,8 +694,8 @@ class EvLearnedRateEstimatorTest {
 
         val saved = Json.parseToJsonElement(store.raw).jsonObject
         assertEquals(2, saved.size)
-        assertTrue(saved.containsKey("Test|C|2024"))
-        assertTrue(saved.containsKey("Test|D|2024"))
+        assertTrue(saved.containsKey("Test|C|2024|cap60000-65000|rev2|absolute-wh"))
+        assertTrue(saved.containsKey("Test|D|2024|cap60000-65000|rev2|absolute-wh"))
         assertTrue(store.raw.toByteArray(Charsets.UTF_8).size <= 300)
     }
 
@@ -838,5 +840,27 @@ class EvLearnedRateEstimatorTest {
         )
         val status = EvLearnedRateEstimator.applyTick(s, vd, 1_000L)
         assertEquals("skip:noBattery", status)
+    }
+
+    @Test
+    fun `lifecycle reset is actor ordered and preserves learned calibration`() = runTest {
+        val estimator = EvLearnedRateEstimator.createForTest(
+            FakeStore(),
+            this,
+            EvLearnedRateEstimator.Config(persistDebounceMs = 60_000L),
+        )
+        estimator.onVehicleTick(vehicle("A", 50_000, 36f), 1_000L)
+        estimator.onVehicleTick(vehicle("A", 49_990, 36f), 6_000L)
+        estimator.awaitIdle()
+        val learned = estimator.activeSnapshot.value.whPerKm
+        assertTrue(learned > 0f)
+
+        estimator.resetContinuity()
+        estimator.onVehicleTick(vehicle("A", 40_000, 36f), 7_000L)
+        estimator.awaitIdle()
+
+        assertEquals("init", estimator.activeSnapshot.value.lastTickStatus)
+        assertEquals(learned, estimator.activeSnapshot.value.whPerKm, 0f)
+        estimator.stop()
     }
 }
