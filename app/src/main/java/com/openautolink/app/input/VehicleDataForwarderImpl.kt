@@ -11,12 +11,14 @@ import com.openautolink.app.transport.VehiclePropertyObservation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.lang.reflect.InvocationTargetException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Monitors VHAL properties via the AAOS Car API using reflection.
@@ -97,6 +99,13 @@ class VehicleDataForwarderImpl(
     private val currentValues = ConcurrentHashMap<Int, Any>()
     // Guarded with the forwarder monitor, alongside value updates and batch snapshots.
     private val evObservationMetadata = mutableMapOf<String, VehiclePropertyObservation>()
+    private val observationSequence = AtomicLong()
+    private data class BufferedSafetyObservation(
+        val value: Any?,
+        val observation: VehiclePropertyObservation,
+    )
+    private val pendingSafetySubscriptions = mutableMapOf<Int, Long>()
+    private val bufferedSafetyObservations = mutableMapOf<Int, BufferedSafetyObservation>()
     private var lastSendTime = 0L
 
     // HistoryProvider polling cache (Finding F.2). Refreshed every 5s on a
@@ -136,19 +145,31 @@ class VehicleDataForwarderImpl(
     private val _latestVehicleData = MutableStateFlow(ControlMessage.VehicleData())
     override val latestVehicleData: StateFlow<ControlMessage.VehicleData> = _latestVehicleData.asStateFlow()
 
-    private val _propertyStatus = mutableMapOf<String, String>()
-    override val propertyStatus: Map<String, String> get() = _propertyStatus.toMap()
+    private val _propertyStatus = ConcurrentHashMap<String, String>()
+    override val propertyStatus: Map<String, String> get() =
+        java.util.Collections.unmodifiableMap(HashMap(_propertyStatus))
 
     private var startInFlight = false
     private var desiredActive = false
     private var lifecycleGeneration = 0L
+    private var startFailureGeneration: Long? = null
+    private var reconnectAttempt = 0
+    private var reconnectJob: kotlinx.coroutines.Job? = null
+    private var carLifecycleProxy: Any? = null
+    private val retryState = VhalRetryState()
 
     override fun start() {
         val generation = synchronized(this) {
+            if (!desiredActive) reconnectAttempt = 0
             desiredActive = true
-            if (isActive || startInFlight) return
+            if (isActive || startInFlight) {
+                retryState.request()
+                return
+            }
+            val retryGeneration = retryState.start() ?: return
             startInFlight = true
-            ++lifecycleGeneration
+            lifecycleGeneration = retryGeneration
+            retryGeneration
         }
         launchStartAttempt(generation)
     }
@@ -157,24 +178,30 @@ class VehicleDataForwarderImpl(
         // Run on background thread — Car API calls can block (connect, waitForConnected).
         // Every stage is fenced because stop() may run while this coroutine is blocked.
         scope.launch {
+            var failed = false
             try {
                 if (!isStartCurrent(generation)) return@launch
                 connectToCar()
                 if (!isStartCurrent(generation)) return@launch
                 readStaticVehicleInfo()
                 if (!isStartCurrent(generation)) return@launch
-                registerProperties()
+                val subscribed = registerProperties()
+                check(VhalSubscriptionReadiness.mayActivate(subscribed)) {
+                    "No meaningful safety or energy VHAL property subscribed"
+                }
                 if (!isStartCurrent(generation)) return@launch
 
                 val activated = synchronized(this@VehicleDataForwarderImpl) {
                     if (lifecycleGeneration == generation && desiredActive) {
-                        isActive = true
-                        true
+                        isActive = retryState.started(generation)
+                        isActive
                     } else {
                         false
                     }
                 }
                 if (!activated) return@launch
+
+                synchronized(this@VehicleDataForwarderImpl) { reconnectAttempt = 0 }
 
                 Log.i(TAG, "Vehicle data forwarding started")
                 DiagnosticLog.i("vhal", "Vehicle data forwarding started")
@@ -182,43 +209,46 @@ class VehicleDataForwarderImpl(
                 _latestVehicleData.value = buildVehicleData()
                 startHistoryPoller()
             } catch (e: Exception) {
-                synchronized(this@VehicleDataForwarderImpl) {
-                    if (lifecycleGeneration == generation) desiredActive = false
-                }
+                failed = true
                 val root = e.rootCause()
                 Log.w(TAG, "Failed to start vehicle data forwarding: ${root.message}")
                 DiagnosticLog.w("vhal", "Failed to start: ${root.javaClass.simpleName}: ${root.message}")
             } finally {
-                cleanupAfterStartAttempt(generation)
+                cleanupAfterStartAttempt(generation, failed)
             }
         }
     }
 
     private fun isStartCurrent(generation: Long): Boolean = synchronized(this) {
-        lifecycleGeneration == generation && desiredActive
+        lifecycleGeneration == generation && desiredActive && startFailureGeneration != generation
     }
 
-    private fun cleanupAfterStartAttempt(generation: Long) {
+    private fun cleanupAfterStartAttempt(generation: Long, failed: Boolean) {
         var nextGeneration: Long? = null
         var cleanupOutcome: String? = null
+        var retryDelayMs: Long? = null
         synchronized(this) {
+            val attemptFailed = failed || startFailureGeneration == generation
+            if (startFailureGeneration == generation) startFailureGeneration = null
             val stale = lifecycleGeneration != generation || !desiredActive
-            if (stale) {
+            if (stale || attemptFailed) {
                 isActive = false
                 cleanup()
-                cleanupOutcome = if (desiredActive) {
-                    "Stale VHAL start cleaned before queued restart"
-                } else {
-                    "In-flight VHAL start cleaned after stop"
+                cleanupOutcome = when {
+                    attemptFailed -> "Failed VHAL start cleaned before bounded retry"
+                    desiredActive -> "Stale VHAL start cleaned before queued restart"
+                    else -> "In-flight VHAL start cleaned after stop"
                 }
             }
             startInFlight = false
+            if (attemptFailed && !stale) retryDelayMs = retryState.failedAttemptCleaned(generation)
             // stop() followed quickly by start() while the old attempt was blocked
             // leaves desiredActive=true but invalidates the old generation. Relaunch
             // only after that attempt has cleaned up its partially-created Car state.
-            if (desiredActive && !isActive) {
+            if (desiredActive && !isActive && (stale || !attemptFailed)) {
                 startInFlight = true
-                nextGeneration = ++lifecycleGeneration
+                nextGeneration = retryState.serviceReady()
+                if (nextGeneration != null) lifecycleGeneration = nextGeneration!!
             }
         }
         cleanupOutcome?.let {
@@ -226,6 +256,24 @@ class VehicleDataForwarderImpl(
             DiagnosticLog.i("vhal", it)
         }
         nextGeneration?.let(::launchStartAttempt)
+        retryDelayMs?.let { scheduleReconnectAfterCleanup(generation, it) }
+    }
+
+    private fun scheduleReconnectAfterCleanup(failedGeneration: Long, delayMs: Long) {
+        synchronized(this) { reconnectAttempt++ }
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            delay(delayMs)
+            val next = synchronized(this@VehicleDataForwarderImpl) {
+                if (!desiredActive || isActive || startInFlight || lifecycleGeneration != failedGeneration) return@launch
+                val retryGeneration = retryState.retryTimerFired(failedGeneration) ?: return@launch
+                startInFlight = true
+                lifecycleGeneration = retryGeneration
+                retryGeneration
+            }
+            launchStartAttempt(next)
+        }
+        DiagnosticLog.i("vhal", "VHAL reconnect scheduled attempt=$reconnectAttempt delayMs=$delayMs")
     }
 
     override fun stop() {
@@ -233,6 +281,10 @@ class VehicleDataForwarderImpl(
             val pendingOrActive = isActive || startInFlight || carObject != null
             val deferred = startInFlight
             desiredActive = false
+            retryState.stop()
+            reconnectJob?.cancel()
+            reconnectJob = null
+            reconnectAttempt = 0
             lifecycleGeneration++
             // An in-flight attempt owns its partially-created reflection objects;
             // it observes the generation change in finally and cleans them there.
@@ -269,8 +321,8 @@ class VehicleDataForwarderImpl(
             throw IllegalStateException("android.car APIs not available")
         }
 
-        // Try single-arg createCar(Context) first, fall back to createCar(Context, Handler)
-        val car = try {
+        // Prefer the lifecycle-listener API so service death owns one bounded reconnect.
+        val car = createCarWithLifecycle(carClass) ?: try {
             carClass.getMethod("createCar", Context::class.java).invoke(null, context)
         } catch (_: NoSuchMethodException) {
             carClass.getMethod("createCar", Context::class.java, android.os.Handler::class.java)
@@ -298,7 +350,7 @@ class VehicleDataForwarderImpl(
 
         // Wait for connection (app_v1 waits up to 2s)
         if (!waitForConnected(car)) {
-            DiagnosticLog.i("vhal", "Car service did not report connected within timeout; continuing best-effort")
+            throw IllegalStateException("Car service did not report connected within timeout")
         }
         carObject = car
 
@@ -310,6 +362,69 @@ class VehicleDataForwarderImpl(
 
         Log.i(TAG, "Connected to Car API via reflection")
         DiagnosticLog.i("vhal", "Connected to Car API")
+    }
+
+    private fun createCarWithLifecycle(carClass: Class<*>): Any? = runCatching {
+        val listenerClass = Class.forName("android.car.Car\$CarServiceLifecycleListener")
+        val listener = java.lang.reflect.Proxy.newProxyInstance(
+            listenerClass.classLoader,
+            arrayOf(listenerClass),
+        ) { proxy, method, args ->
+            when (method.name) {
+                "onLifecycleChanged" -> {
+                    val ready = args?.getOrNull(1) as? Boolean ?: false
+                    if (ready) onCarServiceReady(args?.firstOrNull()) else onCarServiceLost(args?.firstOrNull())
+                    null
+                }
+                "toString" -> "OalCarServiceLifecycleListener"
+                "hashCode" -> System.identityHashCode(proxy)
+                "equals" -> proxy === args?.firstOrNull()
+                else -> null
+            }
+        }
+        val method = carClass.methods.first { candidate ->
+            candidate.name == "createCar" && candidate.parameterTypes.size == 4 &&
+                candidate.parameterTypes.last() == listenerClass
+        }
+        carLifecycleProxy = listener
+        method.invoke(null, context, null, 2_000L, listener)
+    }.getOrNull()
+
+    private fun onCarServiceLost(lostCar: Any?) {
+        val loss = synchronized(this) {
+            if (!desiredActive) return
+            if (carObject != null && carObject !== lostCar) return
+            val failedGeneration = lifecycleGeneration
+            if (startInFlight) {
+                startFailureGeneration = failedGeneration
+                failedGeneration to false
+            } else {
+                if (!isActive || !retryState.serviceLost(failedGeneration)) return
+                isActive = false
+                reconnectAttempt = 0
+                cleanup()
+                startInFlight = false
+                failedGeneration to true
+            }
+        }
+        DiagnosticLog.w("vhal", "Car service lost; startupFailed=${!loss.second}; scheduling process-owned reconnect")
+        if (loss.second) {
+            retryState.failedAttemptCleaned(loss.first)?.let { scheduleReconnectAfterCleanup(loss.first, it) }
+        }
+    }
+
+    private fun onCarServiceReady(readyCar: Any?) {
+        val generation = synchronized(this) {
+            if (!desiredActive || isActive || startInFlight || (carObject != null && carObject !== readyCar)) return
+            reconnectJob?.cancel()
+            reconnectJob = null
+            reconnectAttempt = 0
+            val next = retryState.serviceReady() ?: return
+            startInFlight = true
+            lifecycleGeneration = next
+            next
+        }
+        launchStartAttempt(generation)
     }
 
     /** Poll isConnected() up to timeoutMs, matching app_v1's waitForConnected pattern. */
@@ -392,8 +507,8 @@ class VehicleDataForwarderImpl(
         return cause?.rootCause() ?: this
     }
 
-    private fun registerProperties() {
-        val pm = propertyManager ?: return
+    private fun registerProperties(): Set<String> {
+        val pm = propertyManager ?: return emptySet()
         val pmClass = pm::class.java
 
         // Resolve callback interface ONCE and create ONE shared proxy (app_v1 pattern)
@@ -401,7 +516,7 @@ class VehicleDataForwarderImpl(
             Class.forName("android.car.hardware.property.CarPropertyManager\$CarPropertyEventCallback")
         } catch (e: ClassNotFoundException) {
             DiagnosticLog.w("vhal", "CarPropertyEventCallback class not found")
-            return
+            return emptySet()
         }
         callbackProxy = createCallbackProxy(callbackInterface)
 
@@ -439,6 +554,7 @@ class VehicleDataForwarderImpl(
         )
 
         var subscribed = 0
+        val subscribedNames = mutableSetOf<String>()
         for (prop in properties) {
             // Resolve property ID from VehiclePropertyIds at runtime (app_v1 pattern)
             val propId = resolveIntConstant("android.car.VehiclePropertyIds", prop.fieldName)
@@ -469,19 +585,16 @@ class VehicleDataForwarderImpl(
                 continue
             }
 
-            // Add to tracked set BEFORE initial read so handleChangeEvent doesn't discard it.
-            // Static properties (e.g., INFO_EV_BATTERY_CAPACITY) never get callback updates,
-            // so the initial read is their only chance to populate currentValues.
-            trackedPropertyIds.add(propId)
-
             // Read initial value
+            var initialPropertyValue: Any? = null
             try {
                 val pv = pmClass.getMethod("getProperty", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
                     .invoke(pm, propId, 0)
+                initialPropertyValue = pv
                 if (pv != null) {
                     val initVal = try { pv.javaClass.getMethod("getValue").invoke(pv) } catch (_: Throwable) { null }
                     DiagnosticLog.d("vhal", "${prop.fieldName}: initial read = $initVal")
-                    handleChangeEvent(pv)
+                    handleInitialRead(pv)
                 } else {
                     DiagnosticLog.d("vhal", "${prop.fieldName}: initial read returned null")
                 }
@@ -489,13 +602,26 @@ class VehicleDataForwarderImpl(
                 DiagnosticLog.d("vhal", "${prop.fieldName}: initial read: ${t.rootCause().javaClass.simpleName}: ${t.rootCause().message}")
             }
 
+            // A platform may synchronously deliver the current value from inside
+            // subscribe(). Fence and buffer that callback before invoking it so
+            // the older initial read cannot overwrite a newer safety observation.
+            val subscriptionGeneration = registrationGeneration
+            beginSafetySubscription(propId, subscriptionGeneration)
             // Subscribe using shared callback (app_v1's subscribe pattern)
             val ok = subscribe(pm, callbackInterface, callbackProxy!!, propId, prop.rateField)
             if (ok) {
+                trackedPropertyIds.add(propId)
+                if (isSafetyProperty(propId)) {
+                    commitSafetySubscription(propId, subscriptionGeneration)
+                } else {
+                    initialPropertyValue?.let { promoteSubscribedInitialRead(propId, it) }
+                }
                 subscribed++
+                subscribedNames += prop.fieldName
                 _propertyStatus[prop.fieldName] = "subscribed"
                 DiagnosticLog.d("vhal", "${prop.fieldName}: subscribed")
             } else {
+                rejectSafetySubscription(propId)
                 _propertyStatus[prop.fieldName] = "rejected"
                 DiagnosticLog.w("vhal", "${prop.fieldName}: subscription rejected")
             }
@@ -514,6 +640,7 @@ class VehicleDataForwarderImpl(
             _latestVehicleData.value = data
             sendMessage(data)
         }
+        return subscribedNames
     }
 
     /** Create ONE shared callback proxy for all properties (app_v1 pattern). */
@@ -529,13 +656,18 @@ class VehicleDataForwarderImpl(
             when (method.name) {
                 "onChangeEvent" -> {
                     synchronized(this) {
-                        if (generation == registrationGeneration) args?.firstOrNull()?.let(::handleChangeEvent)
+                        if (generation == registrationGeneration) {
+                            args?.firstOrNull()?.let { handleCallbackChange(generation, it) }
+                        }
                     }
                     null
                 }
                 "onErrorEvent" -> {
                     val propertyId = (args?.getOrNull(0) as? Int) ?: -1
                     Log.w(TAG, "Property error callback for $propertyId")
+                    synchronized(this) {
+                        if (generation == registrationGeneration) handleCallbackError(generation, propertyId)
+                    }
                     null
                 }
                 "toString" -> "VehiclePropertyCallback"
@@ -613,50 +745,206 @@ class VehicleDataForwarderImpl(
 
     /** Handle property change event — extracts propertyId from event (app_v1 pattern). */
     @Synchronized
+    private fun handleInitialRead(propertyValue: Any) {
+        val propertyId = runCatching {
+            propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int
+        }.getOrNull() ?: return
+        val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+        if (value != null) currentValues[propertyId] = value
+        VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let { name ->
+            evObservationMetadata[name] = observationFrom(propertyValue, propertyId, authoritative = false)
+        }
+    }
+
+    @Synchronized
+    private fun promoteSubscribedInitialRead(propertyId: Int, propertyValue: Any) {
+        trackedPropertyIds.add(propertyId)
+        handleChangeEvent(propertyValue)
+    }
+
+    private fun isSafetyProperty(propertyId: Int): Boolean =
+        propertyId == VEHICLE_PROPERTY_ID_FALLBACK["GEAR_SELECTION"] ||
+            propertyId == VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
+
+    @Synchronized
+    private fun beginSafetySubscription(propertyId: Int, generation: Long) {
+        if (!isSafetyProperty(propertyId) || generation != registrationGeneration) return
+        pendingSafetySubscriptions[propertyId] = generation
+        bufferedSafetyObservations.remove(propertyId)
+    }
+
+    @Synchronized
+    private fun commitSafetySubscription(propertyId: Int, generation: Long) {
+        if (!isSafetyProperty(propertyId) || generation != registrationGeneration ||
+            pendingSafetySubscriptions[propertyId] != generation
+        ) return
+        pendingSafetySubscriptions.remove(propertyId)
+        trackedPropertyIds.add(propertyId)
+        val name = VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key ?: return
+        val initial = evObservationMetadata[name]
+        val buffered = bufferedSafetyObservations.remove(propertyId)
+        val newest = when {
+            buffered == null -> initial?.let { BufferedSafetyObservation(currentValues[propertyId], it) }
+            initial == null || buffered.observation.sequence > initial.sequence -> buffered
+            else -> BufferedSafetyObservation(currentValues[propertyId], initial)
+        } ?: return
+        applySafetyObservation(
+            propertyId,
+            newest.value,
+            newest.observation.copy(
+                registrationGeneration = generation,
+                subscriptionActive = true,
+            ),
+        )
+        publishImmediate()
+    }
+
+    @Synchronized
+    private fun handleCallbackChange(generation: Long, propertyValue: Any) {
+        val propertyId = runCatching {
+            propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int
+        }.getOrNull() ?: return
+        if (isSafetyProperty(propertyId) && pendingSafetySubscriptions[propertyId] == generation) {
+            val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+            val observation = observationFrom(propertyValue, propertyId, authoritative = true)
+                .copy(registrationGeneration = generation)
+            val previous = bufferedSafetyObservations[propertyId]
+            if (previous == null || observation.sequence > previous.observation.sequence) {
+                bufferedSafetyObservations[propertyId] = BufferedSafetyObservation(value, observation)
+            }
+            return
+        }
+        handleChangeEvent(propertyValue)
+    }
+
+    @Synchronized
+    private fun handleCallbackError(generation: Long, propertyId: Int) {
+        if (isSafetyProperty(propertyId) && pendingSafetySubscriptions[propertyId] == generation) {
+            val observation = VehiclePropertyObservation(
+                timestampElapsedNanos = SystemClock.elapsedRealtimeNanos(),
+                receivedElapsedMs = SystemClock.elapsedRealtime(),
+                status = 1,
+                registrationGeneration = generation,
+                propertyId = propertyId,
+                subscriptionActive = true,
+                sequence = observationSequence.incrementAndGet(),
+            )
+            val previous = bufferedSafetyObservations[propertyId]
+            if (previous == null || observation.sequence > previous.observation.sequence) {
+                bufferedSafetyObservations[propertyId] = BufferedSafetyObservation(null, observation)
+            }
+            return
+        }
+        handleErrorEvent(propertyId)
+    }
+
+    @Synchronized
+    private fun rejectSafetySubscription(propertyId: Int) {
+        if (!isSafetyProperty(propertyId)) return
+        pendingSafetySubscriptions.remove(propertyId)
+        bufferedSafetyObservations.remove(propertyId)
+        trackedPropertyIds.remove(propertyId)
+        currentValues.remove(propertyId)
+        VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let(evObservationMetadata::remove)
+    }
+
+    private fun observationFrom(propertyValue: Any, propertyId: Int, authoritative: Boolean): VehiclePropertyObservation {
+        val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+        return VehiclePropertyObservation(
+            timestampElapsedNanos = if (value == null) null else runCatching {
+                propertyValue.javaClass.getMethod("getTimestamp").invoke(propertyValue) as? Long
+            }.getOrNull(),
+            receivedElapsedMs = SystemClock.elapsedRealtime(),
+            status = runCatching { propertyValue.javaClass.getMethod("getStatus").invoke(propertyValue) as? Int }.getOrNull(),
+            registrationGeneration = registrationGeneration.takeIf { authoritative },
+            propertyId = propertyId,
+            subscriptionActive = authoritative,
+            sequence = observationSequence.incrementAndGet(),
+        )
+    }
+
+    @Synchronized
     private fun handleChangeEvent(propertyValue: Any) {
         try {
             val propertyId = propertyValue.javaClass.getMethod("getPropertyId").invoke(propertyValue) as? Int ?: return
             if (propertyId !in trackedPropertyIds) return
-            // Observe raw availability without filtering currentValues or changing prediction.
-            // Reflection failures are independent: a missing timestamp must not hide status.
-            val receivedElapsedMs = SystemClock.elapsedRealtime()
+            // Observe raw availability without filtering ordinary telemetry values.
+            // Safety values are fail-closed and published immediately.
             val value = runCatching { propertyValue.javaClass.getMethod("getValue").invoke(propertyValue) }.getOrNull()
+            val observation = observationFrom(propertyValue, propertyId, authoritative = true)
+            if (isSafetyProperty(propertyId)) {
+                applySafetyObservation(propertyId, value, observation)
+                if (value != null && observation.status == 0) {
+                    DiagnosticLog.d("vhal", "prop 0x${propertyId.toString(16)}: $value")
+                    processSafetyEdge(propertyId, value)
+                }
+                publishImmediate()
+                return
+            }
             VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key?.let { name ->
-                evObservationMetadata[name] = VehiclePropertyObservation(
-                    timestampElapsedNanos = if (value == null) null else runCatching {
-                        propertyValue.javaClass.getMethod("getTimestamp").invoke(propertyValue) as? Long
-                    }.getOrNull(),
-                    receivedElapsedMs = receivedElapsedMs,
-                    status = runCatching {
-                        propertyValue.javaClass.getMethod("getStatus").invoke(propertyValue) as? Int
-                    }.getOrNull(),
-                )
+                evObservationMetadata[name] = observation
             }
             if (value == null) return
             DiagnosticLog.d("vhal", "prop 0x${propertyId.toString(16)}: $value")
-
-            // Detect ignition state transitions to ON(4)/START(5) for wake signaling
-            val ignitionId = VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
-            if (propertyId == ignitionId && value is Int) {
-                val prev = previousIgnitionState
-                previousIgnitionState = value
-                // IGNITION_STATE: 0=UNDEFINED, 1=LOCK, 2=OFF, 3=ACC, 4=ON, 5=START
-                if (prev != null && prev < 4 && value >= 4) {
-                    Log.i(TAG, "Ignition ON detected (was $prev, now $value)")
-                    DiagnosticLog.i("vhal", "Ignition ON detected ($prev → $value)")
-                    onIgnitionOn?.invoke(value)
-                }
-            }
-
-            // Edge-log a small set of life-cycle-relevant transitions at INFO
-            // so postmortem captures show when the car's state actually changed
-            // (vs the high-cadence DEBUG line above which is one-per-tick).
             edgeLog(propertyId, value)
-
             currentValues[propertyId] = value
             throttledSend()
         } catch (e: Throwable) {
             Log.w(TAG, "handleChangeEvent: ${e.rootCause().message}")
+        }
+    }
+
+    @Synchronized
+    private fun applySafetyObservation(
+        propertyId: Int,
+        value: Any?,
+        observation: VehiclePropertyObservation,
+    ) {
+        val name = VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key ?: return
+        evObservationMetadata[name] = observation
+        if (value != null && observation.status == 0) currentValues[propertyId] = value
+        else currentValues.remove(propertyId)
+    }
+
+    private fun processSafetyEdge(propertyId: Int, value: Any) {
+        val ignitionId = VEHICLE_PROPERTY_ID_FALLBACK["IGNITION_STATE"]
+        if (propertyId == ignitionId && value is Int) {
+            val prev = previousIgnitionState
+            previousIgnitionState = value
+            if (prev != null && prev < 4 && value >= 4) {
+                Log.i(TAG, "Ignition ON detected (was $prev, now $value)")
+                DiagnosticLog.i("vhal", "Ignition ON detected ($prev → $value)")
+                onIgnitionOn?.invoke(value)
+            }
+        }
+        edgeLog(propertyId, value)
+    }
+
+    @Synchronized
+    private fun publishImmediate() {
+        lastSendTime = System.currentTimeMillis()
+        val data = buildVehicleData()
+        _latestVehicleData.value = data
+        sendMessage(data)
+    }
+
+    @Synchronized
+    private fun handleErrorEvent(propertyId: Int) {
+        if (propertyId !in trackedPropertyIds) return
+        val name = VEHICLE_PROPERTY_ID_FALLBACK.entries.firstOrNull { it.value == propertyId }?.key ?: return
+        currentValues.remove(propertyId)
+        evObservationMetadata[name] = VehiclePropertyObservation(
+            timestampElapsedNanos = SystemClock.elapsedRealtimeNanos(),
+            receivedElapsedMs = SystemClock.elapsedRealtime(),
+            status = 1,
+            registrationGeneration = registrationGeneration,
+            propertyId = propertyId,
+            subscriptionActive = true,
+            sequence = observationSequence.incrementAndGet(),
+        )
+        if (isSafetyProperty(propertyId)) publishImmediate() else {
+            lastSendTime = 0L
+            throttledSend()
         }
     }
 
@@ -867,6 +1155,7 @@ class VehicleDataForwarderImpl(
             evMotorPowerW = motorPowerW,
             evMotorTorqueNm = motorTorqueNm,
             evObservationMetadata = java.util.Collections.unmodifiableMap(observations),
+            vhalRegistrationGeneration = registrationGeneration,
         )
     }
 
@@ -958,11 +1247,16 @@ class VehicleDataForwarderImpl(
         }
 
         trackedPropertyIds.clear()
+        pendingSafetySubscriptions.clear()
+        bufferedSafetyObservations.clear()
         currentValues.clear()
+        _propertyStatus.clear()
         evObservationMetadata.clear()
-        // Do not alter retained numeric values; only retire their diagnostic observations.
-        _latestVehicleData.value = _latestVehicleData.value.copy(evObservationMetadata = emptyMap())
+        val retired = buildVehicleData()
+        _latestVehicleData.value = retired
+        sendMessage(retired)
         callbackProxy = null
+        carLifecycleProxy = null
         carObject = null
         propertyManager = null
     }

@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.openautolink.app.data.AppPreferences
 import com.openautolink.app.transport.bluetooth.WppConfigBtServer
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -62,6 +63,7 @@ data class SettingsUiState(
     val logUploadUrl: String = AppPreferences.DEFAULT_LOG_UPLOAD_URL,
     val logUploadToken: String = AppPreferences.DEFAULT_LOG_UPLOAD_TOKEN,
     val logUploadDeviceLabel: String = AppPreferences.DEFAULT_LOG_UPLOAD_DEVICE_LABEL,
+    val evContributionConsent: Boolean = AppPreferences.DEFAULT_EV_CONTRIBUTION_CONSENT,
     // UI customization
     val syncAaTheme: Boolean = AppPreferences.DEFAULT_SYNC_AA_THEME,
     val hideAaClock: Boolean = AppPreferences.DEFAULT_HIDE_AA_CLOCK,
@@ -143,6 +145,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         preferences.simulateIgnitionButton,
         preferences.overlayPhoneSwitchButton,
         preferences.overlayReconnectButton,
+        preferences.evContributionConsent,
     ) { values: Array<Any> ->
         SettingsUiState(
             videoAutoNegotiate = values[0] as Boolean,
@@ -195,6 +198,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             simulateIgnitionButton = values[47] as Boolean,
             overlayPhoneSwitchButton = values[48] as Boolean,
             overlayReconnectButton = values[49] as Boolean,
+            evContributionConsent = values[50] as Boolean,
         )
     }.stateIn(
         viewModelScope,
@@ -520,6 +524,29 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun updateLogUploadEnabled(enabled: Boolean) {
         viewModelScope.launch { preferences.setLogUploadEnabled(enabled) }
+    }
+
+    fun updateEvContributionConsent(enabled: Boolean) {
+        viewModelScope.launch {
+            val binding = if (enabled) {
+                com.openautolink.app.diagnostics.EvContributionConsentBinding.create(
+                    uiState.value.logUploadUrl,
+                    uiState.value.logUploadToken,
+                )?.encode() ?: run {
+                    com.openautolink.app.diagnostics.EvContributionService.reportConsentInvalid(
+                        "A valid HTTPS upload URL and non-empty token are required",
+                    )
+                    return@launch
+                }
+            } else null
+            preferences.setEvContributionConsent(enabled, binding)
+        }
+    }
+
+    fun deletePendingEvContributions() {
+        viewModelScope.launch(Dispatchers.IO) {
+            com.openautolink.app.diagnostics.EvContributionService.deletePendingEvContributions()
+        }
     }
 
     fun updateSimulateIgnitionButton(enabled: Boolean) {
