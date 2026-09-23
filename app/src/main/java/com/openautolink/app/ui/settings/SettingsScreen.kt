@@ -2843,7 +2843,7 @@ private fun DiagnosticsSettingsTab(
                     "Consent: ${if (contributionStatus.consentValid) "valid" else contributionStatus.consentInvalidReason}; " +
                         "retained=${contributionStatus.retainedCount}; last upload=${contributionStatus.lastUploadOutcome}; " +
                         "evicted=${contributionStatus.evictedCount}; quarantined=${contributionStatus.quarantinedCount}; " +
-                        "delete=${contributionStatus.lastDeleteResult}",
+                        "upload stalled=${contributionStatus.uploadStalled}; delete=${contributionStatus.lastDeleteResult}",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.testTag("evContributionStatus"),
                 )

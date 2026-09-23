@@ -23,6 +23,7 @@ class EvContributionConsentContractTest {
         assertTrue(screen.contains("evictedCount"))
         assertTrue(screen.contains("quarantinedCount"))
         assertTrue(screen.contains("lastDeleteResult"))
+        assertTrue(screen.contains("uploadStalled"))
         assertTrue(screen.contains("never the mutable device label"))
         assertFalse(screen.substringAfter("Automatic compact EV contribution").substringBefore("Log Upload (maintainer)").contains("logUploadEnabled"))
     }

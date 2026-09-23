@@ -2,6 +2,9 @@ package com.openautolink.app.diagnostics
 
 import com.openautolink.app.transport.ControlMessage
 import com.openautolink.app.transport.VehiclePropertyObservation
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
@@ -439,6 +442,143 @@ class EvContributionHardeningTest {
         gate.releaseUpload(replacementLease!!)
         assertFalse(ownership.finish("replacement"))
         assertFalse(ownership.finish("replacement"))
+    }
+
+    @Test fun `unquiescent upload is orphaned after bounded wait and destructive deletion continues`() = runBlocking {
+        val root = dir()
+        val q = EvContributionQueue(root, 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val gate = EvContributionLifecycleGate()
+        val lease = gate.admitUpload { true }!!
+        val ownership = EvUploadJobOwnership<String>()
+        assertTrue(ownership.tryInstall("stuck"))
+        val deletion = gate.beginDestructiveOperation()
+        assertTrue(q.beginDeletion())
+        var cancelled = false
+
+        val result = EvUploadQuiescence.awaitExactOrOrphan(
+            ownership = ownership,
+            exact = ownership.current(),
+            timeoutMs = 25,
+            cancelExact = { cancelled = it == "stuck" },
+            awaitExact = { _, timeout -> assertEquals(25, timeout); false },
+        )
+        val deleted = gate.exclusive { q.deleteAllArtifacts() }
+        assertTrue(q.completeDeletion(deleted))
+        gate.releaseUpload(lease)
+        gate.finishDestructiveOperation(deletion, resumeAdmissions = result.quiesced)
+
+        assertTrue(cancelled)
+        assertFalse(result.quiesced)
+        assertTrue(result.orphaned)
+        assertTrue(ownership.isOrphaned())
+        assertEquals(EvContributionQueue.StorageUsage(0, 0), q.storageUsage())
+        assertFalse(q.isDeletionBlocked())
+        assertNull(gate.admitCapture { true })
+        assertNull(gate.admitUpload { true })
+        assertFalse(ownership.tryInstall("replacement"))
+        Unit
+    }
+
+    @Test fun `orphan valid ACK cannot mutate deleted queue or recreate artifacts`() = runBlocking {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val gate = EvContributionLifecycleGate()
+        val lease = gate.admitUpload { true }!!
+        val ownership = EvUploadJobOwnership<String>()
+        ownership.tryInstall("old")
+        val pending = q.pending().single()
+        val deletion = gate.beginDestructiveOperation()
+        q.beginDeletion()
+        EvUploadQuiescence.awaitExactOrOrphan(ownership, "old", 1, {}, { _, _ -> false })
+        val deleted = q.deleteAllArtifacts()
+        assertTrue(q.completeDeletion(deleted))
+
+        val staleAckMutation = gate.withCurrent(lease) { q.markAccepted(pending) }
+        assertNull(staleAckMutation)
+        assertEquals(EvContributionQueue.StorageUsage(0, 0), q.storageUsage())
+        assertEquals(0, q.counters().accepted)
+        assertEquals(0, q.counters().quarantined)
+        assertTrue(q.pending().isEmpty())
+        gate.finishDestructiveOperation(deletion, resumeAdmissions = false)
+        Unit
+    }
+
+    @Test fun `reconsent stays closed until exact orphan exits then ownership can resume`() = runBlocking {
+        val gate = EvContributionLifecycleGate()
+        val upload = gate.admitUpload { true }!!
+        val ownership = EvUploadJobOwnership<String>()
+        ownership.tryInstall("old")
+        val revoke = gate.beginDestructiveOperation()
+        EvUploadQuiescence.awaitExactOrOrphan(ownership, "old", 1, {}, { _, _ -> false })
+        gate.releaseUpload(upload)
+        gate.finishDestructiveOperation(revoke, resumeAdmissions = false)
+
+        val reconsent = gate.beginDestructiveOperation()
+        gate.finishDestructiveOperation(reconsent, resumeAdmissions = !ownership.isOrphaned())
+        assertNull(gate.admitCapture { true })
+        assertFalse(ownership.tryInstall("replacement"))
+
+        val completion = ownership.finishDetailed("old")
+        assertTrue(completion.finished)
+        assertTrue(completion.wasOrphaned)
+        val recovery = gate.beginDestructiveOperation()
+        assertTrue(gate.finishDestructiveOperation(recovery, resumeAdmissions = true))
+        assertNotNull(gate.admitCapture { true })
+        assertTrue(ownership.tryInstall("replacement"))
+        Unit
+    }
+
+    @Test fun `concurrent destructive operations remain serialized in one bounded orphan batch`() = runBlocking {
+        val gate = EvContributionLifecycleGate()
+        val ownership = EvUploadJobOwnership<String>()
+        ownership.tryInstall("stuck")
+        val revoke = gate.beginDestructiveOperation()
+        val manual = gate.beginDestructiveOperation()
+        val first = EvUploadQuiescence.awaitExactOrOrphan(ownership, "stuck", 1, {}, { _, _ -> false })
+        val second = EvUploadQuiescence.awaitExactOrOrphan(ownership, "stuck", 1, {}, { _, _ -> false })
+        assertTrue(first.orphaned)
+        assertTrue(second.orphaned)
+        assertFalse(gate.finishDestructiveOperation(revoke, resumeAdmissions = false))
+        assertTrue(gate.finishDestructiveOperation(manual, resumeAdmissions = false))
+        assertNull(gate.admitUpload { true })
+        Unit
+    }
+
+    @Test fun `normal cancellation waits for exact worker and does not orphan`() = runBlocking {
+        val ownership = EvUploadJobOwnership<String>()
+        ownership.tryInstall("worker")
+        var cancelled = false
+        val result = EvUploadQuiescence.awaitExactOrOrphan(
+            ownership, "worker", 100,
+            cancelExact = { cancelled = true },
+            awaitExact = { exact, _ -> ownership.finish(exact); true },
+        )
+        assertTrue(cancelled)
+        assertTrue(result.quiesced)
+        assertFalse(result.orphaned)
+        assertFalse(ownership.isOrphaned())
+        assertNull(ownership.current())
+        Unit
+    }
+
+    @Test fun `destructive lane serializes callers without holding its monitor across suspension`() = runBlocking {
+        val lane = EvDestructiveLane()
+        val first = lane.enqueue()
+        val second = lane.enqueue()
+        first.awaitTurn()
+        val waiting = async { second.awaitTurn(); true }
+        yield()
+        assertFalse(waiting.isCompleted)
+        // Enqueue remains callable while the first owner is suspended, proving
+        // no lane monitor is held across awaitTurn or destructive worker waits.
+        val third = lane.enqueue()
+        first.finish()
+        assertTrue(waiting.await())
+        second.finish()
+        third.awaitTurn()
+        third.finish()
+        Unit
     }
 
     @Test fun `validated default network replacement ignores stale loss`() {

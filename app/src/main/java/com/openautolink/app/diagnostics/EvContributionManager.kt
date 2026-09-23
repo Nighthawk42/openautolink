@@ -1,6 +1,7 @@
 package com.openautolink.app.diagnostics
 
 import com.openautolink.app.transport.ControlMessage
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -191,7 +192,10 @@ class EvContributionLifecycleGate {
 
 /** Exact worker ownership plus a completion-owned handoff for triggers rejected while owned. */
 class EvUploadJobOwnership<T : Any> {
+    data class Completion(val finished: Boolean, val drainPending: Boolean, val wasOrphaned: Boolean)
+
     private val active = AtomicReference<T?>()
+    private val orphaned = AtomicReference<T?>()
     private val drainPending = AtomicBoolean(false)
 
     @Synchronized fun tryInstall(owner: T): Boolean = active.compareAndSet(null, owner)
@@ -200,11 +204,65 @@ class EvUploadJobOwnership<T : Any> {
         drainPending.set(true)
         return true
     }
-    @Synchronized fun finish(owner: T): Boolean {
-        if (!active.compareAndSet(owner, null)) return false
-        return drainPending.getAndSet(false)
+    @Synchronized fun markOrphaned(owner: T): Boolean {
+        if (active.get() !== owner) return false
+        val current = orphaned.get()
+        return current === owner || (current == null && orphaned.compareAndSet(null, owner))
     }
+    @Synchronized fun isOrphaned(owner: T? = orphaned.get()): Boolean =
+        owner != null && active.get() === owner && orphaned.get() === owner
+
+    @Synchronized fun finishDetailed(owner: T): Completion {
+        if (!active.compareAndSet(owner, null)) return Completion(false, false, false)
+        val wasOrphaned = orphaned.compareAndSet(owner, null)
+        return Completion(true, drainPending.getAndSet(false), wasOrphaned)
+    }
+    @Synchronized fun finish(owner: T): Boolean = finishDetailed(owner).drainPending
     fun current(): T? = active.get()
+}
+
+/** Bounded exact-owner wait used after destructive admission has already been fenced. */
+object EvUploadQuiescence {
+    data class Result(val quiesced: Boolean, val orphaned: Boolean)
+
+    suspend fun <T : Any> awaitExactOrOrphan(
+        ownership: EvUploadJobOwnership<T>,
+        exact: T?,
+        timeoutMs: Long,
+        cancelExact: (T) -> Unit,
+        awaitExact: suspend (T, timeoutMs: Long) -> Boolean,
+    ): Result {
+        require(timeoutMs > 0)
+        if (exact == null) return Result(quiesced = true, orphaned = false)
+        cancelExact(exact)
+        if (ownership.isOrphaned(exact)) return Result(quiesced = false, orphaned = true)
+        if (awaitExact(exact, timeoutMs) && ownership.current() !== exact) {
+            return Result(quiesced = true, orphaned = false)
+        }
+        if (ownership.markOrphaned(exact)) return Result(quiesced = false, orphaned = true)
+        return Result(quiesced = ownership.current() !== exact, orphaned = false)
+    }
+}
+
+/** FIFO destructive ownership; its synchronized section never spans suspension or I/O. */
+class EvDestructiveLane {
+    class Turn internal constructor(
+        private val predecessor: CompletableDeferred<Unit>,
+        private val completion: CompletableDeferred<Unit>,
+    ) {
+        suspend fun awaitTurn() = predecessor.await()
+        fun finish(): Boolean = completion.complete(Unit)
+    }
+
+    private var tail = CompletableDeferred(Unit)
+
+    @Synchronized
+    fun enqueue(): Turn {
+        val predecessor = tail
+        val completion = CompletableDeferred<Unit>()
+        tail = completion
+        return Turn(predecessor, completion)
+    }
 }
 
 class ValidatedDefaultNetworkTracker<T : Any> {
