@@ -272,13 +272,13 @@ object EvLazyUploadStartup {
             }
         }
         cleanup = EvUploadOwnerCleanup(job, ownership, releaseLease, onOwnedCompletion)
-        job.invokeOnCompletion { cleanup.complete() }
 
         if (!ownership.tryInstall(job)) {
             cleanup.complete()
             job.cancel()
             return null
         }
+        job.invokeOnCompletion { cleanup.complete() }
         try {
             afterOwnerInstalled(job)
             job.start()

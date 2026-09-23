@@ -3,6 +3,7 @@ package com.openautolink.app.diagnostics
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
@@ -16,6 +17,47 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 class EvLazyUploadStartupTest {
+    @Test fun `already cancelled scope cannot strand completed owner and healthy startup follows`() = runBlocking {
+        val ownership = EvUploadJobOwnership<Job>()
+        val lifecycle = EvContributionLifecycleGate()
+        val cancelledLease = lifecycle.admitUpload { true }!!
+        val cancelledParent = SupervisorJob().apply { cancel() }
+        val releases = AtomicInteger()
+        var cancelledBodyRuns = 0
+
+        val cancelled = EvLazyUploadStartup.launch(
+            scope = CoroutineScope(cancelledParent + Dispatchers.Default),
+            ownership = ownership,
+            releaseLease = {
+                releases.incrementAndGet()
+                lifecycle.releaseUpload(cancelledLease)
+            },
+        ) { cancelledBodyRuns++ }
+        cancelled!!.join()
+
+        assertEquals(0, cancelledBodyRuns)
+        assertEquals(1, releases.get())
+        assertNull(ownership.current())
+        assertFalse(ownership.isOrphaned())
+
+        var healthyBodyRuns = 0
+        val healthyLease = lifecycle.admitUpload { true }!!
+        val healthy = EvLazyUploadStartup.launch(
+            scope = this,
+            ownership = ownership,
+            releaseLease = {
+                releases.incrementAndGet()
+                lifecycle.releaseUpload(healthyLease)
+            },
+        ) { healthyBodyRuns++ }
+        healthy!!.join()
+
+        assertEquals(1, healthyBodyRuns)
+        assertEquals(2, releases.get())
+        assertNull(ownership.current())
+        assertFalse(ownership.isOrphaned())
+    }
+
     @Test fun `destructive quiescence at installed barrier cleans prestart owner and lease`() = runBlocking {
         val queue = EvContributionQueue(Files.createTempDirectory("ev-prestart-delete").toFile())
         queue.append("drive", 1, """{"schema":2,"type":"vehicle","elapsedBucketS":0,"vehicleClass":"0123456789abcdef"}""", "owner")
