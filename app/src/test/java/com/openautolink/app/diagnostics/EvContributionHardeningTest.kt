@@ -124,11 +124,11 @@ class EvContributionHardeningTest {
     @Test fun `stale blocked response is disconnected and cannot mutate queue`() {
         val q = EvContributionQueue(dir(), 100_000, 8)
         q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
-        val entered = CountDownLatch(1); val release = CountDownLatch(1); val disconnected = AtomicBoolean(false)
+        val entered = CountDownLatch(1); val release = CountDownLatch(1); val disconnected = CountDownLatch(1)
         val connection = object : HttpURLConnection(URL("https://logs.example/upload")) {
             override fun connect() = Unit
             override fun usingProxy() = false
-            override fun disconnect() { disconnected.set(true); release.countDown() }
+            override fun disconnect() { disconnected.countDown(); release.countDown() }
             override fun getOutputStream() = java.io.ByteArrayOutputStream()
             override fun getResponseCode(): Int { entered.countDown(); release.await(5, TimeUnit.SECONDS); return 200 }
             override fun getInputStream() = "{\"ok\":true,\"sha256\":\"${q.pending().single().sha256}\"}".byteInputStream()
@@ -144,7 +144,7 @@ class EvContributionHardeningTest {
         assertTrue(entered.await(5, TimeUnit.SECONDS))
         fence.invalidate(); transport.cancel(); worker.join(5_000)
 
-        assertTrue(disconnected.get())
+        assertTrue(disconnected.await(1, TimeUnit.SECONDS))
         assertEquals(EvContributionUploader.Outcome.CANCELLED, outcome)
         assertEquals(1, q.pending().size)
         assertEquals(0, q.pending().single().attempts)
@@ -670,10 +670,11 @@ class EvContributionHardeningTest {
         val q = EvContributionQueue(dir(), 100_000, 8)
         q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
         val closed = AtomicBoolean(false)
+        val disconnectCalled = CountDownLatch(1)
         val trickle = object : HttpURLConnection(URL("https://logs.example/upload")) {
             override fun connect() = Unit
             override fun usingProxy() = false
-            override fun disconnect() { closed.set(true) }
+            override fun disconnect() { closed.set(true); disconnectCalled.countDown() }
             override fun getOutputStream() = java.io.ByteArrayOutputStream()
             override fun getResponseCode() = 200
             override fun getInputStream() = object : java.io.InputStream() {
@@ -694,6 +695,7 @@ class EvContributionHardeningTest {
             ).send("https://logs.example/upload", "token", "ev-class-test", q.pending().single().file)
         }
         assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 2_000)
+        assertTrue(disconnectCalled.await(1, TimeUnit.SECONDS))
         assertTrue(closed.get())
     }
 
@@ -866,11 +868,12 @@ class EvContributionHardeningTest {
         val q = EvContributionQueue(dir(), 100_000, 8)
         q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
         val configuring = CountDownLatch(1)
+        val disconnectCalled = CountDownLatch(1)
         val disconnected = AtomicBoolean(false)
         val connection = object : HttpURLConnection(URL("https://logs.example/upload")) {
             override fun connect() = Unit
             override fun usingProxy() = false
-            override fun disconnect() { disconnected.set(true) }
+            override fun disconnect() { disconnected.set(true); disconnectCalled.countDown() }
             override fun setRequestProperty(key: String?, value: String?) {
                 configuring.countDown()
                 while (!disconnected.get()) Thread.sleep(5)
@@ -889,7 +892,7 @@ class EvContributionHardeningTest {
         } }
         assertTrue(configuring.await(1, TimeUnit.SECONDS))
         worker.join(2_000)
-        assertTrue(disconnected.get())
+        assertTrue(disconnectCalled.await(1, TimeUnit.SECONDS))
         assertFalse(worker.isAlive)
     }
 
@@ -946,6 +949,100 @@ class EvContributionHardeningTest {
         assertFalse(replacement.isAlive)
         assertTrue(bDisconnectCalled.await(1, TimeUnit.SECONDS))
         assertTrue(bDisconnected.get())
+    }
+
+    @Test fun `authorized stale deadline cannot interrupt replacement on reused worker`() {
+        val q = EvContributionQueue(dir(), 100_000, 8)
+        q.append("drive", 1, vehicleLine(), "owner"); q.close("drive", 2)
+        val deadlines = mutableListOf<() -> Unit>()
+        val aResponseEntered = CountDownLatch(1)
+        val cancellationAuthorized = CountDownLatch(1)
+        val releaseStaleCancellation = CountDownLatch(1)
+        val bEntered = CountDownLatch(1)
+        val releaseB = CountDownLatch(1)
+        val bInterrupted = AtomicBoolean(false)
+        val aDisconnects = AtomicInteger()
+        val bDisconnects = AtomicInteger()
+        val a = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() { aDisconnects.incrementAndGet() }
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode(): Int {
+                aResponseEntered.countDown()
+                assertTrue(cancellationAuthorized.await(5, TimeUnit.SECONDS))
+                return 200
+            }
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        val b = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() { bDisconnects.incrementAndGet(); releaseB.countDown() }
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode(): Int {
+                bEntered.countDown()
+                try {
+                    assertTrue(releaseB.await(5, TimeUnit.SECONDS))
+                } catch (interrupted: InterruptedException) {
+                    bInterrupted.set(true)
+                    throw java.io.InterruptedIOException("replacement interrupted").apply { initCause(interrupted) }
+                }
+                return 200
+            }
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        val c = object : HttpURLConnection(URL("https://logs.example/upload")) {
+            override fun connect() = Unit
+            override fun usingProxy() = false
+            override fun disconnect() = Unit
+            override fun getOutputStream() = java.io.ByteArrayOutputStream()
+            override fun getResponseCode() = 200
+            override fun getInputStream() = "{}".byteInputStream()
+        }
+        var opens = 0
+        val transport = EvContributionHttpTransport(
+            openConnection = { when (opens++) { 0 -> a; 1 -> b; else -> c } },
+            scheduleDeadline = { _, task ->
+                synchronized(deadlines) { deadlines += task }
+                EvContributionDeadline.Cancellable { }
+            },
+            requestCancellation = { connection ->
+                assertTrue("stale callback must remain bound to A", connection === a)
+                cancellationAuthorized.countDown()
+                assertTrue(releaseStaleCancellation.await(5, TimeUnit.SECONDS))
+                connection.disconnect()
+            },
+        )
+        var bResponse: EvContributionUploader.Response? = null
+        val worker = thread {
+            runCatching { transport.send(
+                "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+            ) }
+            bResponse = runCatching { transport.send(
+                "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+            ) }.getOrNull()
+        }
+        assertTrue(aResponseEntered.await(1, TimeUnit.SECONDS))
+        val staleDeadline = synchronized(deadlines) { deadlines.first() }
+        val callback = thread { staleDeadline() }
+        assertTrue(cancellationAuthorized.await(1, TimeUnit.SECONDS))
+        assertTrue("same worker must start B after A clears", bEntered.await(1, TimeUnit.SECONDS))
+
+        releaseStaleCancellation.countDown()
+        callback.join(1_000)
+        assertFalse(callback.isAlive)
+        releaseB.countDown()
+        worker.join(2_000)
+
+        assertFalse(worker.isAlive)
+        assertFalse("A deadline must not interrupt B", bInterrupted.get())
+        assertEquals(200, bResponse?.statusCode)
+        assertEquals(1, aDisconnects.get())
+        assertEquals("A cancellation must not disconnect B", 0, bDisconnects.get())
+        assertEquals(200, transport.send(
+            "https://logs.example/upload", "token", "ev-class-test", q.pending().single().file,
+        ).statusCode)
     }
 
     @Test fun `completed fixed length body never invokes hostile output close`() {

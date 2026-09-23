@@ -578,29 +578,37 @@ internal class EvContributionHttpTransport(
         val owner: Thread,
         private val requestCancellation: (HttpURLConnection) -> Unit,
     ) {
+        data class Cancellation(private val attempt: Attempt, private val bound: HttpURLConnection?) {
+            fun requestTeardown() = attempt.requestBoundCancellation(bound)
+        }
+
         val connection = AtomicReference<HttpURLConnection?>()
         val body = AtomicReference<java.io.OutputStream?>()
         val response = AtomicReference<InputStream?>()
         val cancelled = AtomicBoolean(false)
         private val cancellationRequested = AtomicBoolean(false)
 
-        private fun requestBoundCancellation() {
-            val bound = connection.get() ?: return
+        private fun requestBoundCancellation(bound: HttpURLConnection? = connection.get()) {
+            bound ?: return
             if (cancellationRequested.compareAndSet(false, true)) requestCancellation(bound)
         }
 
         fun bind(connection: HttpURLConnection) {
             check(this.connection.compareAndSet(null, connection)) { "attempt connection already bound" }
             if (cancelled.get()) {
-                requestBoundCancellation()
+                requestBoundCancellation(connection)
                 throw InterruptedIOException("upload cancelled during connection creation")
             }
         }
 
-        fun cancel() {
-            if (!cancelled.compareAndSet(false, true)) return
-            requestBoundCancellation()
+        /** Called only while the transport ownership lock proves this exact attempt is active. */
+        fun authorizeCancellation(): Cancellation? {
+            if (!cancelled.compareAndSet(false, true)) return null
+            val bound = connection.get()
+            // Interrupt while ownership is fenced. The owner cannot clear this attempt and
+            // register a replacement on the same Thread until after this interrupt is sent.
             owner.interrupt()
+            return Cancellation(this, bound)
         }
 
         fun cleanup() {
@@ -613,11 +621,21 @@ internal class EvContributionHttpTransport(
         }
     }
 
-    private val activeAttempt = AtomicReference<Attempt?>()
+    private val ownershipLock = Any()
+    private var activeAttempt: Attempt? = null
 
-    fun cancel() {
-        activeAttempt.get()?.cancel()
+    private fun cancelAttempt(expected: Attempt? = null) {
+        val cancellation = synchronized(ownershipLock) {
+            val active = activeAttempt ?: return@synchronized null
+            if (expected != null && active !== expected) return@synchronized null
+            active.authorizeCancellation()
+        }
+        // Teardown may be hostile. The action is captured from the exact attempt
+        // under the ownership fence, then dispatched after releasing that fence.
+        cancellation?.requestTeardown()
     }
+
+    fun cancel() = cancelAttempt()
 
     fun send(
         url: String,
@@ -630,7 +648,10 @@ internal class EvContributionHttpTransport(
         require(attemptTimeoutMs > 0)
         val deadline = monotonicNow.asLong + attemptTimeoutMs
         val attempt = Attempt(Thread.currentThread(), requestCancellation)
-        check(activeAttempt.compareAndSet(null, attempt)) { "transport already active" }
+        synchronized(ownershipLock) {
+            check(activeAttempt == null) { "transport already active" }
+            activeAttempt = attempt
+        }
 
         fun checkDeadline() {
             if (attempt.cancelled.get()) throw InterruptedIOException("EV upload attempt cancelled")
@@ -643,7 +664,7 @@ internal class EvContributionHttpTransport(
         }
 
         val deadlineTask = scheduleDeadline((deadline - monotonicNow.asLong).coerceAtLeast(0L)) {
-            if (activeAttempt.get() === attempt) attempt.cancel()
+            cancelAttempt(attempt)
         }
         return try {
             checkDeadline()
@@ -728,7 +749,9 @@ internal class EvContributionHttpTransport(
         } finally {
             deadlineTask.cancel()
             attempt.cleanup()
-            activeAttempt.compareAndSet(attempt, null)
+            synchronized(ownershipLock) {
+                if (activeAttempt === attempt) activeAttempt = null
+            }
             // A watchdog interrupt is attempt-owned; do not leak it into a later
             // sequential attempt on the same worker thread.
             Thread.interrupted()
