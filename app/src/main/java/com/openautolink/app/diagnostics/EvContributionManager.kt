@@ -2,8 +2,12 @@ package com.openautolink.app.diagnostics
 
 import com.openautolink.app.transport.ControlMessage
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -223,6 +227,70 @@ class EvUploadJobOwnership<T : Any> {
     fun current(): T? = active.get()
 }
 
+/** Idempotent cleanup shared by the worker body and Job completion callback. */
+class EvUploadOwnerCleanup<T : Any>(
+    private val owner: T,
+    private val ownership: EvUploadJobOwnership<T>,
+    private val releaseLease: () -> Unit,
+    private val onOwnedCompletion: (EvUploadJobOwnership.Completion) -> Unit = {},
+) {
+    private val completed = AtomicBoolean(false)
+
+    fun complete(): EvUploadJobOwnership.Completion {
+        if (!completed.compareAndSet(false, true)) {
+            return EvUploadJobOwnership.Completion(false, false, false)
+        }
+        var releaseFailure: Throwable? = null
+        try {
+            releaseLease()
+        } catch (failure: Throwable) {
+            releaseFailure = failure
+        }
+        val completion = ownership.finishDetailed(owner)
+        if (completion.finished) onOwnedCompletion(completion)
+        releaseFailure?.let { throw it }
+        return completion
+    }
+}
+
+/** Installs exact ownership before starting a lazy upload and owns every cleanup path. */
+object EvLazyUploadStartup {
+    fun launch(
+        scope: CoroutineScope,
+        ownership: EvUploadJobOwnership<Job>,
+        releaseLease: () -> Unit,
+        afterOwnerInstalled: (Job) -> Unit = {},
+        onOwnedCompletion: (EvUploadJobOwnership.Completion) -> Unit = {},
+        body: suspend CoroutineScope.() -> Unit,
+    ): Job? {
+        lateinit var cleanup: EvUploadOwnerCleanup<Job>
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            try {
+                body()
+            } finally {
+                cleanup.complete()
+            }
+        }
+        cleanup = EvUploadOwnerCleanup(job, ownership, releaseLease, onOwnedCompletion)
+        job.invokeOnCompletion { cleanup.complete() }
+
+        if (!ownership.tryInstall(job)) {
+            cleanup.complete()
+            job.cancel()
+            return null
+        }
+        try {
+            afterOwnerInstalled(job)
+            job.start()
+        } catch (failure: Throwable) {
+            job.cancel()
+            cleanup.complete()
+            throw failure
+        }
+        return job
+    }
+}
+
 /** Bounded exact-owner wait used after destructive admission has already been fenced. */
 object EvUploadQuiescence {
     data class Result(val quiesced: Boolean, val orphaned: Boolean)
@@ -237,6 +305,7 @@ object EvUploadQuiescence {
         require(timeoutMs > 0)
         if (exact == null) return Result(quiesced = true, orphaned = false)
         cancelExact(exact)
+        if (ownership.current() !== exact) return Result(quiesced = true, orphaned = false)
         if (ownership.isOrphaned(exact)) return Result(quiesced = false, orphaned = true)
         if (awaitExact(exact, timeoutMs) && ownership.current() !== exact) {
             return Result(quiesced = true, orphaned = false)

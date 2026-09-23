@@ -10,7 +10,6 @@ import com.openautolink.app.navigation.VehicleEnergyForecast
 import com.openautolink.app.session.SessionState
 import com.openautolink.app.transport.ControlMessage
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -58,6 +57,7 @@ object EvContributionService {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeTransport = AtomicReference<EvContributionHttpTransport?>()
     private val activeUploadJob = EvUploadJobOwnership<Job>()
+    @Volatile internal var afterUploadOwnerInstalled: ((Job) -> Unit)? = null
     private val destructiveLane = EvDestructiveLane()
     private val reevaluation = EarliestOneShotDeadline(SystemClock::elapsedRealtime) { delayMs, task ->
         val job = scope.launch { delay(delayMs); task() }
@@ -390,8 +390,19 @@ object EvContributionService {
         val url = uploadUrl
         val secret = token
         val namespace = binding.tokenFingerprint
-        val job = scope.launch(start = CoroutineStart.LAZY) {
-            val self = kotlin.coroutines.coroutineContext[Job]
+        val job = EvLazyUploadStartup.launch(
+            scope = scope,
+            ownership = activeUploadJob,
+            releaseLease = { lifecycle.releaseUpload(uploadLease) },
+            afterOwnerInstalled = { installed -> afterUploadOwnerInstalled?.invoke(installed) },
+            onOwnedCompletion = { completion ->
+                if (completion.wasOrphaned) {
+                    recoverAfterOrphanExit()
+                } else if (completion.drainPending) {
+                    scope.launch { attemptNaturalDrain("worker-finished-pending") }
+                }
+            },
+        ) {
             val transport = EvContributionHttpTransport()
             try {
                 if (!lifecycle.isCurrent(uploadLease)) return@launch
@@ -451,26 +462,15 @@ object EvContributionService {
                 }
             } finally {
                 activeTransport.compareAndSet(transport, null)
-                lifecycle.releaseUpload(uploadLease)
                 publishStatus(q)
-                if (self != null) {
-                    val completion = activeUploadJob.finishDetailed(self)
-                    if (completion.wasOrphaned) {
-                        recoverAfterOrphanExit()
-                    } else if (completion.drainPending) {
-                        scope.launch { attemptNaturalDrain("worker-finished-pending") }
-                    }
-                }
             }
         }
-        if (!activeUploadJob.tryInstall(job)) {
-            lifecycle.releaseUpload(uploadLease)
+        if (job == null) {
             if (!activeUploadJob.markDrainPending()) {
                 scope.launch { attemptNaturalDrain("worker-install-race") }
             }
             return
         }
-        job.start()
     }
 
     private fun scheduleReevaluation(delayMs: Long, trigger: String) {
