@@ -2,8 +2,14 @@ package com.openautolink.app.diagnostics
 
 import com.openautolink.app.transport.ControlMessage
 import com.openautolink.app.transport.VehiclePropertyObservation
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import org.junit.Assert.*
 import org.junit.Test
@@ -562,23 +568,125 @@ class EvContributionHardeningTest {
         Unit
     }
 
-    @Test fun `destructive lane serializes callers without holding its monitor across suspension`() = runBlocking {
+    @Test fun `cancelled queued destructive turn bridges to its predecessor without running its body`() = runBlocking {
         val lane = EvDestructiveLane()
-        val first = lane.enqueue()
-        val second = lane.enqueue()
-        first.awaitTurn()
-        val waiting = async { second.awaitTurn(); true }
+        val releaseFirst = CompletableDeferred<Unit>()
+        val firstAcquired = CompletableDeferred<Unit>()
+        val entries = mutableListOf<String>()
+        val first = launch {
+            lane.withTurn {
+                entries += "A"
+                firstAcquired.complete(Unit)
+                releaseFirst.await()
+            }
+        }
+        firstAcquired.await()
+
+        var cancelledBodyRan = false
+        val second = launch(start = CoroutineStart.UNDISPATCHED) {
+            lane.withTurn {
+                cancelledBodyRan = true
+                entries += "B"
+            }
+        }
+        second.cancelAndJoin()
+
+        val third = async(start = CoroutineStart.UNDISPATCHED) {
+            lane.withTurn { entries += "C" }
+        }
         yield()
-        assertFalse(waiting.isCompleted)
-        // Enqueue remains callable while the first owner is suspended, proving
-        // no lane monitor is held across awaitTurn or destructive worker waits.
-        val third = lane.enqueue()
-        first.finish()
-        assertTrue(waiting.await())
-        second.finish()
-        third.awaitTurn()
-        third.finish()
-        Unit
+        assertFalse("C must remain behind active A", third.isCompleted)
+
+        releaseFirst.complete(Unit)
+        first.join()
+        withTimeout(1_000) { third.await() }
+        withTimeout(1_000) { lane.withTurn { entries += "D" } }
+
+        assertFalse("cancelled B must skip its destructive body", cancelledBodyRan)
+        assertEquals("each acquired turn runs exactly once", listOf("A", "C", "D"), entries)
+    }
+
+    @Test fun `cancelled queued manual delete cannot poison following consent revocation`() = runBlocking {
+        val lane = EvDestructiveLane()
+        val gate = EvContributionLifecycleGate()
+        val queue = EvContributionQueue(dir(), 100_000, 8)
+        queue.append("retained", 1, vehicleLine(), "owner")
+        queue.close("retained", 2)
+        val capture = gate.admitCapture { true }!!
+        val upload = gate.admitUpload { true }!!
+        val generationBefore = gate.snapshot()
+
+        val releaseFirst = CompletableDeferred<Unit>()
+        val firstAcquired = CompletableDeferred<Unit>()
+        val first = launch {
+            lane.withTurn {
+                firstAcquired.complete(Unit)
+                releaseFirst.await()
+            }
+        }
+        firstAcquired.await()
+
+        var manualDeleteRan = false
+        val manualDelete = launch(start = CoroutineStart.UNDISPATCHED) {
+            lane.withTurn {
+                manualDeleteRan = true
+                queue.deleteAllArtifacts()
+            }
+        }
+        manualDelete.cancelAndJoin()
+
+        val revocation = async(start = CoroutineStart.UNDISPATCHED) {
+            lane.withTurn {
+                val lease = gate.beginDestructiveOperation()
+                try {
+                    assertTrue(queue.beginDeletion())
+                    val result = gate.exclusive { queue.deleteAllArtifacts() }
+                    assertTrue(queue.completeDeletion(result))
+                } finally {
+                    gate.finishDestructiveOperation(lease, resumeAdmissions = false)
+                }
+            }
+        }
+        assertFalse("revocation must not pass active predecessor", revocation.isCompleted)
+
+        releaseFirst.complete(Unit)
+        first.join()
+        withTimeout(1_000) { revocation.await() }
+
+        assertFalse(manualDeleteRan)
+        assertFalse("revocation advances the generation fence", gate.isCurrent(generationBefore))
+        assertFalse("prior capture is fenced", gate.isCurrent(capture))
+        assertFalse("prior upload is fenced", gate.isCurrent(upload))
+        assertNull("capture remains closed after revocation", gate.admitCapture { true })
+        assertNull("upload remains closed after revocation", gate.admitUpload { true })
+        assertEquals(0, queue.storageUsage().units)
+        assertFalse(queue.isDeletionBlocked())
+    }
+
+    @Test fun `cancellation during acquired destructive operation releases exactly one turn`() = runBlocking {
+        val lane = EvDestructiveLane()
+        val entered = CompletableDeferred<Unit>()
+        var activeRuns = 0
+        var successorRuns = 0
+        val active = launch(start = CoroutineStart.UNDISPATCHED) {
+            lane.withTurn {
+                activeRuns++
+                entered.complete(Unit)
+                awaitCancellation()
+            }
+        }
+        entered.await()
+        val successor = async(start = CoroutineStart.UNDISPATCHED) {
+            lane.withTurn { successorRuns++ }
+        }
+        assertFalse(successor.isCompleted)
+
+        active.cancelAndJoin()
+        withTimeout(1_000) { successor.await() }
+        withTimeout(1_000) { lane.withTurn { successorRuns++ } }
+
+        assertEquals(1, activeRuns)
+        assertEquals(2, successorRuns)
     }
 
     @Test fun `validated default network replacement ignores stale loss`() {

@@ -2,6 +2,8 @@ package com.openautolink.app.diagnostics
 
 import com.openautolink.app.transport.ControlMessage
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -246,22 +248,38 @@ object EvUploadQuiescence {
 
 /** FIFO destructive ownership; its synchronized section never spans suspension or I/O. */
 class EvDestructiveLane {
-    class Turn internal constructor(
+    private class Turn(
         private val predecessor: CompletableDeferred<Unit>,
         private val completion: CompletableDeferred<Unit>,
     ) {
         suspend fun awaitTurn() = predecessor.await()
         fun finish(): Boolean = completion.complete(Unit)
+        fun finishAfterPredecessor() {
+            predecessor.invokeOnCompletion { completion.complete(Unit) }
+        }
     }
 
     private var tail = CompletableDeferred(Unit)
 
     @Synchronized
-    fun enqueue(): Turn {
+    private fun enqueue(): Turn {
         val predecessor = tail
         val completion = CompletableDeferred<Unit>()
         tail = completion
         return Turn(predecessor, completion)
+    }
+
+    suspend fun <T> withTurn(block: suspend () -> T): T {
+        val turn = enqueue()
+        var predecessorCompleted = false
+        try {
+            turn.awaitTurn()
+            predecessorCompleted = true
+            currentCoroutineContext().ensureActive()
+            return block()
+        } finally {
+            if (predecessorCompleted) turn.finish() else turn.finishAfterPredecessor()
+        }
     }
 }
 

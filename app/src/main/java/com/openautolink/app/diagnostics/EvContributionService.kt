@@ -133,9 +133,7 @@ object EvContributionService {
                 prefs.logUploadDeviceLabel,
             ) { enabled, encoded, url, secret, label -> ConsentConfig(enabled, encoded, url, secret, label) }
                 .collect { config ->
-                    val turn = destructiveLane.enqueue()
-                    turn.awaitTurn()
-                    try {
+                    destructiveLane.withTurn {
                         val decoded = EvContributionConsentBinding.decode(config.encoded)
                         val valid = config.enabled && decoded?.matches(config.url, config.token) == true
                         val deletionLease = lifecycle.beginDestructiveOperation {
@@ -192,7 +190,7 @@ object EvContributionService {
                         } finally {
                             if (!finished) lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = false)
                         }
-                    } finally { turn.finish() }
+                    }
                 }
         }
     }
@@ -488,9 +486,7 @@ object EvContributionService {
     }
 
     suspend fun deletePendingEvContributions(): EvContributionQueue.DeleteResult {
-        val turn = destructiveLane.enqueue()
-        turn.awaitTurn()
-        return try {
+        return destructiveLane.withTurn {
             val deletionLease = lifecycle.beginDestructiveOperation {
                 driveIdentityOwner.clear()
                 activeId = null
@@ -532,7 +528,7 @@ object EvContributionService {
             } finally {
                 if (!leaseFinished) lifecycle.finishDestructiveOperation(deletionLease, resumeAdmissions = false)
             }
-        } finally { turn.finish() }
+        }
     }
 
     private suspend fun quiesceUpload(reason: String): EvUploadQuiescence.Result {
@@ -555,10 +551,8 @@ object EvContributionService {
 
     private fun recoverAfterOrphanExit() {
         scope.launch {
-            val turn = destructiveLane.enqueue()
-            turn.awaitTurn()
-            try {
-                if (activeUploadJob.current() != null || activeUploadJob.isOrphaned()) return@launch
+            destructiveLane.withTurn {
+                if (activeUploadJob.current() != null || activeUploadJob.isOrphaned()) return@withTurn
                 orphanUploadBlocked = false
                 val q = queue
                 val currentValid = consentBinding?.matches(uploadUrl, token) == true && !authFenced
@@ -568,7 +562,7 @@ object EvContributionService {
                 _status.value = _status.value.copy(uploadStalled = false)
                 DiagnosticLog.i("ev_contribution", "orphanUploadExited resumeAdmissions=$resume")
                 if (resume) attemptNaturalDrain("orphan-exited")
-            } finally { turn.finish() }
+            }
         }
     }
 

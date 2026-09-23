@@ -1,6 +1,7 @@
 package com.openautolink.app.diagnostics
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -42,6 +43,17 @@ class EvContributionConsentContractTest {
         assertFalse(app.contains("IgnitionMonitor.start(this)"))
         assertTrue(session.contains("ProcessVehicleDataRuntime.attachSessionConsumer(::forwardVehicleData)"))
         assertFalse(session.contains("_vehicleDataForwarder?.stop()"))
+    }
+
+    @Test fun `every destructive service caller delegates acquisition and release to the lane`() {
+        val service = projectFile("app/src/main/java/com/openautolink/app/diagnostics/EvContributionService.kt").readText()
+        assertFalse(service.contains("destructiveLane.enqueue()"))
+        assertFalse(service.contains("turn.awaitTurn()"))
+        assertFalse(service.contains("turn.finish()"))
+        assertEquals(3, "destructiveLane.withTurn".toRegex().findAll(service).count())
+        assertTrue(service.substringAfter("private fun recoverAfterOrphanExit()").substringBefore("fun reportConsentInvalid").contains("destructiveLane.withTurn"))
+        assertTrue(service.substringAfter("suspend fun deletePendingEvContributions()").substringBefore("private suspend fun quiesceUpload").contains("destructiveLane.withTurn"))
+        assertTrue(service.substringAfter("private fun observeConsent(").substringBefore("private fun installPassiveNetworkObserver").contains("destructiveLane.withTurn"))
     }
 
     private fun projectFile(path: String): File {
