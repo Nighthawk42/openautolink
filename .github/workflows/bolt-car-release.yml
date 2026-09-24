@@ -307,7 +307,7 @@ jobs:
           serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
           packageName: ${{ vars.APP_ID }}
           releaseFiles: ${{ steps.verify.outputs.aab }}
-          track: ${{ inputs.track }}
+          tracks: ${{ inputs.track }}
           status: completed
           whatsNewDirectory: ${{ runner.temp }}/whatsnew
           mappingFile: ${{ steps.verify.outputs.mapping }}

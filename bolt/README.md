@@ -187,3 +187,4 @@ must be merged onto each new upstream tag, or you can unset the variable to go b
 | `APK specifies a version code that has already been used` | The tag was already uploaded. Publish its `car-<tag>` release so sync skips it |
 | `AAB signer ... does not match UPLOAD_CERT_SHA256` | The wrong keystore is in secrets. Restore it from the backup |
 | Sync `403` / `Resource not accessible` | `SYNC_TOKEN` expired or lacks a permission |
+| `The caller does not have permission` right after `Creating a new Edit` | The service account has no access to this app in Play Console. Redo step 4.2: invite the service account email under **Users and permissions**, add this app with *View app information* and *Release apps to testing tracks*, and check that the email matches `client_email` in `PLAY_SERVICE_ACCOUNT_JSON`. New grants can take up to a day to apply |
