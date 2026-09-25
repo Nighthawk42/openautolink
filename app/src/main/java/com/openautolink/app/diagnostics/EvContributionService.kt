@@ -89,6 +89,7 @@ object EvContributionService {
     private var lastTickElapsedMs = 0L
     private var lastSpeedKmh = 0f
     private var distanceM = 0.0
+    private val vehicleSampleDedup = EvVehicleSampleDedup()
 
     fun initialize(context: Context) {
         if (!initialized.compareAndSet(false, true)) return
@@ -265,7 +266,7 @@ object EvContributionService {
                     change.closeId?.let { closing -> q.close(closing, System.currentTimeMillis()) }
                 }
             } ?: return
-            if (transition.closeId != null) resetDriveContinuity()
+            if (transition.closeId != null || previousId != transition.activeId) resetDriveContinuity()
             val id = transition.activeId
             activeId = id
             activeIdentity = identity
@@ -292,10 +293,14 @@ object EvContributionService {
                 put("energyBasis", "absolute-wh"); put("estimatorRevision", "rev2")
                 put("vehicleClass", identity.pseudonymousLabel.removePrefix("ev-class-"))
             }.toString()
+            // Keep every distinct observation; repeated VHAL batches can
+            // generate identical compact rows many times within one bucket.
+            if (!vehicleSampleDedup.shouldRecord(line)) return
             runCatching {
                 checkNotNull(lifecycle.withCurrent(captureLease) {
                     q.append(id, activeStartedMs, line, binding!!.tokenFingerprint, identity.pseudonymousLabel)
                 }) { "capture generation invalidated" }
+                vehicleSampleDedup.recorded(line)
             }
                 .onFailure {
                     driveIdentityOwner.clear()
@@ -579,7 +584,10 @@ object EvContributionService {
         )
     }
 
-    private fun resetDriveContinuity() { lastTickElapsedMs = 0; lastSpeedKmh = 0f; distanceM = 0.0 }
+    private fun resetDriveContinuity() {
+        lastTickElapsedMs = 0; lastSpeedKmh = 0f; distanceM = 0.0
+        vehicleSampleDedup.reset()
+    }
     private fun EvContributionQueue.DeleteResult.display() = "files=$files bytes=$bytes failures=$failures"
     // label is intentionally never transmitted; retaining it in the observed
     // configuration ensures even a legacy label edit cancels exact in-flight I/O.
