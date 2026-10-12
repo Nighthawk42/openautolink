@@ -247,7 +247,7 @@ class ProjectionReceiver(
                                 status("carplay-enrollment stage=commit accepted=$committed")
                                 committed
                             }) else null,
-                            videoSelection = videoSelection)
+                            videoSelection = videoSelection, microphoneCapability = microphoneCapability)
                         if (peerAdmission?.claim(session, socket.inetAddress, socket.localAddress) == false) {
                             socket.close(); status("CarPlay network stage=accept-declined reason=peer-interface-scope")
                             return@synchronized

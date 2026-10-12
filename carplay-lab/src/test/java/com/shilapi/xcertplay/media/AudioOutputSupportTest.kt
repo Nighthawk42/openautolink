@@ -180,7 +180,8 @@ class AudioOutputSupportTest {
             withInputs.filter { it.containsKey("audioInputFormats") }.map { it["type"] to it["audioType"] })
         withInputs.forEach { row ->
             val input = (row["audioInputFormats"] as? Number)?.toLong() ?: 0L
-            assertEquals(0L,input and 0xffffL) // no PCM input, even if present in probed map
+            assertEquals(if (row["audioType"] == "speechRecognition") 0x40L else 0L,
+                input and 0xffffL) // only exact implemented/probed PCM24k source; no 8k/48k promotion
             assertEquals(0L,input and (row["audioOutputFormats"] as Long).inv())
         }
     }

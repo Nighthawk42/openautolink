@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.518
+
+### CarPlay audio negotiation
+- Add permission-gated, independently qualified 24 kHz mono PCM microphone input for default, phone and voice-recognition streams, alongside existing Opus support.
+- Use the negotiated capture rate, sealed RTP transmission and exact microphone retirement; reject malformed input formats and stream declarations.
+- Validate authenticated audio packet headers and payloads before allowing microphone activation.
+- Export bounded microphone format, capture and transmission diagnostics in uploaded logs.
+- Addresses a wired input-format incompatibility identified in representative iOS firmware. Actual phone audio routing, navigation-volume selection, calls and Siri still require vehicle confirmation; this release does not claim those issues resolved.
+
+### Video defaults and guidance
+- Fresh CarPlay settings use Automatic codec (H.264 plus decoder-qualified HEVC) and automatic 1440p-class detail, retaining bounded lower-detail fallbacks.
+- Preserve existing saved codec, resolution and manual-mode choices; invalid codec data falls back to H.264.
+- Recommend Automatic codec with 1440p for manual setup and clarify protocol-specific video and curved-screen guidance.
+
+### Distribution
+- Deliver the same runtime revision and version to OpenAutoLink and OpenAutoLink Test Group 2, with separate package identities and tester lists.
+- No Android companion update is required for these receiver changes.
+
 ## 0.1.517
 
 ### Display controls
