@@ -14,11 +14,12 @@ class CarPlayRecoveryIntegrationTest {
     @Test fun codecPreferenceSurvivesStorageWithoutChangingAndroidAutoCodec() {
         val restored = CarPlaySettings.decode("""{"videoCodec":"hevc","resolution":"custom","widthPixels":2400,"heightPixels":960,"fps":31}""")
         assertTrue(CarPlaySettings.encode(restored).contains("\"videoCodec\":\"hevc\""))
-        assertTrue(CarPlaySettings.encode(CarPlaySettings()).contains("\"videoCodec\":\"h264\""))
+        assertTrue(CarPlaySettings.encode(CarPlaySettings()).contains("\"videoCodec\":\"hevc\""))
         assertTrue(restored.displayRequest().preferHevc)
         assertTrue(com.openautolink.app.data.CarPlaySettingsPolicy.runtimeConfig(
             restored.copy(enabled = true), restored.displayRequest()).display.preferHevc)
-        assertFalse(CarPlaySettings().displayRequest().preferHevc)
+        assertTrue(CarPlaySettings().displayRequest().preferHevc)
+        assertFalse(CarPlaySettings(videoCodec = "h264").displayRequest().preferHevc)
         assertNull(carPlayEditError(restored))
         assertNotNull(carPlayEditError(restored.copy(videoCodec = "vp9")))
         assertEquals("h264", CarPlaySettings.decode("""{"videoCodec":"vp9"}""").videoCodec)

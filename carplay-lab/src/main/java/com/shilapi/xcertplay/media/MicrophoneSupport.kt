@@ -20,7 +20,7 @@ object MicrophoneSupport {
         val samples = rtpSamples(bits) ?: return null
         if (spf != null && (spf !is Number || spf.toDouble() != samples.toDouble())) return null
         return MicrophoneConfig(audioType, host, destination, key, bits, samples,
-            if (bits == 0x20000000L) 64000 else 96000)
+            bitrate(bits))
     }
 
     fun addInputOffers(rows: List<Map<String, Any?>>, capability: MicrophoneCapability): List<Map<String, Any?>> =
@@ -30,7 +30,16 @@ object MicrophoneSupport {
                 .fold(0L) { a, b -> a or (b and output) } else 0L
             if (mask == 0L) row else LinkedHashMap(row).apply { this["audioInputFormats"] = mask }
         }
-    val implementedBits = setOf(0x20000000L,0x40000000L)
+    // Apple AudioFormats bit 6: signed PCM16, 24 kHz, mono. No resampling or stereo claims.
+    val pcmBits = setOf(0x40L)
+    val opusBits = setOf(0x20000000L,0x40000000L)
+    val implementedBits = pcmBits + opusBits
+    fun bitrate(bits: Long): Int = when (bits) {
+        0x40L -> 0
+        0x20000000L -> 64000
+        0x40000000L -> 96000
+        else -> throw IllegalArgumentException("Unsupported microphone format")
+    }
     fun source(kind: String): MicrophoneSource? = when (kind.lowercase(Locale.ROOT)) {
         "default" -> MicrophoneSource.MIC
         "telephony" -> MicrophoneSource.VOICE_COMMUNICATION
@@ -38,14 +47,14 @@ object MicrophoneSupport {
         else -> null
     }
     fun rtpSamples(bits: Long): Int? = when (bits) {
-        0x20000000L -> 480
+        0x40L, 0x20000000L -> 480
         0x40000000L -> 960
         else -> null
     }
     /** The predicate must successfully configure/start/release the actual encoder at that bitrate. */
     fun available(permission: Boolean, encoders: List<String>, configure: (String, Int) -> Boolean): Set<Long> {
         if (!permission) return emptySet()
-        return implementedBits.filter { bit ->
+        return opusBits.filter { bit ->
             encoders.any { configure(it,if (bit == 0x20000000L) 64000 else 96000) }
         }.toSet()
     }
@@ -66,7 +75,9 @@ object MicrophoneSupport {
         }
         return (samples * frames).takeIf { frames > 0 && it <= 5760 }
     }
-    fun bits(format: AudioFormat): Long? = if (format.codec != AudioCodecKind.OPUS ||
+    fun bits(format: AudioFormat): Long? = if (format.codec == AudioCodecKind.LPCM) {
+        if (format.sampleRate == 24000 && format.rtpClockRate == 24000 && format.channels == 1) 0x40L else null
+    } else if (format.codec != AudioCodecKind.OPUS ||
         format.sampleRate != 48000 || format.channels != 1) null else when (format.rtpClockRate) {
         24000 -> 0x20000000L
         48000 -> 0x40000000L
@@ -75,7 +86,7 @@ object MicrophoneSupport {
     fun admits(format: AudioFormat, type: Int, port: Int, spf: Any?): Boolean {
         val bit = bits(format) ?: return false
         if (type != 100 || port !in 1..65535 || source(format.audioType) == null) return false
-        if (format.audioType.lowercase(Locale.ROOT) == "speechrecognition" && bit != 0x20000000L) return false
+        if (format.audioType.lowercase(Locale.ROOT) == "speechrecognition" && bit !in setOf(0x40L, 0x20000000L)) return false
         val expected = rtpSamples(bit) ?: return false
         return spf == null || (spf is Number && spf.toDouble() == expected.toDouble())
     }

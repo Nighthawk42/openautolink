@@ -41,6 +41,7 @@ class AudioStream(
     private val onDiagnostic: (String) -> Unit = {},
     private val expectedPeer: InetAddress? = null,
     private val socketBinding: com.openautolink.carplaylab.network.CarPlaySocketBinding? = null,
+    private val format: AudioFormat? = null,
 ) : Closeable {
     interface Listener {
         fun onStarted(firstSample: Int) {}
@@ -149,6 +150,13 @@ class AudioStream(
                     continue
                 }
                 val rtp = wire.copyOf(RTP_HEADER_LEN) + payload
+                // Authentication alone does not validate clear RTP flags or the codec payload.
+                // Use the sink's existing validator before first-packet capture activation.
+                if (format != null && com.shilapi.xcertplay.media.AudioOutputSupport.payload(format, rtp) == null) {
+                    listener.onPacket(wire, null, sample, IOException("invalid audio RTP or payload"))
+                    stats.processed()
+                    continue
+                }
                 val decryptedNumber = decryptedPackets.incrementAndGet()
                 if (decryptedNumber <= FIRST_PACKET_LOG_COUNT) {
                     Unit

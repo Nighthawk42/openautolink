@@ -1,0 +1,127 @@
+package com.openautolink.app.carplay
+
+import android.Manifest
+import android.graphics.SurfaceTexture
+import android.media.*
+import android.view.Surface
+import com.openautolink.carplaylab.media.*
+import com.shilapi.xcertplay.airplay.*
+import com.shilapi.xcertplay.media.*
+import org.junit.Assert.*
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.shadows.AudioDeviceInfoBuilder
+import org.robolectric.util.ReflectionHelpers
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowAudioRecord
+import java.net.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+@RunWith(RobolectricTestRunner::class)
+@org.robolectric.annotation.ConscryptMode(org.robolectric.annotation.ConscryptMode.Mode.OFF)
+@Config(sdk=[32], manifest=Config.NONE)
+class CarPlayPcmMicrophoneExportTest {
+    @Test fun actualPcmSinkCaptureReceiptsSurviveBoundedReporterAndUploadArchive() {
+        val app=RuntimeEnvironment.getApplication()
+        shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val device=AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_BUILTIN_MIC).build()
+        // OS-boundary fixture: the builder has no role setter; AudioPort source role is 1.
+        ReflectionHelpers.setField(ReflectionHelpers.getField<Any>(device,"mPort"),"mRole",1)
+        shadowOf(app.getSystemService(AudioManager::class.java)).setInputDevices(listOf(device))
+        val cap=AndroidMicrophoneSupport.probe(app)
+        val lines=java.util.concurrent.CopyOnWriteArrayList<String>()
+        val sent=CountDownLatch(1)
+        val reporter=CarPlayAudioDiagnosticReporter(1,System::nanoTime) {
+            lines.add(it); if (it.contains("microphone-datagram-sent")) sent.countDown()
+        }
+        ShadowAudioRecord.setSource(object : ShadowAudioRecord.AudioRecordSource {
+            override fun readInByteArray(b: ByteArray,o: Int,n: Int,blocking: Boolean): Int {
+                Thread.sleep(20); b.fill(0,o,o+n); return n
+            }
+        })
+        val texture=SurfaceTexture(0); val surface=Surface(texture)
+        val sink=AndroidMediaSink(app,surface,display=CarPlayDisplaySelection(CarPlayDisplayPreferences(),"avc.exact",false),onStatus=reporter::record)
+        val session=AirPlaySession(Socket(),AirPlayConfig("test","id","mac","950.7.1",AirPlayDisplayConfig(800,480)),
+            AirPlayIdentity.generate(),PairingStore(),null,object : AirPlaySessionListener {},object : AirPlayMediaHandler {})
+        val folder=java.nio.file.Files.createTempDirectory(java.nio.file.Path.of(System.getProperty("java.io.tmpdir")),"pcm-export").toFile()
+        try {
+            DatagramSocket(0,InetAddress.getLoopbackAddress()).use { receive ->
+                val mic=MicrophoneSupport.negotiate(cap,100,"telephony",0x40L,receive.localPort,480,receive.localAddress,ByteArray(32))!!
+                assertTrue(sink.supportsMicrophone(AudioOutputSupport.negotiate(0x40L,100,"telephony")!!))
+                sink.onMicrophoneStarted(MicrophoneStreamId(session,100,"telephony",1),mic)
+                assertTrue("actual send receipt omitted by sanitizer",sent.await(3,TimeUnit.SECONDS))
+                assertTrue(lines.any { it.endsWith("media stage=microphone-format type=100 audioType=telephony codec=LPCM rate=24000 channels=1 spf=480 source=VOICE_COMMUNICATION") })
+                val contents=lines.joinToString("\n",postfix="\n")
+                val log=java.io.File(folder,"oal_pcm.log").apply { writeText(contents) }
+                val plan=com.openautolink.app.diagnostics.LogUploadArchive.select(listOf(log),log.lastModified())
+                com.openautolink.app.diagnostics.LogUploadArchive.create(plan,folder).use { archive ->
+                    java.util.zip.ZipFile(archive.file).use { zip ->
+                        assertEquals(contents,zip.getInputStream(zip.getEntry(log.name)).bufferedReader().readText())
+                    }
+                }
+            }
+        } finally {
+            sink.close(); assertTrue(sink.awaitRetired(3000)); session.close()
+            ShadowAudioRecord.clearSource(); folder.deleteRecursively(); surface.release(); texture.release()
+        }
+    }
+    @Test fun stalledCaptureKeepsExactSinkRetirementPendingAndCannotSendAfterCancellation() {
+        val app=RuntimeEnvironment.getApplication()
+        shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val device=AudioDeviceInfoBuilder.newBuilder().setType(AudioDeviceInfo.TYPE_BUILTIN_MIC).build()
+        ReflectionHelpers.setField(ReflectionHelpers.getField<Any>(device,"mPort"),"mRole",1)
+        shadowOf(app.getSystemService(AudioManager::class.java)).setInputDevices(listOf(device))
+        val cap=AndroidMicrophoneSupport.probe(app)
+        val entered=CountDownLatch(1); val release=CountDownLatch(1)
+        ShadowAudioRecord.setSource(object : ShadowAudioRecord.AudioRecordSource {
+            override fun readInByteArray(b: ByteArray,o: Int,n: Int,blocking: Boolean): Int {
+                entered.countDown()
+                while (release.count > 0) { try { release.await() } catch (_: InterruptedException) {} }
+                b.fill(0,o,o+n); return n
+            }
+        })
+        val texture=SurfaceTexture(0); val surface=Surface(texture)
+        val sink=AndroidMediaSink(app,surface,display=CarPlayDisplaySelection(CarPlayDisplayPreferences(),"avc.exact",false))
+        val session=AirPlaySession(Socket(),AirPlayConfig("test","id","mac","950.7.1",AirPlayDisplayConfig(800,480)),
+            AirPlayIdentity.generate(),PairingStore(),null,object : AirPlaySessionListener {},object : AirPlayMediaHandler {})
+        try {
+            DatagramSocket(0,InetAddress.getLoopbackAddress()).use { receive ->
+                val mic=MicrophoneSupport.negotiate(cap,100,"default",0x40L,receive.localPort,480,receive.localAddress,ByteArray(32))!!
+                sink.onMicrophoneStarted(MicrophoneStreamId(session,100,"default",2),mic)
+                assertTrue(entered.await(3,TimeUnit.SECONDS))
+                // A stale stop cannot retire a newer exact stream generation.
+                sink.onMicrophoneStopped(MicrophoneStreamId(session,100,"default",1))
+                sink.close()
+                assertFalse("500ms close join is not worker retirement",sink.awaitRetired(100))
+                sink.close() // explicit retirement retry retains the same stalled owner
+                assertFalse(sink.awaitRetired(100))
+                release.countDown()
+                assertTrue(sink.awaitRetired(3000))
+                receive.soTimeout=100
+                assertTrue(runCatching { receive.receive(DatagramPacket(ByteArray(4096),4096)) }.exceptionOrNull() is SocketTimeoutException)
+            }
+        } finally {
+            release.countDown(); sink.close(); assertTrue(sink.awaitRetired(3000)); session.close()
+            ShadowAudioRecord.clearSource(); surface.release(); texture.release()
+        }
+    }
+    @Test fun microphoneSchemasRejectPrivateSuffixesAndUnsupportedSourceRateClaims() {
+        val lines=listOf(
+            "media stage=microphone-format type=100 audioType=telephony codec=LPCM rate=24000 channels=1 spf=480 source=VOICE_COMMUNICATION",
+            "media stage=microphone-started type=100; uplink audibility unverified",
+            "media stage=microphone-datagram-sent packets=1; phone receipt unverified",
+            "media stage=microphone-retirement-pending",
+            "media stage=microphone-worker-start-failed",
+            "media stage=microphone-failed type=100 errorType=SecurityException")
+        lines.forEach {
+            assertNotNull(it,CarPlayAudioDiagnostics.sanitize(1,it))
+            listOf(" key=private"," host=private","\n","\u0000").forEach { suffix -> assertNull(CarPlayAudioDiagnostics.sanitize(1,it+suffix)) }
+        }
+        assertNull(CarPlayAudioDiagnostics.sanitize(1,lines[0].replace("rate=24000","rate=16000")))
+        assertNull(CarPlayAudioDiagnostics.sanitize(1,lines[0].replace("source=VOICE_COMMUNICATION","source=private")))
+    }
+}

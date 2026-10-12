@@ -14,7 +14,7 @@ import java.security.SecureRandom
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Capture/codec/socket release share one owner; at most four pending encoded 20ms frames. */
+/** Capture/codec/socket release share one owner; at most four pending wire-ready 20ms frames. */
 internal class MicrophoneUplink(private val config: MicrophoneConfig,
     private val report: (String) -> Unit = {}) : Closeable {
     private val closed = AtomicBoolean()
@@ -47,15 +47,18 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig,
         try {
             if (closed.get() || !AndroidMicrophoneSupport.permissionGranted()) return
             if (config.formatBits !in AndroidMicrophoneSupport.capability.bits(config.audioType)) return
-            val name = AndroidMicrophoneSupport.encoderName(config.formatBits) ?: return
-            val codec = OpusEncoder(name, config.bitrate)
+            val codec = if (config.codec == com.shilapi.xcertplay.airplay.AudioCodecKind.OPUS) {
+                val name = AndroidMicrophoneSupport.encoderName(config.formatBits) ?: return
+                OpusEncoder(name, config.bitrate)
+            } else null
             encoder = codec
             if (closed.get()) return
             // The helper wires MIC, VOICE_COMMUNICATION and VOICE_RECOGNITION to actual AudioRecord sources.
             val source = checkNotNull(MicrophoneSupport.source(config.audioType))
-            val record = AndroidMicrophoneSupport.recorder(source)
+            val record = AndroidMicrophoneSupport.recorder(source, config.sampleRate)
             capture = record
-            require(record.state == AudioRecord.STATE_INITIALIZED)
+            require(record.state == AudioRecord.STATE_INITIALIZED && record.sampleRate == config.sampleRate &&
+                record.channelCount == config.channels && record.audioFormat == android.media.AudioFormat.ENCODING_PCM_16BIT)
             val udp = if (config.socketBinding == null) DatagramSocket()
                 else DatagramSocket(java.net.InetSocketAddress(config.socketBinding.local, 0))
             transport = udp; socket = udp
@@ -67,6 +70,7 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig,
             }
             if (closed.get()) return
             check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING)
+            report("media stage=microphone-format type=100 audioType=${config.audioType} codec=${config.codec} rate=${config.sampleRate} channels=${config.channels} spf=${config.rtpSamplesPerPacket} source=$source")
             report("media stage=microphone-started type=100; uplink audibility unverified")
             val pcm = ByteArray(config.frameBytes)
             // Same connection-ID re-SETUP can reuse a key: randomized counters avoid restarting nonce0.
@@ -80,7 +84,13 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig,
                 if (count == 0) { Thread.sleep(2); continue }
                 filled += count
                 if (filled != pcm.size) continue
-                codec.encode(pcm).forEach { frame ->
+                val frames = if (codec == null) {
+                    // AudioRecord PCM16 is little endian; CarPlay LPCM payloads are big endian.
+                    val body = pcm.copyOf()
+                    for (i in body.indices step 2) { val b = body[i]; body[i] = body[i+1]; body[i+1] = b }
+                    listOf(OpusEncoder.Frame(body, sent * 20000))
+                } else codec.encode(pcm)
+                frames.forEach { frame ->
                     if (!pending.offer(frame)) {
                         pending.poll(); pending.offer(frame)
                         report("media stage=microphone-queue-overflow")
