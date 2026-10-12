@@ -108,9 +108,9 @@ Select **USB** under **Android Auto connection** for normal wired use, then conn
 
 ### Temporary USB switch between phones
 
-For example, keep **Android Auto connection → Wireless** and **CarPlay connection → USB**, with **Enable iPhone projection** on. Enabling CarPlay does not disable wireless Android Auto or change its saved mode.
+For example, keep **Android Auto connection → Wireless** and **CarPlay connection → USB**. Both phone protocols are available in the same app; using CarPlay does not disable wireless Android Auto or change its saved mode.
 
-- Plug in an Android phone or enabled iPhone while projection is connected or connecting. OAL offers **Switch / Stay here** before starting USB setup or stopping the current projection.
+- Plug in an Android phone or iPhone while projection is connected or connecting. OAL offers **Switch / Stay here** before starting USB setup or stopping the current projection.
 - **Stay here** (or dismissing the prompt) leaves the current projection alone. Replug the phone to offer it again.
 - **Switch** attempts to stop the current receiver, then starts the attached phone over USB. Accept the applicable system permission/Trust prompts.
 - The selection lasts for that cable connection only. Unplugging returns OAL to its saved normal connection policy; it does not rewrite either mode. Wireless reconnection still depends on the phone and vehicle.
@@ -124,10 +124,6 @@ If text or maps look soft, try **1440p** as the recommended manual quality setti
 
 **4K (3840×2160)** is an optional higher-detail setting if your phone and head-unit decoder support it. It costs more bandwidth and processing; return to 1440p if it stutters or fails to connect. Auto does not guarantee a particular negotiated resolution, and a blurry image alone does not prove the stream is 1080p. These codec controls apply to Android Auto, not CarPlay.
 
-### Keep Android Auto call controls visible on GM
-
-In the native **Phone app → Settings**, turn **Active Call OFF** and **Privacy ON**. Leave Bluetooth **Phone calls enabled**: Android Auto controls/displays the call while the car's native HFP path carries microphone and speaker audio. See [Phone calls](docs/phone-calls.md). These settings apply to Android Auto.
-
 ## CarPlay setup
 
 Keep the vehicle parked while configuring. Disconnect the iPhone from any other OAL receiver before connecting it to the car.
@@ -135,9 +131,10 @@ Keep the vehicle parked while configuring. Disconnect the iPhone from any other 
 ### Common prerequisites
 
 1. Install a current OAL build with a valid accessory authentication identity. Maintainer Play builds provide the identity; public GitHub APKs and source builds require your own compatible files. See the [authentication/build policy](docs/carplay-private-mfi-assets.md).
-2. In **OAL → Settings → Connection → CarPlay**, check **Enable iPhone projection** if you previously disabled it. Saved choices are retained; selecting a connection mode does not change this control.
-3. Choose **USB** or **Wireless** under **CarPlay connection**, independently of Android Auto. Fresh or older records without a CarPlay mode default to USB.
-4. Apply changes with **Save & Reconnect**. Keep file logging enabled for testing and upload results, including failed attempts.
+2. Use **USB** under **OAL → Settings → Connection → CarPlay → CarPlay connection** for wired projection. Wireless remains a development option; CarPlay and Android Auto connection modes are independent.
+3. Apply any changes with **Save & Reconnect**. Keep file logging enabled for testing and upload results, including failed attempts.
+
+If you previously turned off iPhone projection, OAL retains that choice. Only in that case, turn **Enable iPhone projection** back on in the same settings page and save. There is no separate enablement step for normal setup.
 
 ### USB
 
@@ -163,6 +160,43 @@ Wireless CarPlay is still in development and is not working in the maintainer's 
 ### Authentication and source builds
 
 Maintainer Play builds include the CarPlay authentication files. Public GitHub APKs and source builds omit them and require your own compatible files. OAL is **not an Apple-certified CarPlay product**. Never publish authentication files or signing keys. See the [authentication and build policy](docs/carplay-private-mfi-assets.md) for requirements, provenance and redistribution limitations.
+
+## Adjust text, icons and UI size
+
+Configure these while parked in **OAL → Settings → Display**. Android Auto and CarPlay have separate scaling controls; changing one does not change the other. Select **Save & Reconnect** after adjusting them to apply the settings to the next projection session.
+
+### Android Auto — DPI scaling
+
+Under **Android Auto → AA Display Density (DPI)**:
+
+- Leave **Auto DPI** on for sizing based on the available projection area and the head unit's display density. It accounts for fullscreen versus system-UI-visible layouts and the negotiated video size.
+- For manual control, turn **Auto DPI** off. If **Layout Width Target** is shown, select **Off** too so it does not override the DPI slider.
+- Adjust **DPI**: **lower DPI** gives smaller text/icons and more content; **higher DPI** gives larger text/icons and less content at the same video resolution. DPI can also change Android Auto's card and panel layout.
+- With automatic video negotiation, **Layout Width Target** offers **Compact**, **Normal** and **Wide** presets to keep a consistent logical layout width across resolution tiers. This is an alternative to choosing a fixed manual DPI.
+
+### CarPlay — UI scaling
+
+Under **CarPlay → CarPlay UI scale**:
+
+- Leave **Auto sizing** on to estimate UI scale from the next session's projection area and available display measurements. If that estimate does not suit your screen, use manual sizing.
+- Turn **Auto sizing** off to unlock **Manual UI size**.
+- Move the slider **left toward Smaller UI** for smaller text/icons and more content, or **right toward Larger UI** for larger text/icons and less content.
+- The physical-width value in the help text is CarPlay calibration metadata, **not Android Auto DPI**. Use the slider's Smaller/Larger labels rather than copying an AA DPI value.
+
+**UI scale is not video resolution.** Use **Video** settings for image detail and **Fit to window** for CarPlay's standard-tier canvas fit. Use **Display → Calibrate safe controls** to move CarPlay controls away from curved screen edges; changing UI size does not replace safe-area calibration. Neither protocol's scaling control changes the vehicle's native apps or OAL's own settings UI.
+
+## Keep incoming and active calls in Android Auto or CarPlay on GM
+
+The same vehicle settings apply to **both Android Auto and Apple CarPlay**. To stop GM's native Phone app from covering the projected incoming-call and in-call controls on the center display:
+
+1. Open the vehicle's native **Phone** app.
+2. Tap the **Settings** gear.
+3. Turn **Active Call** **OFF** (“Show active call view when answering call”).
+4. Turn **Privacy** **ON** (“Only show call alerts in cluster”).
+
+Incoming-call alerts stay in the instrument cluster, and the native active-call screen no longer takes over the center display. Answer and manage calls from Android Auto or CarPlay instead.
+
+These are **Phone-app display settings**, not Bluetooth profile settings. For **Android Auto**, leave the paired phone's Bluetooth **Phone calls** profile **enabled**: the vehicle's hands-free system carries microphone and speaker audio, and disabling it can also break wireless WPP startup. See [Phone calls](docs/phone-calls.md) for Android Auto audio routing, verification and troubleshooting.
 
 ## Vehicle compatibility
 
