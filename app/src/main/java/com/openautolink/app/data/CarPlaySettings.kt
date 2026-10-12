@@ -3,6 +3,7 @@ package com.openautolink.app.data
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
 
 /** One atomic, non-secret next-session configuration. Never a connection/admission lease. */
 @Serializable
@@ -16,7 +17,7 @@ data class CarPlaySettings(
     val sharedWifiOverride: Boolean = false,
     val ssid: String = "",
     val receiverAddress: String = "",
-    val resolution: String = "720p",
+    val resolution: String = "1440p",
     val fps: Int = 30,
     /** Source-backed CarPlay UI scale, independent of Android Surface size. */
     val widthPhysicalMm: Int = 200,
@@ -32,9 +33,9 @@ data class CarPlaySettings(
     val widthPixels: Int = 1280,
     val heightPixels: Int = 720,
     /** Separate from Android Auto codec; HEVC is preferred, never forced. */
-    val videoCodec: String = "h264",
+    val videoCodec: String = "hevc",
     /** Independent of physical-size Auto; retain the manual resolution and FPS underneath. */
-    val autoResolution: Boolean = false,
+    val autoResolution: Boolean = true,
     /** Standard tiers fit the measured window by default; explicit saved false stays exact. */
     val fitToWindow: Boolean = true,
     /** Fractions of the chrome-free parent axis in 1/10000 units, never AA codec pixels. */
@@ -122,7 +123,10 @@ data class CarPlaySettings(
                         stored.resolution, stored.fps, stored.widthPhysicalMm,
                         customWidth = stored.widthPixels, customHeight = stored.heightPixels,
                     )
-                    stored.copy(connectionMode = stored.connectionMode.takeIf { it in setOf("usb", "wireless") } ?: "usb",
+                    val fields = json.parseToJsonElement(requireNotNull(record)).jsonObject
+                    stored.copy(autoResolution = if ("autoResolution" !in fields && "resolution" in fields)
+                            false else stored.autoResolution,
+                        connectionMode = stored.connectionMode.takeIf { it in setOf("usb", "wireless") } ?: "usb",
                         resolution = display.resolution.id, fps = display.fps,
                         widthPhysicalMm = display.widthPhysicalMm,
                         videoCodec = stored.videoCodec.takeIf { it in setOf("h264", "hevc") } ?: "h264")

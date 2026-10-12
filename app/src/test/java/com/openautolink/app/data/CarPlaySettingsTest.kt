@@ -29,7 +29,9 @@ class CarPlaySettingsTest {
         val preferences = preferences(store)
         val initial = preferences.carPlaySettings.first()
         assertTrue(initial.enabled)
-        assertEquals("720p", initial.resolution)
+        assertEquals("1440p", initial.resolution)
+        assertTrue(initial.autoResolution)
+        assertEquals("hevc", initial.videoCodec)
         assertEquals(30, initial.fps)
         assertFalse(initial.sharedWifiOverride)
         assertEquals("ap_br_swlan0", initial.interfaceName)
@@ -82,7 +84,7 @@ class CarPlaySettingsTest {
             val canonical = com.openautolink.carplaylab.media.CarPlayDisplayPreferences.fromStored(
                 restored.resolution, restored.fps, restored.widthPhysicalMm,
                 customWidth = restored.widthPixels, customHeight = restored.heightPixels)
-            assertEquals(restored.displayRequest(), canonical)
+            assertEquals(restored.displayRequest(), canonical.copy(preferHevc = restored.videoCodec == "hevc"))
             assertEquals(width, com.shilapi.xcertplay.airplay.AirPlayDisplaySettings.sanitizeWidthPhysicalMm(width))
             val runtime = CarPlaySettingsPolicy.runtimeConfig(restored, canonical)
             val config = com.shilapi.xcertplay.airplay.AirPlayConfig(
