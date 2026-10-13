@@ -17,7 +17,7 @@ class CarPlayWindowSettingsTest {
                 .apply { isAccessible = true }.newInstance(store)
             preferences.setSafeAreaRight(319)
             preferences.setAaResolution("1440p")
-            preferences.setCarPlaySettings(CarPlaySettings(resolution = "1440p", enabled = false))
+            preferences.setCarPlaySettings(CarPlaySettings(autoResolution = false, resolution = "1440p", enabled = false))
             val draft = com.openautolink.app.ui.settings.CarPlaySettingsDraft()
             draft.update { it.copy(fitToWindow = true, safeRight = 1100, safeTop = 150) }
             // A separate tab's saved changes must not be lost by calibration Apply.
@@ -62,8 +62,8 @@ class CarPlayWindowSettingsTest {
 
     @Test fun fitFlagNeverOverridesCustomOrGeometryNamedPreset() {
         for (saved in listOf(
-            CarPlaySettings(resolution = "custom", widthPixels = 2400, heightPixels = 960, fitToWindow = true),
-            CarPlaySettings(resolution = "1920x720", fitToWindow = true))) {
+            CarPlaySettings(autoResolution = false, resolution = "custom", widthPixels = 2400, heightPixels = 960, fitToWindow = true),
+            CarPlaySettings(autoResolution = false, resolution = "1920x720", fitToWindow = true))) {
             val selected = saved.qualifiedDisplay(viewport(2914,1134), probe)
             assertFalse(saved.usesWindowGeometry)
             assertEquals(saved.displayRequest().width, selected.width)
@@ -73,7 +73,7 @@ class CarPlayWindowSettingsTest {
 
     @Test fun selectedDetailAreaDoesNotSilentlyBecomeAutomatic1440() {
         val areas = listOf("720p", "1080p", "1440p", "4k").map { id ->
-            val selected = CarPlaySettings(resolution = id, fitToWindow = true).qualifiedDisplay(viewport(2400,960), probe)
+            val selected = CarPlaySettings(autoResolution = false, resolution = id, fitToWindow = true).qualifiedDisplay(viewport(2400,960), probe)
             assertEquals(2.5, selected.width.toDouble() / selected.height, .005)
             selected.width.toLong() * selected.height
         }
@@ -81,7 +81,7 @@ class CarPlayWindowSettingsTest {
     }
 
     @Test fun onlyOneExactQualifiedReceiptIsConsumedAfterWindowSelection() {
-        val selected = CarPlaySettings(resolution = "1440p", fitToWindow = true, videoCodec = "hevc")
+        val selected = CarPlaySettings(autoResolution = false, resolution = "1440p", fitToWindow = true, videoCodec = "hevc")
             .qualifiedDisplay(viewport(2914,1134), probe)
         assertSame(selected.qualifiedVideoSelection,
             com.openautolink.carplaylab.media.CarPlayDisplayPolicy.videoSelection(selected,
@@ -89,7 +89,7 @@ class CarPlayWindowSettingsTest {
     }
 
     @Test fun safeEdgesUseLetterboxOriginRatherThanShrinkingTouchCanvas() {
-        val selected = CarPlaySettings(resolution = "1080p", fitToWindow = false, autoScale = false, safeRight = 3000)
+        val selected = CarPlaySettings(autoResolution = false, resolution = "1080p", fitToWindow = false, autoScale = false, safeRight = 3000)
             .qualifiedDisplay(viewport(3000,1000), probe)
         assertEquals(312, selected.toAirPlayDisplay().safeArea!!.right)
         assertEquals(1920, selected.width)
@@ -100,7 +100,7 @@ class CarPlayWindowSettingsTest {
     }
 
     @Test fun alreadyChromeFreeParentHasNoSecondBarDeduction() {
-        val saved = CarPlaySettings(resolution = "custom", widthPixels = 2400, heightPixels = 960,
+        val saved = CarPlaySettings(autoResolution = false, resolution = "custom", widthPixels = 2400, heightPixels = 960,
             autoScale = false, safeRight = 1000)
         val fullscreen = saved.qualifiedDisplay(viewport(1200,480), probe)
         val barsVisible = saved.qualifiedDisplay(viewport(1200,400), probe)
@@ -120,7 +120,7 @@ class CarPlayWindowSettingsTest {
     }
 
     @Test fun serializerEmitsBackgroundOutsideSafeAreaWithFullHidCoordinates() {
-        val display = CarPlaySettings(resolution = "custom", widthPixels = 2400, heightPixels = 960,
+        val display = CarPlaySettings(autoResolution = false, resolution = "custom", widthPixels = 2400, heightPixels = 960,
             safeTop = 500, safeLeft = 500, safeRight = 1000).qualifiedDisplay(viewport(1200,480), probe)
         val config = com.shilapi.xcertplay.airplay.AirPlayConfig("synthetic", "00:11:22:33:44:55", "00:11:22:33:44:55", "950.7.1", display.toAirPlayDisplay())
         val info = com.shilapi.xcertplay.airplay.AirPlayInfoPlist.build(config, emptySet())
@@ -156,7 +156,7 @@ class CarPlayWindowSettingsTest {
 
     @Test fun failedWideGeometryFallsBackOnlyToQualifiedBaselineWithoutRepeatingFailedProbe() {
         val checked = mutableListOf<com.shilapi.xcertplay.media.VideoDecoderRequest>()
-        val selected = CarPlaySettings(resolution = "1440p", fitToWindow = true, fps = 60)
+        val selected = CarPlaySettings(autoResolution = false, resolution = "1440p", fitToWindow = true, fps = 60)
             .qualifiedDisplay(viewport(2914,1134), com.shilapi.xcertplay.media.VideoDecoderProbe {
                 checked += it
                 if (it.width == 1280 && it.height == 720 && it.fps == 30) "baseline" else null
@@ -167,7 +167,7 @@ class CarPlayWindowSettingsTest {
         assertEquals(30, selected.fps)
         assertEquals(checked.size, checked.distinct().size)
         assertThrows(IllegalStateException::class.java) {
-            CarPlaySettings(resolution = "1440p", fitToWindow = true).qualifiedDisplay(viewport(2914,1134),
+            CarPlaySettings(autoResolution = false, resolution = "1440p", fitToWindow = true).qualifiedDisplay(viewport(2914,1134),
                 com.shilapi.xcertplay.media.VideoDecoderProbe { null })
         }
     }
@@ -188,7 +188,7 @@ class CarPlayWindowSettingsTest {
     }
 
     @Test fun manualSafeEdgesReachTheExactOfferWithoutShrinkingCanvas() {
-        val settings = CarPlaySettings(resolution = "custom", widthPixels = 2400, heightPixels = 960,
+        val settings = CarPlaySettings(autoResolution = false, resolution = "custom", widthPixels = 2400, heightPixels = 960,
             autoScale = false, safeRight = 1000)
         val input = com.openautolink.carplaylab.media.CarPlayAutoScalePolicy.Input(1200,480,2400,960,200.0,200.0,200)
         val display = settings.qualifiedDisplay(input, com.shilapi.xcertplay.media.VideoDecoderProbe { "qualified" })
@@ -202,7 +202,7 @@ class CarPlayWindowSettingsTest {
     }
 
     @Test fun selected1440DetailFillsMeasuredWideParent() {
-        val settings = CarPlaySettings(resolution = "1440p", fps = 60, videoCodec = "hevc", fitToWindow = true)
+        val settings = CarPlaySettings(autoResolution = false, resolution = "1440p", fps = 60, videoCodec = "hevc", fitToWindow = true)
         val input = com.openautolink.carplaylab.media.CarPlayAutoScalePolicy.Input(2914,1134,2914,1134,200.0,200.0,200)
         val probe = com.shilapi.xcertplay.media.VideoDecoderProbe { "qualified-${it.codec}" }
         val display = settings.qualifiedDisplay(input, probe)

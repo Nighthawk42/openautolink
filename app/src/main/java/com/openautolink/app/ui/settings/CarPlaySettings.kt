@@ -455,7 +455,7 @@ fun CarPlayVideoSettingsSection(viewModel: SettingsViewModel) {
                 }
             }
         }
-        SettingsHelp("Automatic codec always retains H.264 and offers HEVC only when the same exact size, rate and profile qualify. H.264 remains the default. Optional HEVC has been verified on one phone/display after a negotiation correction, not on every device. If connection fails, select H.264 and Save & Reconnect. Local qualification is not phone acceptance; no automatic retry is performed.")
+        SettingsHelp("Automatic codec always retains H.264 and offers HEVC only when the same exact size, rate and profile qualify. Automatic is the default for new settings; saved H.264 choices are preserved. HEVC has been verified on one phone/display after a negotiation correction, not on every device. If connection fails, select H.264 and Save & Reconnect. Local qualification is not phone acceptance; no automatic retry is performed.")
         if (videoError != null) Text(videoError, color = MaterialTheme.colorScheme.error)
         else if (!draft.usesWindowGeometry && !supportedProfile) Text("This exact size and maximum FPS are not supported by the local decoder.",
             color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)

@@ -18,22 +18,23 @@ class MicrophoneConfig(
     val socketBinding: com.openautolink.carplaylab.network.CarPlaySocketBinding? = null,
 ) {
     internal val key = key.copyOf()
-    val sampleRate: Int get() = 48000
+    val codec: AudioCodecKind get() = if (formatBits == 0x40L) AudioCodecKind.LPCM else AudioCodecKind.OPUS
+    val sampleRate: Int get() = if (codec == AudioCodecKind.LPCM) 24000 else 48000
     val channels: Int get() = 1
-    val frameBytes: Int get() = 1920 // 960 samples, mono, PCM16, 48k capture, 20ms
+    val frameBytes: Int get() = sampleRate / 50 * channels * 2 // 20ms signed PCM16 capture
     init {
         require(port in 1..65535 && key.size == 32)
         require(socketBinding?.allowsPeer(host) != false) { "Microphone destination differs from authenticated control" }
-        require(formatBits in setOf(0x20000000L,0x40000000L))
-        require(rtpSamplesPerPacket == if (formatBits == 0x20000000L) 480 else 960)
-        require(bitrate == if (formatBits == 0x20000000L) 64000 else 96000)
+        require(formatBits in com.shilapi.xcertplay.media.MicrophoneSupport.implementedBits)
+        require(rtpSamplesPerPacket == com.shilapi.xcertplay.media.MicrophoneSupport.rtpSamples(formatBits))
+        require(bitrate == com.shilapi.xcertplay.media.MicrophoneSupport.bitrate(formatBits))
         require(audioType in setOf("default", "telephony", "speechrecognition"))
-        require(audioType != "speechrecognition" || formatBits == 0x20000000L)
+        require(audioType != "speechrecognition" || formatBits in setOf(0x40L, 0x20000000L))
     }
 }
 class MicrophoneCounters(var sequence: Int = 0, var timestamp: Int = 0, var nonce: Long = 0)
 
-/** Fixed clear RTP header, timestamp+SSRC AAD, raw Opus ciphertext+tag, trailing LE nonce. */
+/** Fixed clear RTP header, timestamp+SSRC AAD, LPCM/Opus ciphertext+tag, trailing LE nonce. */
 object MicrophonePacketizer {
     fun inputKey(shared: ByteArray, connectionId: Any?): ByteArray? {
         val id = unsignedPlistDecimal(connectionId) ?: return null

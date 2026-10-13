@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.520
+
+### Android Auto USB
+- Repair Android USB access-result delivery after the unified CarPlay USB integration; permission callbacks now match the registered receiver.
+- Clear stale permission requests when a phone disconnects or an exact USB admission fails, preserving current-owner and stale-generation checks.
+- Reset failed USB admission state so deliberate Retry USB can request access again.
+- Cover permission delivery and denial, equal-but-distinct device-name cleanup, retry and stale callback protection on Android API 32 and 34.
+- Applies to saved Android Auto USB mode and wireless-to-USB Switch. Software regression tests pass; physical permission prompts and sustained projection still require vehicle confirmation.
+- No companion update is required for this car-side correction. CarPlay permission handling and saved connection modes are unchanged.
+
+### CarPlay vehicle data
+- Discover each EV property's actual HAL change mode instead of inferring it from the requested sensor rate.
+- Permit stable STATIC/ONCHANGE event timestamps only while real status reads or events keep the exact registration live; retain existing age limits for continuous or unknown modes.
+- Revalidate supported stable-source properties on the existing serialized vehicle-data lane and promptly revoke unavailable/null observations. Retain actual usable capacity requirements and do not substitute nominal capacity.
+- Vehicle change-mode confirmation and Apple Maps EV recognition remain unverified.
+
+### CarPlay microphone diagnostics
+- Add bounded exact-recorder input-route, client-silenced, permission and global-mute receipts to distinguish capture policy from uplink delivery.
+- Keep OS queries on one zero-backlog process worker with at most three attempts per capture and fence late results at close.
+- Export only finite sanitized metadata, not raw audio or device identities. No microphone source/rate change or claim that Siri silence is fixed.
+
+## 0.1.518
+
+### CarPlay audio negotiation
+- Add permission-gated, independently qualified 24 kHz mono PCM microphone input for default, phone and voice-recognition streams, alongside existing Opus support.
+- Use the negotiated capture rate, sealed RTP transmission and exact microphone retirement; reject malformed input formats and stream declarations.
+- Validate authenticated audio packet headers and payloads before allowing microphone activation.
+- Export bounded microphone format, capture and transmission diagnostics in uploaded logs.
+- Addresses a wired input-format incompatibility identified in representative iOS firmware. Actual phone audio routing, navigation-volume selection, calls and Siri still require vehicle confirmation; this release does not claim those issues resolved.
+
+### Video defaults and guidance
+- Fresh CarPlay settings use Automatic codec (H.264 plus decoder-qualified HEVC) and automatic 1440p-class detail, retaining bounded lower-detail fallbacks.
+- Preserve existing saved codec, resolution and manual-mode choices; invalid codec data falls back to H.264.
+- Recommend Automatic codec with 1440p for manual setup and clarify protocol-specific video and curved-screen guidance.
+
+### Distribution
+- Deliver the same runtime revision and version to OpenAutoLink and OpenAutoLink Test Group 2, with separate package identities and tester lists.
+- No Android companion update is required for these receiver changes.
+
 ## 0.1.517
 
 ### Display controls

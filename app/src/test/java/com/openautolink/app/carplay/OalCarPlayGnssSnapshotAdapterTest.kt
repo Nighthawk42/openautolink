@@ -6,6 +6,46 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OalCarPlayGnssSnapshotAdapterTest {
+    @Test fun failedStartCleanupRetainsExactHostOwnerForRetirementRetry() {
+        var stops=0
+        val adapter=OalCarPlayGnssSnapshotAdapter({1000}) {object : GnssForwarder {
+            override val isActive=false
+            override fun start() {throw IllegalStateException("private-source-error")}
+            override fun stop() {stops++;if(stops==1) throw IllegalStateException("private-close-error")}
+        }}
+        assertTrue(runCatching {adapter.setActive(true)}.isFailure)
+        assertNull(adapter.latest(setOf(1)))
+        adapter.close(); assertEquals(2,stops)
+        adapter.close(); assertEquals(2,stops)
+    }
+    @Test fun failedFactoryDoesNotLeaveAnActiveFlagThatSuppressesAnExplicitNewSubscription() {
+        var creates=0
+        val adapter=OalCarPlayGnssSnapshotAdapter({1000}) {
+            creates++;if(creates==1) throw IllegalStateException("private-factory-error")
+            object : GnssForwarder {
+                override var isActive=false
+                override fun start() {isActive=true}
+                override fun stop() {isActive=false}
+            }
+        }
+        assertTrue(runCatching {adapter.setActive(true)}.isFailure)
+        adapter.setActive(true); assertEquals(2,creates);adapter.close()
+    }
+    @Test fun failedExactHostRetirementRemainsRetryableWithoutReactivingTheSource() {
+        var stops=0; var starts=0
+        val adapter=OalCarPlayGnssSnapshotAdapter({1000}) {
+            object : GnssForwarder {
+                override var isActive=false
+                override fun start() {starts++;isActive=true}
+                override fun stop() {stops++; if(stops==1) throw IllegalStateException("private-host-error");isActive=false}
+            }
+        }
+        adapter.setActive(true)
+        assertTrue(runCatching {adapter.close()}.isFailure)
+        adapter.setActive(true); assertEquals(1,starts); assertNull(adapter.latest(setOf(1)))
+        adapter.close(); assertEquals("the exact failed GNSS owner cannot be lost",2,stops)
+        adapter.close(); assertEquals(2,stops)
+    }
     @Test fun failedHostStopStillPermanentlyRetiresAdapter() {
         var starts=0
         val adapter = OalCarPlayGnssSnapshotAdapter({1000}) {

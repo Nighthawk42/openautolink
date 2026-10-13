@@ -1,5 +1,7 @@
 # iAP2 car-data intake: parent integration contract
 
+> Historical intake qualification. Its reference-derived U16 parameter-0, empty-only EV admission, 1000-ms GPS floor and passive GNSS assumptions are superseded by [the firmware-backed production qualification](../docs/carplay-vehicle-data-contract-qualification.md). Retained below for provenance, not current implementation guidance.
+
 This is implemented and JVM-tested intake, **not proof of iPhone consumption**. All fixtures are source-contract fixtures; none are described as captured phone traffic. No runtime/provider files were changed by this worker. Parent owns the actual receiver hook and first car test.
 
 ## Source trace

@@ -11,6 +11,62 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2RuntimeWrittenTest {
+    @Test fun actualIdentificationAndMfiLoopsPreserveVehicleRequestsForExactAuthenticatedHandoff() {
+        val identify=Iap2IdentificationClient::class.java.methods.firstOrNull {it.name=="identify" && it.parameterCount==3}
+        val run=com.shilapi.xcertplay.mfi.Iap2MfiAuthenticationClient::class.java.methods.firstOrNull {it.name=="run" && it.parameterCount==4}
+        assertNotNull("identification must expose bounded non-identification intake",identify)
+        assertNotNull("MFi must expose bounded non-authentication intake",run)
+        val listener=ServerSocket(0)
+        val left=Stream(Socket("127.0.0.1",listener.localPort))
+        val right=Stream(listener.accept()); listener.close()
+        val a=Iap2Session.openTunnel(left); val b=Iap2Session.openTunnel(right)
+        val caps=com.openautolink.carplaylab.intake.OalCarDataCapabilities(currentEnergy=true)
+        val bootstrap=com.openautolink.carplaylab.intake.OalCarDataBootstrap(caps,{0},{})
+        val done=CountDownLatch(1); val failure=java.util.concurrent.atomic.AtomicReference<Throwable>()
+        val auth=object : com.shilapi.xcertplay.mfi.MfiAuthenticator {
+            override fun protocolMajor()=3
+            override fun readCertificate(maximumOutputLength: Int)=byteArrayOf(1) // synthetic OS-independent authenticator, never private assets
+            override fun signChallenge(challenge: ByteArray)=byteArrayOf(1)
+        }
+        val handler: (Iap2Frame)->Boolean=bootstrap::handle
+        val worker=Thread {
+            try {
+                identify!!.invoke(Iap2IdentificationClient(a,bootstrap::identification),
+                    Iap2IdentificationConfig("test","test","test","private","1","1",0),3000L,handler)
+                run!!.invoke(com.shilapi.xcertplay.mfi.Iap2MfiAuthenticationClient(auth),a,3000L,handler,{_: String ->})
+            } catch (error: Throwable) {failure.set(error)} finally {done.countDown()}
+        }
+        try {
+            worker.start(); assertTrue(b.awaitReady(3000))
+            b.send(Iap2Frame(0x1D00,byteArrayOf()))
+            val identification=com.shilapi.xcertplay.iap2.body.Iap2BodyReader.of(b.recv(1000)!!)
+            assertTrue(identification.has(21)); assertFalse(identification.has(22))
+            b.send(com.shilapi.xcertplay.iap2.message.Iap2Messages.buildRaw(0xA100) {void(21)})
+            b.send(Iap2Frame(0x1D02,byteArrayOf()))
+            b.send(Iap2Frame(0xA102,byteArrayOf()))
+            b.send(com.shilapi.xcertplay.iap2.message.Iap2Messages.buildRaw(0xA100) {void(21)})
+            b.send(Iap2Frame(0xAA05,byteArrayOf()))
+            assertTrue(done.await(4,TimeUnit.SECONDS)); assertNull(failure.get())
+            val reporter=com.openautolink.carplaylab.intake.OalIap2CarDataReporter(caps,{0},{null},
+                {com.openautolink.carplaylab.intake.OalEvSnapshot(currentChargeWh=0)}, {}, {a.sendAndAwaitWritten(it,1000)}, {})
+            val target=object : com.openautolink.carplaylab.intake.RuntimeCarDataLink {
+                override fun identification(base: Iap2Frame)=bootstrap.identification(base)
+                override fun authenticate()=reporter.authenticate()
+                override fun handle(frame: Iap2Frame)=reporter.handle(frame)
+                override fun tick(encryptedEventReady: Boolean)=reporter.tick()
+                override fun pollTimeout(maximumMs: Long)=reporter.pollTimeout(maximumMs)
+                override fun revoke()=reporter.close()
+                override fun close()=reporter.close()
+            }
+            val exact=bootstrap.wrap(target)
+            assertNull("deferred requests cannot send before authenticated runtime",b.recv(100))
+            exact.authenticate()
+            val update=b.recv(1000)
+            assertEquals(0xA101,update?.messageId)
+            assertEquals(0L,com.shilapi.xcertplay.iap2.body.Iap2BodyReader.of(update!!).u32(22))
+            exact.close()
+        } finally {bootstrap.close(); runCatching {a.close()}; runCatching {b.close()}; worker.join(1000)}
+    }
     private class Stream(val socket: Socket) : BlockingDuplexByteStream {
         @Volatile var block = false
         @Volatile var dropWrites = false

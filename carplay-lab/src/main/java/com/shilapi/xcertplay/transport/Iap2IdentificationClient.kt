@@ -160,7 +160,8 @@ class Iap2IdentificationClient(
 ) {
     /** Waits for link negotiation, then completes the 1D00/1D01/1D02 exchange. */
     @Throws(IphoneUsbException::class, Iap2IdentificationException::class)
-    fun identify(config: Iap2IdentificationConfig, timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS) {
+    fun identify(config: Iap2IdentificationConfig, timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
+        onOtherFrame: (Iap2Frame) -> Boolean = {false}) {
         require(timeoutMillis in 1..MAXIMUM_TIMEOUT_MILLIS) {
             "timeoutMillis must be in 1..$MAXIMUM_TIMEOUT_MILLIS"
         }
@@ -179,7 +180,7 @@ class Iap2IdentificationClient(
                     val rejected = Iap2BodyReader.of(frame).list().mapTo(LinkedHashSet()) { it.id }
                     throw Iap2IdentificationException.Rejected(rejected)
                 }
-                else -> throw Iap2IdentificationException.UnexpectedMessage(frame.messageId)
+                else -> if (!onOtherFrame(frame)) throw Iap2IdentificationException.UnexpectedMessage(frame.messageId)
             }
         }
     }

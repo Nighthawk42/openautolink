@@ -51,6 +51,10 @@ object CarPlayAudioDiagnostics {
         "media stage=runtime-control-failed type=$failure",
         "media stage=(runtime-message-received|runtime-subscriptions-sent|video-first-frame-confirmed) count=$number",
         "carplay-car-data id=(0|65530|65531|65532|41216|41217|41218) reason=(authenticated|retired|unauthenticated|started|stopped|disabled|unsupported_request|source_absent|transmitted|send_failed) count=$number fields=([0-9]|[12][0-9]|3[01]) suppressed=$number",
+        "carplay-car-data-offer location=$bool range=$bool current=$bool maximum=$bool",
+        "carplay-car-data-request id=(65530|41216) bytes=[0-9]{1,5} result=(accepted|disabled|malformed|oversized|duplicate|unsupported_id|width|interval_bounds|orphan_interval|no_supported_groups) parameter=[0-9]{1,5} length=[0-9]{1,3} groups=[0-7] ggaMs=[0-9]{1,5} rmcMs=[0-9]{1,5}",
+        "carplay-car-data-source property=(range|current|maximum) reason=(available|absent|fuel|metadata|generation|source|inactive|status|timestamp|source_age|receipt_age|bounds|inconsistent) status=(-1|[0-9]) active=$bool generation=$bool sourceAgeMs=(-1|[0-9]{1,8}) receiptAgeMs=(-1|[0-9]{1,8})",
+        "carplay-car-data-bootstrap id=(65530|65532|41216|41218) result=(deferred|oversized|retired)",
         "carplay-appearance reason=(transmitted|send_failed) count=$number",
         "carplay-enrollment stage=commit accepted=$bool",
         "carplay-enrollment stage=awaiting-selected-bootstrap-request",
@@ -86,6 +90,16 @@ object CarPlayAudioDiagnostics {
         "media stage=device-playback index=[0-7] scope=device owner=unknown usage=([0-9]{1,4}|null) content=([0-9]{1,4}|null) device=([0-9]{1,4}|null)",
         "media stage=status-queue drops=[0-9]{1,19}",
         "media stage=record-active; rendering unverified",
+        "media stage=microphone-format type=100 audioType=(default|telephony|speechrecognition) codec=LPCM rate=24000 channels=1 spf=480 source=(MIC|VOICE_COMMUNICATION|VOICE_RECOGNITION)",
+        "media stage=microphone-format type=100 audioType=(default|telephony|speechrecognition) codec=OPUS rate=48000 channels=1 spf=(480|960) source=(MIC|VOICE_COMMUNICATION|VOICE_RECOGNITION)",
+        "media stage=audio-focus-change change=(-3|-2|-1|1) volumePercent=(0|20|100)",
+        "media stage=media-control index=[1-5] outcome=(sent|failed)",
+        "media stage=microphone-capture type=100 audioType=(default|telephony|speechrecognition) frames=$number nonzeroFrames=$number state=(1|3|unknown) ended=$bool",
+        "media stage=microphone-policy scope=own source=(MIC|VOICE_COMMUNICATION|VOICE_RECOGNITION) rate=(24000|48000) permission=(granted|denied|unknown) mute=(true|false|unknown) route=(builtin|wired|usb|bluetooth|other|none|unknown) silenced=(true|false|unknown) result=(ok|partial|unavailable)",
+        "media stage=microphone-started type=100; uplink audibility unverified",
+        "media stage=microphone-datagram-sent packets=$number; phone receipt unverified",
+        "media stage=microphone-failed type=100 errorType=$failure",
+        "media stage=(microphone-worker-start-failed|microphone-queue-overflow|microphone-retirement-pending)",
     ).map(::Regex)
 
     fun sanitize(session: Long, message: String): String? {

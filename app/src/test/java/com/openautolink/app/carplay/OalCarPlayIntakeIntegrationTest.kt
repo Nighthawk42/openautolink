@@ -36,7 +36,25 @@ class OalCarPlayIntakeIntegrationTest {
     )
     private fun initial() = Iap2IdentificationClient.identificationInformation(Iap2IdentificationConfig(
         "OAL", "OAL", "OAL", "private", "1", "1", 0))
-    private fun start() = Iap2Messages.buildRaw(0xFFFA) { u16(0,0); void(1); u32(0x8001,1000) }
+    private fun start() = Iap2Messages.buildRaw(0xFFFA) { u32(0,1000); void(1); u32(0x8001,1000) }
+
+    @Test fun actualLinkExportsFrozenOfferAndPrecisePropertyOmissionsWithoutValues() {
+        now=60000
+        val observation=VehiclePropertyObservation(1_000_000_000,59000,0,registrationGeneration=1,subscriptionActive=true)
+        source.value=ControlMessage.VehicleData(fuelTypes=listOf(10),rangeKm=123f,evBatteryLevelWh=12345f,
+            vhalRegistrationGeneration=1,evObservationMetadata=mapOf("RANGE_REMAINING" to observation,
+                "EV_BATTERY_LEVEL" to observation.copy(timestampElapsedNanos=59_000_000_000,status=1)))
+        val link=link(gps=false)
+        try {
+            link.identification(initial()); link.authenticate(); link.handle(Iap2Messages.buildRaw(0xA100) {void(21)})
+            assertTrue(receipts.any {it=="carplay-car-data-offer location=false range=false current=false maximum=false"})
+            assertTrue(receipts.any {it.contains("property=range reason=source_age")})
+            assertTrue(receipts.any {it.contains("property=current reason=status")})
+            assertTrue(receipts.any {it.contains("property=maximum reason=absent")})
+            assertFalse(receipts.any {it.contains("12345") || it.contains("VIN=") || it.contains("lat=")})
+            assertTrue(sent.isEmpty())
+        } finally {link.close()}
+    }
 
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test fun appearanceRequiresSameLinkAuthPlusEncryptedEventsAndRetires() = kotlinx.coroutines.test.runTest {
