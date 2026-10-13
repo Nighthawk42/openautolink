@@ -16,6 +16,8 @@ data class ReceiverTelemetrySnapshot(
     val audioStreamObserved: Boolean = false,
     val audioAcceptedPackets: Long? = null,
     val audioWrittenBytes: Long? = null,
+    val presentationGeneration: Long? = null,
+    val presentationRendered: Boolean = false,
 )
 
 /** Constant-space numeric accumulator; callbacks never log or publish UI state. */
@@ -67,6 +69,17 @@ class ReceiverTelemetry(private val generation: Long) {
             }
         }
         lastRenderNs = nowNs
+    }
+    /** Readiness is separate from lifetime counters: a reattach needs its own real render. */
+    @Synchronized fun presentationChanged(generation: Long) {
+        if (retired || state.presentationGeneration == generation) return
+        if (state.presentationGeneration?.let { generation < it } == true) return
+        state = state.copy(presentationGeneration = generation, presentationRendered = false)
+    }
+    @Synchronized fun frameRendered(nowNs: Long, presentationGeneration: Long) {
+        if (retired || state.presentationGeneration != presentationGeneration) return
+        state = state.copy(presentationRendered = true)
+        frameRendered(nowNs)
     }
     @Synchronized fun snapshot(nowNs: Long): ReceiverTelemetrySnapshot {
         if (retired) return state

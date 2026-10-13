@@ -31,7 +31,12 @@ data class CarPlayUiState(
     val status: String = "CarPlay ready",
     val evidence: CarPlayEvidence = CarPlayEvidence(),
     val failure: CarPlayFailureUi? = null,
-)
+    /** Revoked by Stop/failure, independently of the worker's retirement-in-progress busy flag. */
+    val videoWaitActive: Boolean = true,
+) {
+    val waitingForVideo: Boolean get() = selected && busy && videoWaitActive && failure == null &&
+        evidence.telemetry?.presentationRendered != true
+}
 
 /** One worker serializes complete AA retirement, CarPlay setup, and full receiver retirement.
  * No preference or Bluetooth-friendly name starts this owner. Stop keeps CP selected; only explicit
@@ -99,7 +104,7 @@ class CarPlayCoordinator(
             failedStatus = "CarPlay connection failed · reconnect or Return to Android Auto"
             synchronized(lock) {
                 if (current === attempt && !attempt.canceled.get()) {
-                    publish(state.copy(status = failedStatus, failure = CarPlayFailureUi(
+                    publish(state.copy(status = failedStatus, videoWaitActive = false, failure = CarPlayFailureUi(
                         failure.kind, failure.manualPeer, failure.userGuidance +
                             if (!failure.manualPeer && failure.kind in setOf(
                                 CarPlayFailureKind.RUNTIME_STARTUP_TIMEOUT,
@@ -111,6 +116,7 @@ class CarPlayCoordinator(
         } catch (failure: Exception) {
             failedStatus = "CarPlay failed type=${failure.javaClass.simpleName}; check setup / reconnect"
             if (!attempt.canceled.get()) record(attempt, failedStatus)
+            synchronized(lock) { if (current === attempt) publish(state.copy(videoWaitActive = false)) }
         } finally {
             try {
                 attempt.runtime?.cancel()
@@ -141,12 +147,16 @@ class CarPlayCoordinator(
         if (closed || presentation === surface) return@synchronized
         presentation = surface
         current?.takeUnless { it.canceled.get() }?.runtime?.attachSurface(surface)
+        if (current?.canceled?.get() == false)
+            publish(state.copy(evidence = state.evidence.copy(telemetry = null)))
     }
 
     fun detachSurface(surface: Surface) = synchronized(lock) {
         if (presentation !== surface) return@synchronized
         presentation = null
         current?.takeUnless { it.canceled.get() }?.runtime?.detachSurface(surface)
+        if (current?.canceled?.get() == false)
+            publish(state.copy(evidence = state.evidence.copy(telemetry = null)))
     }
 
     /** Called at UI sampling cadence, not from media callbacks. Exact attempt gates retirement. */
@@ -168,7 +178,7 @@ class CarPlayCoordinator(
         val attempt = current ?: return@synchronized
         attempt.canceled.set(true)
         attempt.runtime?.cancel()
-        publish(state.copy(status = "Stopping CarPlay; waiting for exact receiver/control retirement"))
+        publish(state.copy(videoWaitActive = false, status = "Stopping CarPlay; waiting for exact receiver/control retirement"))
         // Socket closure breaks blocking connect/recv. Never close/join MediaCodec on UI thread.
         interrupter.execute { runCatching { attempt.runtime?.close() } }
         // Also retries a previously failed close after the original worker returned.

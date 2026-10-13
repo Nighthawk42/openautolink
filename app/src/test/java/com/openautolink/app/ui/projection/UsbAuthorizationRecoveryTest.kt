@@ -8,7 +8,6 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import com.openautolink.app.carplay.UsbCarPlayPermission
 import com.openautolink.app.carplay.UsbHotPlugSwitchPolicy
-import com.openautolink.app.transport.usb.UsbAttachAuthorization
 import com.openautolink.app.transport.usb.UsbConnectionManager
 import com.openautolink.app.transport.usb.UsbConnectionState
 import androidx.datastore.core.DataStore
@@ -86,9 +85,19 @@ class UsbAuthorizationRecoveryTest {
         manager.javaClass.getDeclaredMethod("handleDeviceAttached", UsbDevice::class.java)
             .apply { isAccessible = true }.invoke(manager, device)
     }
-    @After fun cleanup() { manager.stop(); UsbAttachAuthorization.forget(apple.deviceName); unmockkAll() }
+    @After fun cleanup() { manager.stop(); unmockkAll() }
 
-    @Test fun dismissedOsAuthorizationExposesSameCableWirelessRecoveryWithoutAutomaticRequest() = runBlocking {
+    @Test fun coldPlugWithoutOsGrantImmediatelyOffersConsentRatherThanSilentlyWaiting() {
+        start()
+        assertNotNull("Static USBMUX matching must not suppress the production Switch/Stay offer", offered)
+        assertEquals(0, starts)
+        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
+        assertTrue(manager.accept(offered!!))
+        assertEquals(UsbCarPlayPermission.Result.GRANTED, outcome)
+        verify(exactly = 1) { usb.requestPermission(apple, any<PendingIntent>()) }
+    }
+
+    @Test fun ungrantedUsbOffersSameCableConsentAndPreservesSavedWirelessSettings() = runBlocking {
         val directory = File("build/tmp/usb-recovery-${java.util.UUID.randomUUID()}").apply { mkdirs() }
         val job = SupervisorJob()
         val store = PreferenceDataStoreFactory.create(scope = CoroutineScope(Dispatchers.IO + job),
@@ -101,7 +110,7 @@ class UsbAuthorizationRecoveryTest {
             val saved = store.data.first()
             start()
             assertEquals(UsbConnectionState.AWAITING_USER_SELECTION, UsbConnectionManager.connectionState.value)
-            assertNull(offered)
+            assertNotNull(offered)
             verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
             assertTrue("WPP + enabled CarPlay USB must expose the pending exact-device picker",
                 visible(enabled = preferences.carPlaySettings.first().enabled, transport = preferences.directTransport.first()))
@@ -116,18 +125,51 @@ class UsbAuthorizationRecoveryTest {
             assertEquals(UsbCarPlayPermission.Result.GRANTED, outcome)
             assertEquals(1, starts)
             verify(exactly = 1) { usb.requestPermission(apple, any<PendingIntent>()) }
-            assertFalse(UsbAttachAuthorization.canRequest(apple))
             assertFalse(visible())
             assertEquals(saved, store.data.first())
         } finally { job.cancelAndJoin(); directory.deleteRecursively() }
     }
 
-    @Test fun stayRevokesPickerAuthorityAndNeverRequestsPermission() {
+    @Test fun selectedInitialAndReplacementWithoutOsGrantsContinueUnderSameOwnerWithoutAnotherPicker() {
+        start()
+        UsbConnectionManager.selectDevice(apple.deviceName)
+        val admission = offered!!
+        assertTrue(manager.accept(admission))
+        assertEquals(UsbCarPlayPermission.Result.GRANTED, outcome)
+        val ownership = manager.javaClass.getDeclaredField("dispatchOwnership")
+            .apply { isAccessible = true }.get(manager) as com.openautolink.app.transport.usb.UsbDispatchOwnership
+        val owner = ownership.current()!!
+        val transition = manager.iphoneReenumerationCallbacks(apple)
+        assertTrue(transition.first())
+        manager.javaClass.getDeclaredMethod("handleDeviceDetached", UsbDevice::class.java)
+            .apply { isAccessible = true }.invoke(manager, apple)
+        val replacement = phone("/dev/bus/usb/001/003", 3)
+        every { usb.deviceList } returns hashMapOf(replacement.deviceName to replacement)
+        granted = false // The initial grant is NOT a replacement grant.
+        every { usb.hasPermission(replacement) } answers { granted }
+        every { usb.requestPermission(replacement, any<PendingIntent>()) } answers { granted = true }
+        attach(replacement)
+        assertSame(owner, ownership.current())
+        assertTrue(owner.reenumerating)
+        assertEquals(UsbCarPlayPermission.Result.GRANTED,
+            UsbCarPlayPermission.await(context, usb, replacement, 20) { cancelled })
+        assertTrue(transition.second(replacement)) // Runtime's serial/configuration-qualified acknowledgement.
+        scope.advanceTimeBy(15_001); scope.runCurrent()
+        assertSame(owner, ownership.current())
+        assertEquals(replacement.deviceName, owner.deviceName)
+        assertFalse(owner.retiring)
+        assertEquals(admission, offered)
+        assertEquals(1, starts)
+        assertEquals(UsbConnectionState.CONNECTING, UsbConnectionManager.connectionState.value)
+        verify(exactly = 1) { usb.requestPermission(apple, any<PendingIntent>()) }
+        verify(exactly = 1) { usb.requestPermission(replacement, any<PendingIntent>()) }
+    }
+
+    @Test fun stayRevokesAdmissionAndNeverRequestsPermission() {
         start()
         assertTrue(visible())
         UsbConnectionManager.selectDevice(apple.deviceName)
         manager.stay(offered!!)
-        assertFalse(UsbAttachAuthorization.canRequest(apple))
         assertFalse(manager.accept(offered!!))
         assertEquals(0, starts)
         verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
@@ -143,7 +185,7 @@ class UsbAuthorizationRecoveryTest {
         assertFalse(visible())
     }
 
-    @Test fun switchAwaitsRetirementAndCancellationRevokesExactRequestAuthority() {
+    @Test fun switchAwaitsRetirementAndCancellationPreventsRequest() {
         start()
         assertTrue(visible())
         UsbConnectionManager.selectDevice(apple.deviceName)
@@ -162,7 +204,6 @@ class UsbAuthorizationRecoveryTest {
         retired.complete(Unit)
         scope.runCurrent()
         assertEquals(UsbCarPlayPermission.Result.CANCELLED, outcome)
-        assertFalse(UsbAttachAuthorization.canRequest(apple))
         verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
     }
 
@@ -174,13 +215,12 @@ class UsbAuthorizationRecoveryTest {
         every { usb.deviceList } returns hashMapOf(replacement.deviceName to replacement)
         UsbConnectionManager.selectDevice(apple.deviceName)
         scope.advanceTimeBy(120_001); scope.runCurrent()
-        assertNull(offered)
-        assertFalse(UsbAttachAuthorization.canRequest(replacement))
+        assertFalse(manager.accept(offered!!))
         assertEquals(0, starts)
         verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
     }
 
-    @Test fun lateGrantFromPassiveWaitCannotReplaceRecoveredOwner() {
+    @Test fun lateAttachCannotReplaceAdmittedOwner() {
         start()
         assertTrue(visible())
         UsbConnectionManager.selectDevice(apple.deviceName)

@@ -32,7 +32,8 @@ class UsbOsAuthorizationTest {
         every { productId } returns 0x2d00
     }
     private val accessory = device()
-    private val manager = UsbConnectionManager(context, scope, {})
+    private val transportReady = java.util.concurrent.CountDownLatch(1)
+    private val manager = UsbConnectionManager(context, scope, { transportReady.countDown() })
     private fun call(method: String, device: UsbDevice = accessory) {
         manager.javaClass.getDeclaredMethod(method, UsbDevice::class.java)
             .apply { isAccessible = true }.invoke(manager, device)
@@ -42,41 +43,63 @@ class UsbOsAuthorizationTest {
         manager.start()
     }
     @After fun cleanup() { manager.stop(); unmockkAll() }
-    @Test fun matchedColdStartAndRawAttachNeverStackAppPermissionOnOsResolver() {
+    private val capability = slot<PendingIntent>()
+    private fun grant(target: UsbDevice = accessory) {
+        every { usb.hasPermission(target) } returns true
+        capability.captured.send(context, 0, android.content.Intent()
+            .putExtra(UsbManager.EXTRA_DEVICE, target)
+            .putExtra(UsbManager.EXTRA_PERMISSION_GRANTED, true))
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+    }
+    @Test fun matchedColdStartAndRawAttachRequestOnceWithoutWaitingForOsGrant() {
+        every { usb.requestPermission(any<UsbDevice>(), capture(capability)) } just Runs
         start()
         call("handleDeviceAttached")
         scope.runCurrent()
-        scope.advanceTimeBy(1_000); scope.runCurrent()
-        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
-        assertEquals(UsbConnectionState.AWAITING_USER_SELECTION, UsbConnectionManager.connectionState.value)
-        scope.advanceTimeBy(120_000); scope.runCurrent()
-        assertEquals(UsbConnectionState.AWAITING_USER_SELECTION, UsbConnectionManager.connectionState.value)
-        assertEquals(listOf(accessory.deviceName), UsbConnectionManager.availableDevices.value.map { it.deviceName })
-        call("handleDeviceAttached")
-        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
-        UsbConnectionManager.selectDevice(accessory.deviceName)
         verify(exactly = 1) { usb.requestPermission(accessory, any<PendingIntent>()) }
+        assertEquals(UsbConnectionState.PERMISSION_REQUESTED, UsbConnectionManager.connectionState.value)
+        grant()
+        verify(timeout = 1_000, exactly = 1) { usb.openDevice(accessory) }
     }
-    @Test fun externalGrantResumesOnceWithoutAnAppPermissionCallback() {
-        start(); scope.runCurrent()
+    @Test fun actualGrantBeforeStartupBypassesAppPermissionRequest() {
         every { usb.hasPermission(accessory) } returns true
-        scope.advanceTimeBy(200); scope.runCurrent()
+        start(); scope.runCurrent()
         verify(timeout = 1_000, exactly = 1) { usb.openDevice(accessory) }
         call("handleDeviceAttached")
         verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
     }
-    @Test fun managerRestartCannotInventPermissionForAnExistingDevice() {
+    @Test fun managerRestartRequestsAgainUnlessPlatformPermissionActuallyExists() {
+        every { usb.requestPermission(any<UsbDevice>(), capture(capability)) } just Runs
         start(); scope.runCurrent(); manager.stop()
         val restarted = UsbConnectionManager(context, scope, {})
         try {
             restarted.start(); scope.runCurrent()
-            verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
-            every { usb.hasPermission(accessory) } returns true
-            scope.advanceTimeBy(200); scope.runCurrent()
+            verify(exactly = 2) { usb.requestPermission(accessory, any<PendingIntent>()) }
+            grant()
             verify(timeout = 1_000, exactly = 1) { usb.openDevice(accessory) }
         } finally { restarted.stop() }
     }
-    @Test fun aoaReplacementUsesOsAuthorizationRatherThanRequestingAgain() {
+    @Test fun aoaReplacementWithoutOsGrantRequestsPermissionUnderSameOwner() {
+        every { usb.requestPermission(any<UsbDevice>(), capture(capability)) } just Runs
+        val input = mockk<android.hardware.usb.UsbEndpoint>(relaxed = true) {
+            every { type } returns android.hardware.usb.UsbConstants.USB_ENDPOINT_XFER_BULK
+            every { direction } returns android.hardware.usb.UsbConstants.USB_DIR_IN
+        }
+        val output = mockk<android.hardware.usb.UsbEndpoint>(relaxed = true) {
+            every { type } returns android.hardware.usb.UsbConstants.USB_ENDPOINT_XFER_BULK
+            every { direction } returns android.hardware.usb.UsbConstants.USB_DIR_OUT
+        }
+        val iface = mockk<android.hardware.usb.UsbInterface>(relaxed = true) {
+            every { endpointCount } returns 2
+            every { getEndpoint(0) } returns input
+            every { getEndpoint(1) } returns output
+        }
+        every { accessory.interfaceCount } returns 1
+        every { accessory.getInterface(0) } returns iface
+        val connection = mockk<android.hardware.usb.UsbDeviceConnection>(relaxed = true) {
+            every { claimInterface(iface, true) } returns true
+        }
+        every { usb.openDevice(accessory) } returns connection
         every { usb.deviceList } returns hashMapOf()
         manager.start()
         val ownership = manager.javaClass.getDeclaredField("dispatchOwnership")
@@ -88,15 +111,24 @@ class UsbOsAuthorizationTest {
         scope.runCurrent()
         assertSame(original, ownership.current())
         assertEquals(accessory.deviceName, original.deviceName)
-        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
-        every { usb.hasPermission(accessory) } returns true
-        scope.advanceTimeBy(200); scope.runCurrent()
-        verify(timeout = 1_000, exactly = 1) { usb.openDevice(accessory) }
+        verify(exactly = 1) { usb.requestPermission(accessory, any<PendingIntent>()) }
+        assertEquals(UsbConnectionState.PERMISSION_REQUESTED, UsbConnectionManager.connectionState.value)
+        call("handleDeviceAttached")
+        verify(exactly = 1) { usb.requestPermission(accessory, any<PendingIntent>()) }
+        assertSame("Permission suppression must not send the selected replacement back to the picker", original, ownership.current())
+        grant()
+        assertTrue(transportReady.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        assertSame("Grant must continue the existing startup, not acquire another picker owner", original, ownership.current())
+        assertEquals(UsbConnectionState.CONNECTED, UsbConnectionManager.connectionState.value)
+        call("handleDeviceAttached")
+        assertEquals("Duplicate attach must not replace the connected state", UsbConnectionState.CONNECTED, UsbConnectionManager.connectionState.value)
+        verify(exactly = 1) { usb.openDevice(accessory) }
+        verify(exactly = 1) { usb.requestPermission(accessory, any<PendingIntent>()) }
     }
-    @Test fun unownedOsWaitTimeoutCannotOverrideAnotherPhonesConnectingState() {
+    @Test fun unownedCandidateCannotOverrideAnotherPhonesConnectingState() {
         assertUnownedWaitCannotOverrideSelectedPhone(whileConnecting = true)
     }
-    @Test fun unownedOsWaitTimeoutCannotOverrideAnotherPhonesConnectedState() {
+    @Test fun unownedCandidateCannotOverrideAnotherPhonesConnectedState() {
         assertUnownedWaitCannotOverrideSelectedPhone(whileConnecting = false)
     }
     @Test fun postAdmissionRescanCannotOverrideAnotherPhonesConnectingState() {
@@ -105,7 +137,7 @@ class UsbOsAuthorizationTest {
     @Test fun postAdmissionRescanCannotOverrideAnotherPhonesConnectedState() {
         assertUnownedWaitCannotOverrideSelectedPhone(whileConnecting = false, pauseScan = true)
     }
-    @Test fun rescanFromReleasedAdmissionCannotCreateAWaitInTheNewGeneration() {
+    @Test fun rescanFromReleasedAdmissionCannotOfferInTheNewGeneration() {
         assertUnownedWaitCannotOverrideSelectedPhone(whileConnecting = false, pauseScan = true, releaseBeforeResume = true)
     }
     private fun assertUnownedWaitCannotOverrideSelectedPhone(
@@ -148,7 +180,10 @@ class UsbOsAuthorizationTest {
         try {
             every { usb.deviceList } returns if (pauseScan) hashMapOf() else hashMapOf(accessory.deviceName to accessory)
             productionManager.start(); scope.runCurrent()
-            assertNull(offered) // A waits for Android without a dispatch owner.
+            if (!pauseScan) {
+                assertNotNull(offered) // A offers consent without an OS wait or dispatch owner.
+                productionManager.stay(offered!!) // Decline A before selecting B's independent consent.
+            }
             val attached = hashMapOf(accessory.deviceName to accessory, selected.deviceName to selected)
             if (pauseScan) {
                 // Pause the actual production rescan AFTER its initial unowned check,
@@ -198,7 +233,7 @@ class UsbOsAuthorizationTest {
             productionManager.stop()
         }
     }
-    @Test fun detachCancelsExternalWaitAndCannotAuthorizeReusedName() {
+    @Test fun detachCancelsPendingRequestAndCannotAuthorizeReusedName() {
         start(); scope.runCurrent()
         call("handleDeviceDetached")
         val replacement = device(id = 3)
@@ -206,13 +241,13 @@ class UsbOsAuthorizationTest {
         every { usb.hasPermission(accessory) } returns true
         scope.advanceTimeBy(200); scope.runCurrent()
         verify(exactly = 0) { usb.openDevice(any()) }
-        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
+        verify(exactly = 1) { usb.requestPermission(accessory, any<PendingIntent>()) }
     }
-    @Test fun stopCancelsExternalWaitWithoutPromptOrOpen() {
+    @Test fun stopCancelsPendingRequestWithoutRepromptOrOpen() {
         start(); scope.runCurrent(); manager.stop()
         every { usb.hasPermission(accessory) } returns true
         scope.advanceTimeBy(120_001); scope.runCurrent()
         verify(exactly = 0) { usb.openDevice(any()) }
-        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
+        verify(exactly = 1) { usb.requestPermission(accessory, any<PendingIntent>()) }
     }
 }
