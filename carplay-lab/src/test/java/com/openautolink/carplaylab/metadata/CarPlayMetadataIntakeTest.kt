@@ -37,9 +37,12 @@ class CarPlayMetadataIntakeTest {
         assertNull(intake.navigation) // no speculative empty-list grace
         route(); assertNotNull(intake.navigation)
         for (id in 8..15) intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,id); u8(3,2) })
-        assertNull(intake.navigation) // unchanged eight-entry eviction policy
+        assertNotNull(intake.navigation) // future entries cannot evict selected index
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u16List(13,listOf(8)) })
+        assertNull(intake.navigation) // oldest unselected entry was evicted
         assertTrue(lines.any { it.contains("transition=clear reason=cache_miss") })
         intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+        route()
         intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,2) })
         assertNull(intake.navigation)
         assertTrue(lines.any { it.contains("transition=clear reason=arrived") })

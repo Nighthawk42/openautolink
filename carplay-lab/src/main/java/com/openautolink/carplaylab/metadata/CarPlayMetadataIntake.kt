@@ -4,10 +4,10 @@ import com.shilapi.xcertplay.iap2.body.Iap2BodyReader
 import com.shilapi.xcertplay.iap2.wire.Iap2Frame
 
 /** Sourced subset; null means not reported, never inferred from video/audio or app identity. */
-data class CarPlayMediaMetadata(val title: String? = null, val artist: String? = null, val album: String? = null, val durationMillis: Long? = null, val elapsedMillis: Long? = null, val playing: Boolean? = null, val artworkTransferId: Int? = null)
+data class CarPlayMediaMetadata(val title: String? = null, val artist: String? = null, val album: String? = null, val durationMillis: Long? = null, val elapsedMillis: Long? = null, val playing: Boolean? = null, val artworkTransferId: Int? = null, val playbackStatus: Int? = null)
 
-/** DiPlay e2fd8ead: CarPlayPlaybackStatus. Omitted fields retain; present empty strings clear. */
-data class CarPlayNavigationMetadata(val maneuverType: Int, val drivingSide: Int?, val distanceMeters: Int?, val road: String?, val remainingSeconds: Long?, val remainingMeters: Int?)
+/** Raw accessory-navigation vocabulary, not Android Auto enums. Geometry keeps signed degrees. */
+data class CarPlayNavigationMetadata(val maneuverType: Int, val drivingSide: Int?, val distanceMeters: Int?, val road: String?, val remainingSeconds: Long?, val remainingMeters: Int?, val junctionType: Int? = null, val junctionExitAngleDegrees: Int? = null, val junctionAnglesDegrees: List<Int>? = null)
 class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
     /** Numeric finite receipts only; callback failure cannot change parsing/publication. */
     var onDiagnostic: (String) -> Unit = {}
@@ -40,7 +40,7 @@ class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
         if (!authenticated || retired || id !in 0..255 || media?.artworkTransferId != id) return
         cover = bytes.takeIf { it.isNotEmpty() && it.size <= 2 * 1024 * 1024 }?.copyOf()
     }
-    private data class Maneuver(val type: Int, val side: Int?, val road: String?)
+    private data class Maneuver(val type: Int, val side: Int?, val road: String?, val junction: Int?, val exitAngle: Int?, val angles: List<Int>?)
     private val maneuvers = LinkedHashMap<Int, Maneuver>()
     private var route = false
     private var index: Int? = null
@@ -64,24 +64,38 @@ class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
     }
     private fun publishRoute() {
         val m = maneuvers[index]
-        navigation = if (route && m != null) CarPlayNavigationMetadata(m.type,m.side,distance,m.road ?: road,seconds,meters) else null
+        navigation = if (route && m != null) CarPlayNavigationMetadata(m.type,m.side,distance,m.road ?: road,seconds,meters,m.junction,m.exitAngle,m.angles) else null
     }
     private fun navigationFrame(frame: Iap2Frame) {
-        val b = Iap2BodyReader.of(frame).also(::unique)
+        val b = Iap2BodyReader.of(frame)
+        // accessoryd 24A446 @0x100177a28/@0x100177bf8: repeated U16 TLVs,
+        // not duplicate scalars. Route current-list (13) is one packed U16 array.
+        val repeated = if (frame.messageId == 0x5202) setOf(0, 10) else setOf(0)
+        require(b.list().filterNot { it.id in repeated }.map { it.id }.let { it.distinct().size == it.size })
+        repeated.forEach { id -> b.all(id).forEach { require(it.payload.size == 2) } }
         if (frame.messageId == 0x5202) {
             val id = b.u16(1); val type = b.u8(3); val side = b.optionalU8(8)
             val name = text(b,4,null)
-            if (maneuvers.size >= 8 && !maneuvers.containsKey(id)) maneuvers.remove(maneuvers.keys.first())
-            maneuvers[id] = Maneuver(type,side,name)
+            val junction = b.optionalU8(9)
+            val exitAngle = b.optionalI16(11)
+            val angles = b.all(10).takeIf { it.isNotEmpty() }?.map {
+                val raw = it.payload // exact two-byte width checked above
+                (((raw[0].toInt() and 255) shl 8) or (raw[1].toInt() and 255)).toShort().toInt()
+            }?.let { java.util.Collections.unmodifiableList(it) }
+            if (maneuvers.size >= 8 && !maneuvers.containsKey(id)) {
+                // Future details must not evict the route's currently selected instruction.
+                maneuvers.keys.firstOrNull { it != index }?.let(maneuvers::remove)
+            }
+            maneuvers[id] = Maneuver(type,side,name,junction,exitAngle,angles)
         } else {
             val state = b.optionalU8(1)
             val name = text(b,3,road)
-            val nextDistance = b.optionalU32(10)?.takeIf { it <= Int.MAX_VALUE }?.toInt() ?: distance
+            val nextDistance = b.optionalU32(10)?.also { require(it <= Int.MAX_VALUE) }?.toInt() ?: distance
             val nextSeconds = b.optionalU64(6)?.also { require(it >= 0) } ?: seconds
-            val nextMeters = b.optionalU32(7)?.takeIf { it <= Int.MAX_VALUE }?.toInt() ?: meters
+            val nextMeters = b.optionalU32(7)?.also { require(it <= Int.MAX_VALUE) }?.toInt() ?: meters
             val current = b.optionalU16List(13)?.also { require(it.size <= 8) }
             if (state == 0 || state == 2) { clearRoute(); return }
-            if (state != null) require(state == 1) // other nonterminal meanings not established by pinned source
+            if (state != null) require(state in 0..6) // accessoryd @0x10000443c; unknown stays rejected
             if (current != null) index = current.firstOrNull()
             if (state != null || current?.isNotEmpty() == true) route = true
             road = name; distance = nextDistance; seconds = nextSeconds; meters = nextMeters
@@ -130,7 +144,12 @@ class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
                 durationMillis = m?.optionalU32(4) ?: old.durationMillis,
                 elapsedMillis = p?.optionalU32(1) ?: old.elapsedMillis,
                 artworkTransferId = m?.optionalU8(26) ?: old.artworkTransferId,
-                playing = p?.optionalU8(0)?.let { require(it in 0..1); it == 1 } ?: old.playing)
+                playbackStatus = p?.optionalU8(0) ?: old.playbackStatus,
+                playing = if (p?.has(0) == true) when (p.u8(0)) {
+                    0, 2 -> false // stopped / paused, not a Boolean wire field
+                    1 -> true
+                    else -> null // seeking or unknown cannot be represented by this Boolean DTO
+                } else old.playing)
         }.getOrNull() ?: return true
         val trackChanged = media != null && (media?.title != next.title || media?.artist != next.artist || media?.album != next.album)
         val hasArtReference = runCatching { Iap2BodyReader.of(frame).optionalGroup(0)?.has(26) == true }.getOrDefault(false)
