@@ -391,9 +391,11 @@ class AirPlaySession @JvmOverloads constructor(
     fun sendKnobSelect(down: Boolean) =
         sendHidReport(AirPlayHid.KNOB_HID_UID, AirPlayHid.knobReport(AirPlayKnobState(select = down)))
 
-    fun sendMedia(index: Int) {
-        sendHidReport(AirPlayHid.MEDIA_HID_UID, AirPlayHid.mediaReport(index))
-        sendHidReport(AirPlayHid.MEDIA_HID_UID, AirPlayHid.mediaReport(0))
+    /** One momentary consumer press and release; never interleave another input owner. */
+    fun sendMedia(index: Int): Boolean = synchronized(eventWriteLock) {
+        if (closed.get() || index !in 1..6) return@synchronized false
+        sendHidReport(AirPlayHid.MEDIA_HID_UID, AirPlayHid.mediaReport(index)) &&
+            sendHidReport(AirPlayHid.MEDIA_HID_UID, AirPlayHid.mediaReport(0))
     }
 
     fun sendTelephony(index: Int) {

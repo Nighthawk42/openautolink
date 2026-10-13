@@ -35,7 +35,7 @@ class ProjectionReceiver(
     // Production cannot enroll until the selected BT link proves the controller key. Bench stays explicit.
     private val trustedOnly: Boolean = false,
     private val runtimeCarDataFactory: ((AirPlaySession, (Iap2Frame) -> Unit, (String) -> Unit) -> RuntimeCarDataLink)? = null,
-    private val runtimeMetadataFactory: (((String) -> Unit) -> com.openautolink.carplaylab.metadata.RuntimeMetadataLink)? = null,
+    private val runtimeMetadataFactory: ((AirPlaySession, (String) -> Unit) -> com.openautolink.carplaylab.metadata.RuntimeMetadataLink)? = null,
     private val wired: Boolean = false,
     private val onStatus: (String) -> Unit,
 ) : Closeable {
@@ -298,7 +298,7 @@ class ProjectionReceiver(
                 var metadata: com.openautolink.carplaylab.metadata.RuntimeMetadataLink? = null
                 var failureStage = RuntimeControlFailureStage.IDENTIFICATION
                 try {
-                    metadata = runtimeMetadataFactory?.invoke(::status)
+                    metadata = runtimeMetadataFactory?.invoke(session, ::status)
                     synchronized(lock) {
                         check(!closed.get() && !admissionRevoked.get() && session in sessions)
                         metadata?.let { runtimeMetadata[session] = it }
@@ -373,6 +373,23 @@ class ProjectionReceiver(
             }
             true
         } catch (_: RejectedExecutionException) { tunnels.remove(session, channel); runtimeOwner = null; channel.close(); false }
+    }
+    /** Queue only for the exact authenticated metadata owner; queue admission is not phone receipt. */
+    fun mediaCommand(session: AirPlaySession, index: Int): Boolean {
+        fun current() = !closed.get() && !admissionRevoked.get() && active === session &&
+            runtimeOwner === session && runtimeReady && session in sessions &&
+            !session.isClosed && session.controlAuthenticated && session.encryptedEventReady
+        if (index !in 1..5 || !current()) return false
+        return try {
+            input.execute {
+                synchronized(lock) {
+                    if (!current()) return@execute
+                    val sent = (index != 1 || sink.requestFocusForUserPlay()) && session.sendMedia(index)
+                    status("media stage=media-control index=$index outcome=${if (sent) "sent" else "failed"}")
+                }
+            }
+            true
+        } catch (_: RejectedExecutionException) { false }
     }
     /** Coordinates relative to the actual video Surface, not its parent/letterboxed viewport. */
     fun touch(action: Int, x: Float, y: Float, width: Int, height: Int) {

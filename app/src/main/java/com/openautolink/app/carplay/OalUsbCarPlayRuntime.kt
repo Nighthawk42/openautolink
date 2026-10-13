@@ -232,8 +232,8 @@ class OalUsbCarPlayRuntime(
                     sink -> GnssForwarderImpl(context.applicationContext,sink,true)
                 },SystemClock::elapsedRealtime,CarPlayAppearanceBridge(),session::setNightModeIfEventReady,send,receipt,
                     frozenCapabilities=capabilities))
-            },runtimeMetadataFactory={ receipt -> own {
-                active();OalCarPlayMetadataLink(SystemClock::elapsedRealtime,receipt,OalCarPlayMetadataHost(context.applicationContext))
+            },runtimeMetadataFactory={ session, receipt -> own {
+                active();OalCarPlayMetadataLink(SystemClock::elapsedRealtime,receipt,OalCarPlayMetadataHost(context.applicationContext) { index -> receiver?.mediaCommand(session,index) == true })
             } },wired=true,onStatus=::status).also { receiver=it } }
         active();onDisplayQualified(projection.displayConfiguration)
         val scale=com.openautolink.carplaylab.media.CarPlayDisplayPolicy.scaleDiagnostic(projection.displayConfiguration)

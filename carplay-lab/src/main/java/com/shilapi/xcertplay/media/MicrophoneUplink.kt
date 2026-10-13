@@ -44,6 +44,18 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig,
         var encoder: OpusEncoder? = null
         var capture: AudioRecord? = null
         var transport: DatagramSocket? = null
+        var capturedFrames = 0L
+        var nonzeroFrames = 0L
+        fun captureReceipt(ended: Boolean) {
+            // Only aggregate signal presence and public routing policy, never samples/levels,
+            // device identifiers, addresses or recording configuration dumps.
+            // AudioRecord.getRecordingState reads local state; avoid potentially stalled public
+            // Binder route/configuration queries on the capture/transport owner.
+            val state = runCatching { capture?.recordingState }.getOrNull()
+                ?.takeIf { it == AudioRecord.RECORDSTATE_STOPPED || it == AudioRecord.RECORDSTATE_RECORDING }
+                ?.toString() ?: "unknown"
+            runCatching { report("media stage=microphone-capture type=100 audioType=${config.audioType} frames=$capturedFrames nonzeroFrames=$nonzeroFrames state=$state ended=$ended") }
+        }
         try {
             if (closed.get() || !AndroidMicrophoneSupport.permissionGranted()) return
             if (config.formatBits !in AndroidMicrophoneSupport.capability.bits(config.audioType)) return
@@ -84,6 +96,9 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig,
                 if (count == 0) { Thread.sleep(2); continue }
                 filled += count
                 if (filled != pcm.size) continue
+                capturedFrames++
+                if (pcm.any { it != 0.toByte() }) nonzeroFrames++
+                if (capturedFrames == 1L || capturedFrames % 250 == 0L) captureReceipt(false)
                 val frames = if (codec == null) {
                     // AudioRecord PCM16 is little endian; CarPlay LPCM payloads are big endian.
                     val body = pcm.copyOf()
@@ -112,6 +127,7 @@ internal class MicrophoneUplink(private val config: MicrophoneConfig,
         } catch (failure: Exception) {
             if (!closed.get()) report("media stage=microphone-failed type=100 errorType=${failure.javaClass.simpleName}")
         } finally {
+            if (capturedFrames > 0) captureReceipt(true)
             closed.set(true); pending.clear()
             synchronized(recordLock) { recorder = null }
             runCatching { capture?.stop() }; runCatching { capture?.release() }

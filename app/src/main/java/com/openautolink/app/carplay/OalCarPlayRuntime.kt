@@ -241,7 +241,7 @@ class OalCarPlayRuntime(
                         GnssForwarderImpl(context.applicationContext, sink, true)
                     }, SystemClock::elapsedRealtime, CarPlayAppearanceBridge(),
                     session::setNightModeIfEventReady, send, receipt)
-            }, runtimeMetadataFactory = { receipt -> own { active(); OalCarPlayMetadataLink(SystemClock::elapsedRealtime, receipt, OalCarPlayMetadataHost(context.applicationContext)) } }, onStatus = ::status).also { receiver = it } }
+            }, runtimeMetadataFactory = { session, receipt -> own { active(); OalCarPlayMetadataLink(SystemClock::elapsedRealtime, receipt, OalCarPlayMetadataHost(context.applicationContext) { index -> receiver?.mediaCommand(session,index) == true }) } }, onStatus = ::status).also { receiver = it } }
         // Log the actual decoder-qualified offer, not an earlier requested preset or coded viewport.
         active()
         onDisplayQualified(projection.displayConfiguration)
