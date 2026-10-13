@@ -45,7 +45,7 @@ class CarPlayTelemetryIntegrationTest {
         val app = File("src/main/java/com/openautolink/app")
         val runtime = File(app, "carplay/OalCarPlayRuntime.kt").readText()
         val vm = File(app, "ui/projection/ProjectionViewModel.kt").readText()
-        assertTrue(sink.contains("telemetry.frameRendered(nanoTime)"))
+        assertTrue(sink.contains("telemetry.frameRendered(nanoTime, target.generation)"))
         assertTrue(sink.contains("telemetry.decoderConfigured(candidate.name)"))
         assertTrue(sink.contains("telemetry.outputFormat(width, height,"))
         assertTrue(sink.contains("if (queue.offer(Packet(bytes,sample))) telemetry.audioPacketAccepted()"))

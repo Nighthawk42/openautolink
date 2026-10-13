@@ -23,7 +23,7 @@ class UsbAttachAuthorizationPolicyTest {
             every { interfaceProtocol } returns 2
         }
     }
-    @After fun cleanup() { UsbAttachAuthorization.forget("bus/2"); UsbAttachAuthorization.forget("bus/3"); unmockkAll() }
+    @After fun cleanup() { unmockkAll() }
     @Test fun narrowMatcherDoesNotClaimAllAppleOrAndroidOemDevices() {
         val mux = apple()
         assertTrue(UsbAttachAuthorization.matches(mux))
@@ -37,15 +37,14 @@ class UsbAttachAuthorizationPolicyTest {
         every { mux.productId } returns 0x2d02
         assertFalse(UsbAttachAuthorization.matches(mux))
     }
-    @Test fun requestAuthorityIsSingleUseAndDoesNotTransferToReplacementOrReusedName() {
+    @Test fun exactIdentityDoesNotTransferToReplacementOrReusedName() {
         val selected = apple()
-        UsbAttachAuthorization.explicitRetry(selected)
-        assertFalse(UsbAttachAuthorization.canRequest(apple("bus/3", 3)))
-        assertFalse(UsbAttachAuthorization.canRequest(apple(id = 3)))
-        assertTrue(UsbAttachAuthorization.takeRequest(selected))
-        assertFalse(UsbAttachAuthorization.takeRequest(selected))
+        assertTrue(UsbAttachAuthorization.exact(selected, apple()))
+        assertFalse(UsbAttachAuthorization.exact(selected, apple("bus/3", 3)))
+        assertFalse(UsbAttachAuthorization.exact(selected, apple(id = 3)))
+        assertFalse(UsbAttachAuthorization.exact(selected, null))
     }
-    @Test fun stopRevokesPickerAuthorityForAnUnadmittedCandidate() {
+    @Test fun stopRevokesAdmissionForAnUnadmittedCandidate() {
         val selected = apple()
         val usb = mockk<UsbManager>(relaxed = true) {
             every { deviceList } returns hashMapOf(selected.deviceName to selected)
@@ -53,12 +52,15 @@ class UsbAttachAuthorizationPolicyTest {
         val context = mockk<Context>(relaxed = true) {
             every { getSystemService(Context.USB_SERVICE) } returns usb
         }
-        val manager = UsbConnectionManager(context, TestScope(), {}, onCandidate = { _, _ -> })
+        var offered: Long? = null
+        val manager = UsbConnectionManager(context, TestScope(), {}, onCandidate = { generation, _ -> offered = generation })
         manager.javaClass.getDeclaredField("isRunning").apply { isAccessible = true }.set(manager, true)
         manager.javaClass.getDeclaredMethod("onUserSelectedDevice", String::class.java)
             .apply { isAccessible = true }.invoke(manager, selected.deviceName)
-        assertTrue(UsbAttachAuthorization.canRequest(selected))
+        assertNotNull(offered)
+        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<android.app.PendingIntent>()) }
         manager.stop()
-        assertFalse("A restarted manager must not inherit a cancelled picker request", UsbAttachAuthorization.canRequest(selected))
+        assertFalse("Stopped manager must reject a cancelled admission", manager.accept(offered!!))
+        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<android.app.PendingIntent>()) }
     }
 }

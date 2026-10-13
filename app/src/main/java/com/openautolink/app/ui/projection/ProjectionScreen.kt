@@ -100,6 +100,23 @@ private fun CarPlayRecoveryPanel(
     }
 }
 
+/** Same compact, passive treatment as AA's keyframe wait; never owns projected input. */
+@Composable
+private fun CarPlayVideoWaitIndicator(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color(0x99000000))
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+            .testTag("carPlayVideoWaitIndicator"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+        Text("Waiting for video\u2026", style = MaterialTheme.typography.bodyMedium, color = Color.White)
+    }
+}
+
 /** Confirmation only: the ViewModel owns routing, permissions and exact-generation retirement. */
 @Composable
 private fun UsbHotPlugSwitchDialog(
@@ -240,6 +257,12 @@ fun ProjectionScreen(
                 showSettings = showSettings, showDiagnostics = showDiagnostics,
                 onSettings = { showSettings = true },
             )
+            if (CarPlayVideoWaitPolicy.shouldShow(
+                    carPlayState, carPlayEnabled,
+                    showSettings || showDiagnostics || showCarPlaySafeEditor || showUsbPicker || usbHotPlugPrompt != null || usbSwitchFailure != null,
+                )) {
+                CarPlayVideoWaitIndicator(Modifier.align(Alignment.BottomCenter).padding(bottom = 48.dp))
+            }
             if (showSettings) settingsOverlay(
                 { showSettings = false }, { showSettings = false; showDiagnostics = true },
                 { showCarPlaySafeEditor = true })

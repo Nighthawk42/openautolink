@@ -55,6 +55,67 @@ class CarPlayRuntimePresentationTest(private val usb: Boolean, private val repla
         return runtime.javaClass.getDeclaredField("surface").apply { isAccessible = true }.get(runtime) as Surface?
     }
 
+    @Test fun queuedReplacementCannotRepublishPredecessorReadiness() {
+        val first = mockk<Surface>()
+        val replacement = if (replaceBeforePublish) first else mockk<Surface>()
+        val runtime = runtimes(first).single()
+        val receiver = mockk<ProjectionReceiver>(relaxed = true)
+        val telemetry = com.openautolink.carplaylab.media.ReceiverTelemetry(91)
+        val generation = java.util.concurrent.atomic.AtomicLong(1)
+        telemetry.presentationChanged(generation.get())
+        every { receiver.telemetrySnapshot() } answers { telemetry.snapshot(100) }
+        every { receiver.attachSurface(any()) } answers { telemetry.presentationChanged(generation.incrementAndGet()) }
+        every { receiver.detachSurface(any()) } answers { telemetry.presentationChanged(generation.incrementAndGet()) }
+        every { receiver.awaitClosed(10_000) } returns true
+        val presentationWorker = runtime.javaClass.getDeclaredField("presentationWorker")
+            .apply { isAccessible = true }.get(runtime) as java.util.concurrent.ExecutorService
+        val blocked = CountDownLatch(1)
+        val reconcile = CountDownLatch(1)
+        val running = CountDownLatch(1)
+        val finish = CountDownLatch(1)
+        val state = java.util.concurrent.atomic.AtomicReference(CarPlayUiState())
+        val coordinator = CarPlayCoordinator(CarPlayOwnership(), {}) { state.set(it) }
+        try {
+            installReceiver(runtime) { receiver }
+            coordinator.attachSurface(first)
+            assertTrue(coordinator.connect(true) { object : CarPlayRuntime by runtime {
+                override fun run() { running.countDown(); check(finish.await(10, TimeUnit.SECONDS)) }
+                override fun close() { runtime.close(); finish.countDown() }
+            } })
+            assertTrue(running.await(3, TimeUnit.SECONDS))
+            telemetry.frameRendered(1, generation.get())
+            coordinator.refreshTelemetry()
+            assertFalse(state.get().waitingForVideo)
+            val blocker = presentationWorker.submit {
+                blocked.countDown(); check(reconcile.await(5, TimeUnit.SECONDS))
+            }
+            assertTrue(blocked.await(3, TimeUnit.SECONDS))
+            val predecessor = generation.get()
+            if (replaceBeforePublish) coordinator.detachSurface(first)
+            coordinator.attachSurface(replacement)
+            assertTrue("request immediately clears sampled readiness", state.get().waitingForVideo)
+            coordinator.refreshTelemetry()
+            assertTrue("queued production reconciliation must fence predecessor rendered proof", state.get().waitingForVideo)
+            assertEquals("receiver has not applied the request", predecessor, generation.get())
+            assertEquals("lifetime observations remain available", 1L, state.get().evidence.telemetry?.renderedFrames)
+            reconcile.countDown()
+            blocker.get(3, TimeUnit.SECONDS)
+            presentationWorker.submit {}.get(3, TimeUnit.SECONDS)
+            coordinator.refreshTelemetry()
+            assertTrue("applied receipt alone is not a real render", state.get().waitingForVideo)
+            telemetry.frameRendered(2, predecessor)
+            coordinator.refreshTelemetry()
+            assertTrue("late predecessor callback cannot certify replacement", state.get().waitingForVideo)
+            telemetry.frameRendered(3, generation.get())
+            coordinator.refreshTelemetry()
+            assertFalse("replacement actual render hides indicator", state.get().waitingForVideo)
+            coordinator.stop()
+            assertFalse(state.get().waitingForVideo)
+        } finally {
+            reconcile.countDown(); finish.countDown(); coordinator.close(); runtime.close()
+        }
+    }
+
     @Test fun onlyExactCurrentPresentationCanBeDetachedWithoutRevokingTransport() {
         val first = mockk<Surface>()
         val replacement = mockk<Surface>()

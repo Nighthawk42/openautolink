@@ -173,6 +173,25 @@ class CarPlayPresentationTest {
             assertTrue(fresh.effectThreads.all { it == "lab-video" })
         } finally { resume.countDown(); f.close() }
     }
+    @Test fun renderedPredecessorDoesNotCertifyReattachedPresentation() {
+        val f = Fixture()
+        try {
+            f.config(); val old = f.decoder()
+            assertFalse("configure is not rendering", f.telemetry.snapshot(0).presentationRendered)
+            old.listener.get().onFrameRendered(old.codec, 1, 1)
+            assertTrue(f.telemetry.snapshot(1).presentationRendered)
+            f.sink.detachSurface(f.surface)
+            assertFalse("detach clears readiness synchronously", f.telemetry.snapshot(1).presentationRendered)
+            f.sink.attachSurface(f.surface)
+            val fresh = f.decoder()
+            assertEquals(1L, f.telemetry.snapshot(1).renderedFrames)
+            assertFalse(f.telemetry.snapshot(1).presentationRendered)
+            old.listener.get().onFrameRendered(old.codec, 2, 2)
+            assertFalse("old callback cannot restore readiness", f.telemetry.snapshot(2).presentationRendered)
+            fresh.listener.get().onFrameRendered(fresh.codec, 3, 3)
+            assertTrue("actual current callback certifies readiness", f.telemetry.snapshot(3).presentationRendered)
+        } finally { f.close() }
+    }
     @Test fun lostSurfaceDoesNotRetireVideoOwner() {
         val surface = Surface(SurfaceTexture(0))
         val lost = CountDownLatch(1)

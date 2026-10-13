@@ -7,13 +7,13 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
-import com.openautolink.app.transport.usb.UsbAttachAuthorization
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-/** One exact-device wait. OS-matched enumerations observe platform grants unless the
- * picker authorizes a single app request. No automatic retries or permission transfer. */
+/** One exact-device permission request/wait per admitted startup stage. A manifest
+ * match is not a grant; replacements require their own actual platform permission.
+ * No automatic retries or permission transfer. */
 object UsbCarPlayPermission {
     const val REENUMERATION_TIMEOUT_MS = 15_000L
     private const val PERMISSION_TIMEOUT_MS = 120_000L
@@ -24,7 +24,6 @@ object UsbCarPlayPermission {
               timeoutMs: Long = PERMISSION_TIMEOUT_MS, isCancelled: () -> Boolean): Result {
         val early = if (isCancelled()) Result.CANCELLED else if (timeoutMs <= 0) Result.TIMED_OUT else null
         if (early != null) {
-            UsbAttachAuthorization.forget(device.deviceName)
             return early
         }
         val generation = generations.incrementAndGet()
@@ -60,15 +59,12 @@ object UsbCarPlayPermission {
             if (isCancelled()) return Result.CANCELLED
             if (!attached()) return Result.DETACHED
             if (usb.hasPermission(device)) return Result.GRANTED
-            fun requestIfAuthorized() {
-                if (capability == null && UsbAttachAuthorization.takeRequest(device)) {
-                    capability = PendingIntent.getBroadcast(context, generation.toInt(),
-                        Intent(action).setPackage(context.packageName).putExtra("generation", generation),
-                        PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_ONE_SHOT)
-                    usb.requestPermission(device, capability)
-                }
-            }
-            requestIfAuthorized()
+            capability = PendingIntent.getBroadcast(context, generation.toInt(),
+                Intent(action).setPackage(context.packageName).putExtra("generation", generation),
+                PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_ONE_SHOT)
+            // Android can race this call with an OS/default grant; requestPermission
+            // also resolves immediately when it finds the device already authorized.
+            usb.requestPermission(device, capability)
             val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
             while (true) {
                 if (isCancelled()) return Result.CANCELLED
@@ -81,11 +77,9 @@ object UsbCarPlayPermission {
                 if (usb.hasPermission(device)) return Result.GRANTED
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0) return Result.TIMED_OUT
-                requestIfAuthorized()
                 done.await(minOf(remaining, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS)
             }
         } finally {
-            UsbAttachAuthorization.forget(device.deviceName)
             try { capability?.cancel() } finally { context.unregisterReceiver(receiver) }
         }
     }

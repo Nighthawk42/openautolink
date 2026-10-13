@@ -45,7 +45,7 @@ class OalUsbCarPlayRuntime(
     private val initialPresentation = PresentationReceipt(surface)
     private val requestedPresentation = java.util.concurrent.atomic.AtomicReference(initialPresentation)
     // Applied target and receiver publication are owned together under resourcesLock.
-    private var presentation: PresentationReceipt? = initialPresentation
+    @Volatile private var presentation: PresentationReceipt? = initialPresentation
     private val presentationQueued = AtomicBoolean()
     private val presentationWorker = Executors.newSingleThreadExecutor {
         Thread(it, "oal-usb-carplay-presentation").apply { isDaemon = true }
@@ -383,7 +383,18 @@ class OalUsbCarPlayRuntime(
     fun touch(actionMasked:Int,actionIndex:Int,pointers:List<CarPlayPointer>,width:Int,height:Int) {
         if(!canceled.get()) receiver?.touchContacts(touchMapper.map(actionMasked,actionIndex,pointers,width,height))
     }
-    override fun telemetrySnapshot()=if(canceled.get()) null else receiver?.telemetrySnapshot()
+    override fun telemetrySnapshot(): ReceiverTelemetrySnapshot? {
+        if (canceled.get()) return null
+        // Sampling must certify the requested receipt, not a rendered predecessor while
+        // the presentation worker is queued. Never wait behind resource/decoder work.
+        val requested = requestedPresentation.get()
+        val applied = presentation
+        val snapshot = receiver?.telemetrySnapshot() ?: return null
+        if (canceled.get()) return null
+        return if (applied === requested && presentation === requested &&
+            requestedPresentation.get() === requested && requested.surface != null) snapshot
+        else snapshot.copy(presentationRendered = false)
+    }
     override fun cancel() { canceled.set(true);presentationWorker.shutdownNow();receiver?.revokePendingAdmission() }
     override fun close() = synchronized(closeLock) {
         cancel();val retiring=synchronized(resourcesLock) { resources.toList().asReversed() }

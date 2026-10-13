@@ -93,9 +93,16 @@ class AndroidMediaSink(
     private val currentVideoCodec = java.util.concurrent.atomic.AtomicReference<MediaCodec?>()
     private val codecGeneration = AtomicLong()
     private val presentation = VideoPresentation(surface)
+    init { telemetry.presentationChanged(presentation.snapshot().generation) }
     /** Receipts only: MediaCodec effects belong exclusively to lab-video. */
-    fun attachSurface(surface: Surface) { presentation.attach(surface) }
-    fun detachSurface(surface: Surface) { presentation.detach(surface) }
+    fun attachSurface(surface: Surface) {
+        presentation.attach(surface)
+        telemetry.presentationChanged(presentation.snapshot().generation)
+    }
+    fun detachSurface(surface: Surface) {
+        presentation.detach(surface)
+        telemetry.presentationChanged(presentation.snapshot().generation)
+    }
     @Volatile private var announcedCodec = VideoCodec.H264
     private val videoThread = Thread(::runVideo, "lab-video").apply { isDaemon = true; start() }
     private val routeDiagnostics = PassiveAudioRouteDiagnostics(manager, {
@@ -246,7 +253,7 @@ class AndroidMediaSink(
                 candidate.setOnFrameRenderedListener({ _, _, nanoTime ->
                     if (!closed.get() && presentation.isCurrent(target) && latestVideoConfig.get() === job &&
                         codecGeneration.get() == generation && currentVideoCodec.get() === candidate) {
-                        telemetry.frameRendered(nanoTime)
+                        telemetry.frameRendered(nanoTime, target.generation)
                         if (firstRendered.compareAndSet(false, true))
                             report("media stage=presentation-rendered generation=${target.generation} codecGeneration=$generation")
                         val count = rendered.incrementAndGet()
@@ -293,7 +300,10 @@ class AndroidMediaSink(
                 try {
                     val desired = presentation.snapshot()
                     if (desired.surface != null && !desired.surface.isValid) {
-                        if (presentation.invalidate(desired)) report("media stage=surface-lost")
+                        if (presentation.invalidate(desired)) {
+                            telemetry.presentationChanged(presentation.snapshot().generation)
+                            report("media stage=surface-lost")
+                        }
                         continue
                     }
                     val latest = latestVideoConfig.get()
