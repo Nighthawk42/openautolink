@@ -28,10 +28,11 @@ import java.util.concurrent.atomic.AtomicLong
 /** H264/platform-decoded output and optional platform-encoded, permission-gated microphone. */
 class AndroidMediaSink(
     context: Context,
-    private val surface: Surface,
+    surface: Surface,
     private val display: CarPlayDisplaySelection = CarPlayDisplayPolicy.select(CarPlayDisplayPreferences()),
     private val onStatus: (String) -> Unit = {},
-    private val onSurfaceLost: () -> Unit = {},
+    // Retained source compatibility only: presentation loss must never call session teardown.
+    @Suppress("UNUSED_PARAMETER") onSurfaceLost: () -> Unit = {},
     private val telemetry: com.openautolink.carplaylab.media.ReceiverTelemetry = com.openautolink.carplaylab.media.ReceiverTelemetry(0),
     private val videoSelection: CarPlayVideoSelection = CarPlayVideoSelection(display.display.width,
         display.display.height,display.display.fps,display.decoderName),
@@ -80,15 +81,21 @@ class AndroidMediaSink(
     private fun reportFocus(reason: String, result: String) {
         report("media stage=audio-focus-request reason=$reason result=$result revision=$focusRevision volumePercent=${(focusVolume * 100).toInt()} mute=$muteReason")
     }
-    private var recovery: (() -> Unit)? = null
-    private var diagnostic: ((String) -> Unit)? = null
+    @Volatile private var recovery: (() -> Unit)? = null
+    @Volatile private var diagnostic: ((String) -> Unit)? = null
     private val videoQueue = ArrayBlockingQueue<VideoJob>(24)
+    private val latestVideoConfig = java.util.concurrent.atomic.AtomicReference<VideoConfig?>()
     private val rendered = AtomicLong()
     private val writtenBytes = AtomicLong()
     private val audioOwners = AtomicLong()
     private val videoRetired = AtomicBoolean()
     val isVideoRetired: Boolean get() = videoRetired.get()
     private val currentVideoCodec = java.util.concurrent.atomic.AtomicReference<MediaCodec?>()
+    private val codecGeneration = AtomicLong()
+    private val presentation = VideoPresentation(surface)
+    /** Receipts only: MediaCodec effects belong exclusively to lab-video. */
+    fun attachSurface(surface: Surface) { presentation.attach(surface) }
+    fun detachSurface(surface: Surface) { presentation.detach(surface) }
     @Volatile private var announcedCodec = VideoCodec.H264
     private val videoThread = Thread(::runVideo, "lab-video").apply { isDaemon = true; start() }
     private val routeDiagnostics = PassiveAudioRouteDiagnostics(manager, {
@@ -100,10 +107,10 @@ class AndroidMediaSink(
         val receipts = owners.mapNotNull { it.routeReceipt() }
         listOf("media stage=audio-owners scope=own owners=${owners.size} tracks=${receipts.size}") + receipts + volumes
     }, ::report)
+    private class VideoConfig(val codec: VideoCodec, val bytes: ByteArray)
     private sealed class VideoJob {
-        class Config(val codec: VideoCodec, val bytes: ByteArray) : VideoJob()
-        class Frame(val bytes: ByteArray) : VideoJob()
-        object Reset : VideoJob()
+        class Frame(val bytes: ByteArray, val presentation: VideoPresentation.Receipt, val config: VideoConfig?) : VideoJob()
+        class Reset(val presentation: VideoPresentation.Receipt) : VideoJob()
     }
     private fun report(message: String) { runCatching { onStatus(message) } }
     override fun setVideoRecoveryHandler(type: Int, handler: () -> Unit) { if (type == 110) recovery = handler }
@@ -116,17 +123,21 @@ class AndroidMediaSink(
         if (closed.get() || type != 110) return
         val (actual, data) = ScreenCodec.detectConfig(codecData)
         require(actual == announcedCodec) { "Video codec/config mismatch" }
-        videoQueue.clear(); videoQueue.offer(VideoJob.Config(actual,data.copyOf()))
+        // Config must outlive frame overflow and presentation loss. One latest immutable receipt.
+        latestVideoConfig.set(VideoConfig(actual,data.copyOf()))
+        videoQueue.clear()
     }
     override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
         if (closed.get() || type != 110) return
-        if (!videoQueue.offer(VideoJob.Frame(naluBytes))) {
-            videoQueue.clear(); videoQueue.offer(VideoJob.Reset)
+        val target = presentation.snapshot()
+        if (target.closed || target.surface == null) return // bounded offscreen discard; no recovery
+        if (!videoQueue.offer(VideoJob.Frame(naluBytes, target, latestVideoConfig.get()))) {
+            videoQueue.clear(); videoQueue.offer(VideoJob.Reset(target))
             report("media stage=video-queue-overflow")
         }
     }
     override fun onScreenStreamActive(type: Int, active: Boolean) {
-        if (type == 110 && !active) { videoQueue.clear(); videoQueue.offer(VideoJob.Reset) }
+        if (type == 110 && !active) { videoQueue.clear(); videoQueue.offer(VideoJob.Reset(presentation.snapshot())) }
     }
     override fun supportsAudio(format: AudioFormat): Boolean = AndroidAudioDecoderSupport.supports(format)
     override fun supportsMicrophone(format: AudioFormat): Boolean = !closed.get() &&
@@ -197,30 +208,47 @@ class AndroidMediaSink(
     }
     private fun runVideo() {
         var codec: MediaCodec? = null
-        var config: VideoJob.Config? = null
+        var config: VideoConfig? = null
         var activeCodec = VideoCodec.H264
         var anchored = false
         var lastRecoveryNs = 0L
-        fun release() { currentVideoCodec.set(null); runCatching { codec?.stop() }; runCatching { codec?.release() }; codec = null; anchored = false }
-        fun recover() {
+        var observed = presentation.snapshot()
+        fun visible() = !closed.get() && presentation.isCurrent(observed) &&
+            observed.surface?.isValid == true && latestVideoConfig.get() === config
+        fun release() {
+            codecGeneration.incrementAndGet()
+            currentVideoCodec.set(null)
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            codec = null
             anchored = false
-            val now = System.nanoTime()
-            if (now - lastRecoveryNs > 1_000_000_000L) { lastRecoveryNs = now; recovery?.invoke() }
         }
-        fun configure(job: VideoJob.Config) {
+        fun recover(force: Boolean = false) {
+            anchored = false
+            if (!visible()) return
+            val now = System.nanoTime()
+            if (force || now - lastRecoveryNs > 1_000_000_000L) { lastRecoveryNs = now; recovery?.invoke() }
+        }
+        fun configure(job: VideoConfig) {
             release()
             activeCodec = job.codec
             val fmt = CarPlayVideoQualification.mediaFormat(job.codec,job.bytes,videoSelection)
-            if (closed.get()) return
+            val target = observed
+            if (!visible()) return
             val candidate = videoCodecFactory(checkNotNull(videoSelection.decoderName(job.codec)))
+            val generation = codecGeneration.get()
+            val firstRendered = AtomicBoolean()
             try {
                 val caps = candidate.codecInfo.getCapabilitiesForType(CarPlayVideoQualification.mime(job.codec))
                 require(CarPlayVideoQualification.supports(caps,fmt,videoSelection.fps)) { "Incoming format unsupported by exact decoder" }
-                if (closed.get()) { candidate.release(); return }
-                candidate.configure(fmt, surface, null, 0)
+                if (!visible()) { candidate.release(); return }
+                candidate.configure(fmt, target.surface, null, 0)
                 candidate.setOnFrameRenderedListener({ _, _, nanoTime ->
-                    if (!closed.get() && currentVideoCodec.get() === candidate) {
+                    if (!closed.get() && presentation.isCurrent(target) && latestVideoConfig.get() === job &&
+                        codecGeneration.get() == generation && currentVideoCodec.get() === candidate) {
                         telemetry.frameRendered(nanoTime)
+                        if (firstRendered.compareAndSet(false, true))
+                            report("media stage=presentation-rendered generation=${target.generation} codecGeneration=$generation")
                         val count = rendered.incrementAndGet()
                         if (count == 1L) {
                             diagnostic?.invoke("first frame rendered")
@@ -228,8 +256,9 @@ class AndroidMediaSink(
                         } else if (count % 300 == 0L) report("media stage=frames-rendered count=$count")
                     }
                 }, Handler(Looper.getMainLooper()))
-                if (closed.get()) { candidate.release(); return }
+                if (!visible()) { candidate.release(); return }
                 candidate.start(); codec = candidate; currentVideoCodec.set(candidate)
+                if (!visible()) { release(); return }
                 telemetry.decoderConfigured(candidate.name)
                 report("media stage=${if(job.codec==VideoCodec.H264) "h264" else "h265"}-configured")
             } catch (failure: Exception) { runCatching { candidate.release() }; throw failure }
@@ -238,9 +267,9 @@ class AndroidMediaSink(
             val info = MediaCodec.BufferInfo()
             // Busy decoders must not monopolize this owner and starve replacement/retirement.
             repeat(32) {
-                if (closed.get()) return
+                if (!visible()) return
                 val index = current.dequeueOutputBuffer(info, 0)
-                if (index >= 0) current.releaseOutputBuffer(index, info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0)
+                if (index >= 0) current.releaseOutputBuffer(index, visible() && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0)
                 else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     // Allowlist dimensions only: outputFormat.toString() can contain codec data.
                     val output = current.outputFormat
@@ -261,12 +290,34 @@ class AndroidMediaSink(
         }
         try {
             while (!closed.get()) {
-                if (!surface.isValid) { report("media stage=surface-lost"); onSurfaceLost(); return }
                 try {
+                    val desired = presentation.snapshot()
+                    if (desired.surface != null && !desired.surface.isValid) {
+                        if (presentation.invalidate(desired)) report("media stage=surface-lost")
+                        continue
+                    }
+                    val latest = latestVideoConfig.get()
+                    val configChanged = latest !== config
+                    config = latest
+                    if (desired !== observed) {
+                        observed = desired
+                        release()
+                        if (desired.surface != null) {
+                            report("media stage=presentation-attached generation=${desired.generation}")
+                            config?.let { configure(it) }; recover(force = true)
+                        } else report("media stage=presentation-detached generation=${desired.generation}")
+                    } else if (configChanged && desired.surface != null) {
+                        config?.let { configure(it) }; recover()
+                    }
+                    if (observed.surface == null) {
+                        videoQueue.clear()
+                        TimeUnit.MILLISECONDS.sleep(10)
+                        continue
+                    }
                     when (val job = videoQueue.poll(10, TimeUnit.MILLISECONDS)) {
-                        is VideoJob.Config -> { config = job; configure(job); recover() }
-                        is VideoJob.Reset -> { release(); recover() }
+                        is VideoJob.Reset -> if (job.presentation === observed) { release(); recover() }
                         is VideoJob.Frame -> {
+                            if (job.presentation !== observed || job.config !== config || !visible()) continue
                             val bytes = MediaCodecSupport.toAnnexB(job.bytes)
                             val idr = MediaCodecSupport.isRandomAccess(bytes, activeCodec)
                             if (!anchored && !idr) { recover(); continue }
@@ -275,9 +326,10 @@ class AndroidMediaSink(
                             drain(current)
                             var index = current.dequeueInputBuffer(0)
                             val deadline = System.nanoTime() + 100_000_000L
-                            while (index < 0 && !closed.get() && System.nanoTime() < deadline) {
+                            while (index < 0 && visible() && System.nanoTime() < deadline) {
                                 drain(current); index = current.dequeueInputBuffer(5000)
                             }
+                            if (!visible()) continue
                             if (index < 0) { release(); recover(); continue }
                             val input = checkNotNull(current.getInputBuffer(index)); input.clear()
                             if (bytes.isEmpty() || bytes.size > input.remaining()) { release(); recover(); continue }
@@ -290,15 +342,17 @@ class AndroidMediaSink(
                 } catch (_: Exception) { release(); report("media stage=video-decoder-failed"); recover() }
             }
         } catch (_: InterruptedException) { /* shutdown */ }
-        finally { release(); videoRetired.set(true) }
+        finally { release(); videoRetired.set(true); report("media stage=video-retired") }
     }
     /** Nonblocking cancellation while user PLAY may be inside the platform focus call. */
     fun revokePendingWork() {
+        presentation.close()
         if (closed.compareAndSet(false, true)) telemetry.retire()
         videoThread.interrupt()
     }
     override fun close() {
         routeDiagnostics.close()
+        presentation.close()
         if (closed.compareAndSet(false, true)) telemetry.retire()
         currentVideoCodec.set(null)
         videoThread.interrupt(); videoQueue.clear()

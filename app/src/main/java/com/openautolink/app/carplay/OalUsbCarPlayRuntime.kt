@@ -40,8 +40,46 @@ class OalUsbCarPlayRuntime(
     private val closeLock=Any()
     private val resources=mutableListOf<AutoCloseable>()
     @Volatile private var receiver:ProjectionReceiver?=null
+    // Callbacks cannot wait behind the resource factory/retirement lock.
+    private class PresentationReceipt(val surface: Surface?)
+    private val initialPresentation = PresentationReceipt(surface)
+    private val requestedPresentation = java.util.concurrent.atomic.AtomicReference(initialPresentation)
+    // Applied target and receiver publication are owned together under resourcesLock.
+    private var presentation: PresentationReceipt? = initialPresentation
+    private val presentationQueued = AtomicBoolean()
+    private val presentationWorker = Executors.newSingleThreadExecutor {
+        Thread(it, "oal-usb-carplay-presentation").apply { isDaemon = true }
+    }
+    override fun attachSurface(surface: Surface) {
+        while (!canceled.get()) {
+            val old = requestedPresentation.get()
+            if (old.surface === surface) return
+            if (requestedPresentation.compareAndSet(old, PresentationReceipt(surface))) { schedulePresentation(); return }
+        }
+    }
+    override fun detachSurface(surface: Surface) {
+        while (!canceled.get()) {
+            val old = requestedPresentation.get()
+            if (old.surface !== surface) return
+            if (requestedPresentation.compareAndSet(old, PresentationReceipt(null))) { schedulePresentation(); return }
+        }
+    }
+    private fun schedulePresentation() {
+        if (canceled.get() || receiver == null || !presentationQueued.compareAndSet(false, true)) return
+        try {
+            presentationWorker.execute {
+                var observed = requestedPresentation.get()
+                try {
+                    synchronized(resourcesLock) { observed = requestedPresentation.get(); reconcilePresentation() }
+                } finally {
+                    presentationQueued.set(false)
+                    if (requestedPresentation.get() !== observed) schedulePresentation()
+                }
+            }
+        } catch (_: RejectedExecutionException) { presentationQueued.set(false) }
+    }
     private val touchMapper=CarPlayTouchMapper()
-    private fun active() { check(!canceled.get() && surface.isValid) { "USB CarPlay attempt revoked" } }
+    private fun active() { check(!canceled.get()) { "USB CarPlay attempt revoked" } }
     private val audioDiagnostics=CarPlayAudioDiagnosticReporter(diagnosticSessions.incrementAndGet(),System::nanoTime) { line ->
         runCatching { com.openautolink.app.diagnostics.DiagnosticLog.i("carplay-audio",line) }
         runCatching { android.util.Log.i("OalCarPlayAudio",line) }
@@ -56,6 +94,28 @@ class OalUsbCarPlayRuntime(
         // awaited close/retry even when installation cannot return it to the caller.
         check(!canceled.get()) { "USB CarPlay attempt revoked" }
         resource
+    }
+    private fun ownReceiver(create: () -> ProjectionReceiver): ProjectionReceiver = synchronized(resourcesLock) {
+        val projection = own(create)
+        active()
+        receiver = projection
+        presentation = initialPresentation // Constructor starts with the qualified bootstrap target.
+        reconcilePresentation()
+        projection
+    }
+    private fun reconcilePresentation() {
+        if (canceled.get()) return
+        val projection = receiver ?: return
+        val target = requestedPresentation.get()
+        if (target === presentation) return
+        val targetSurface = target.surface
+        if (targetSurface != null) {
+            // SurfaceHolder may recreate the SAME Java Surface. Preserve a coalesced
+            // destroy/attach receipt by forcing the receiver's generation to advance.
+            if (targetSurface === presentation?.surface) projection.detachSurface(targetSurface)
+            projection.attachSurface(targetSurface)
+        } else presentation?.surface?.let(projection::detachSurface)
+        presentation = target
     }
     private var trustPending = false
     private var topology = topology(device)
@@ -94,7 +154,7 @@ class OalUsbCarPlayRuntime(
             throw failureUi(reason)
         }
         status("CarPlay USB stage=usb-permission result=pending")
-        requirePermission(UsbCarPlayPermission.await(context, usb, device) { canceled.get() || !surface.isValid })
+        requirePermission(UsbCarPlayPermission.await(context, usb, device) { canceled.get() })
         active()
         val serial=device.serialNumber?.takeIf { it.isNotBlank() } ?: error("Private USB serial required for exact ownership")
         VpnService.prepare(context)?.let {
@@ -127,7 +187,7 @@ class OalUsbCarPlayRuntime(
                 if(detached.get() && candidate!=null) {
                     topology=topology(candidate)
                     requirePermission(UsbCarPlayPermission.await(context, usb, candidate,
-                        UsbCarPlayPermission.REENUMERATION_TIMEOUT_MS-elapsed) { canceled.get() || !surface.isValid })
+                        UsbCarPlayPermission.REENUMERATION_TIMEOUT_MS-elapsed) { canceled.get() })
                     active()
                     val acceptedElapsed=SystemClock.elapsedRealtime()-started
                     val fresh=usb.deviceList.values.filter { isCandidate(it) && it.deviceName!=device.deviceName &&
@@ -226,7 +286,7 @@ class OalUsbCarPlayRuntime(
         val vehicleBootstrap=own { com.openautolink.carplaylab.intake.OalCarDataBootstrap(capabilities,SystemClock::elapsedRealtime,::status) }
         val identification=Iap2IdentificationConfig("OpenAutoLink","OAL-native-CarPlay","OpenAutoLink",
             "oal-private-receiver","0.1","Android",function.data.id,externalAccessoryProtocol="com.openautolink.carplaylab")
-        val projection=own { ProjectionReceiver(context,identity,surface,auth,display,trustedOnly=true,
+        val projection=ownReceiver { ProjectionReceiver(context,identity,surface,auth,display,trustedOnly=true,
             runtimeCarDataFactory={ session,send,receipt ->
                 vehicleBootstrap.wrap(OalCarPlayIntakeLink(gps,vehicle,OalCarPlayGnssSnapshotAdapter(SystemClock::elapsedRealtime) {
                     sink -> GnssForwarderImpl(context.applicationContext,sink,true)
@@ -244,7 +304,7 @@ class OalUsbCarPlayRuntime(
                             ?.carBluetoothConnectionObserver?.subscribeEvidence(listener)
                     }.getOrNull()
                 }, receipt)
-            } },wired=true,onStatus=::status).also { receiver=it } }
+            } },wired=true,onStatus=::status) }
         active();onDisplayQualified(projection.displayConfiguration)
         val scale=com.openautolink.carplaylab.media.CarPlayDisplayPolicy.scaleDiagnostic(projection.displayConfiguration)
         com.openautolink.app.diagnostics.DiagnosticLog.i("carplay-scale",scale)
@@ -324,7 +384,7 @@ class OalUsbCarPlayRuntime(
         if(!canceled.get()) receiver?.touchContacts(touchMapper.map(actionMasked,actionIndex,pointers,width,height))
     }
     override fun telemetrySnapshot()=if(canceled.get()) null else receiver?.telemetrySnapshot()
-    override fun cancel() { canceled.set(true);receiver?.revokePendingAdmission() }
+    override fun cancel() { canceled.set(true);presentationWorker.shutdownNow();receiver?.revokePendingAdmission() }
     override fun close() = synchronized(closeLock) {
         cancel();val retiring=synchronized(resourcesLock) { resources.toList().asReversed() }
         val closeFailures=java.util.IdentityHashMap<AutoCloseable,Exception>()
@@ -351,7 +411,8 @@ class OalUsbCarPlayRuntime(
             } catch(error:Exception) { if(failed==null) failed=error }
         }
         failed?.let { throw it }
-        receiver=null;Unit
+        check(presentationWorker.awaitTermination(5,TimeUnit.SECONDS)) { "USB presentation worker retirement timed out" }
+        synchronized(resourcesLock) { receiver=null;presentation=null };Unit
     }
     companion object {
         private val retryFence = UsbCarPlayRetryFence()

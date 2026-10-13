@@ -75,9 +75,47 @@ class OalCarPlayRuntime(
     private val closeLock = Any()
     private val resources = mutableListOf<AutoCloseable>()
     @Volatile private var receiver: ProjectionReceiver? = null
+    // Callbacks cannot wait behind the resource factory/retirement lock.
+    private class PresentationReceipt(val surface: Surface?)
+    private val initialPresentation = PresentationReceipt(surface)
+    private val requestedPresentation = java.util.concurrent.atomic.AtomicReference(initialPresentation)
+    // Applied target and receiver publication are owned together under resourcesLock.
+    private var presentation: PresentationReceipt? = initialPresentation
+    private val presentationQueued = AtomicBoolean()
+    private val presentationWorker = Executors.newSingleThreadExecutor {
+        Thread(it, "oal-carplay-presentation").apply { isDaemon = true }
+    }
+    override fun attachSurface(surface: Surface) {
+        while (!canceled.get()) {
+            val old = requestedPresentation.get()
+            if (old.surface === surface) return
+            if (requestedPresentation.compareAndSet(old, PresentationReceipt(surface))) { schedulePresentation(); return }
+        }
+    }
+    override fun detachSurface(surface: Surface) {
+        while (!canceled.get()) {
+            val old = requestedPresentation.get()
+            if (old.surface !== surface) return
+            if (requestedPresentation.compareAndSet(old, PresentationReceipt(null))) { schedulePresentation(); return }
+        }
+    }
+    private fun schedulePresentation() {
+        if (canceled.get() || receiver == null || !presentationQueued.compareAndSet(false, true)) return
+        try {
+            presentationWorker.execute {
+                var observed = requestedPresentation.get()
+                try {
+                    synchronized(resourcesLock) { observed = requestedPresentation.get(); reconcilePresentation() }
+                } finally {
+                    presentationQueued.set(false)
+                    if (requestedPresentation.get() !== observed) schedulePresentation()
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) { presentationQueued.set(false) }
+    }
     private val deadlines = Executors.newSingleThreadScheduledExecutor { Thread(it, "oal-carplay-deadline").apply { isDaemon = true } }
 
-    private fun active() { check(!canceled.get() && surface.isValid) { "CarPlay attempt revoked" } }
+    private fun active() { check(!canceled.get()) { "CarPlay attempt revoked" } }
     private fun <T : AutoCloseable> own(create: () -> T): T = synchronized(resourcesLock) {
         // Creation belongs to the installation boundary: close's canceled snapshot must not
         // race an already-created owner that has not yet reached this list.
@@ -88,6 +126,28 @@ class OalCarPlayRuntime(
         // Keep that exact resource for close/retry rather than losing it on this exception.
         check(!canceled.get()) { "CarPlay attempt revoked" }
         resource
+    }
+    private fun ownReceiver(create: () -> ProjectionReceiver): ProjectionReceiver = synchronized(resourcesLock) {
+        val projection = own(create)
+        active()
+        receiver = projection
+        presentation = initialPresentation // Constructor starts with the qualified bootstrap target.
+        reconcilePresentation()
+        projection
+    }
+    private fun reconcilePresentation() {
+        if (canceled.get()) return
+        val projection = receiver ?: return
+        val target = requestedPresentation.get()
+        if (target === presentation) return
+        val targetSurface = target.surface
+        if (targetSurface != null) {
+            // SurfaceHolder may recreate the SAME Java Surface. Preserve a coalesced
+            // destroy/attach receipt by forcing the receiver's generation to advance.
+            if (targetSurface === presentation?.surface) projection.detachSurface(targetSurface)
+            projection.attachSurface(targetSurface)
+        } else presentation?.surface?.let(projection::detachSurface)
+        presentation = target
     }
     // Process-local runtime-session sequence, never pairing identity, phone address or persistence data.
     private val audioDiagnostics = CarPlayAudioDiagnosticReporter(
@@ -231,7 +291,7 @@ class OalCarPlayRuntime(
         catch (failure: Exception) { throw CarPlayConnectionFailure(CarPlayFailureKind.BOOTSTRAP_AUTHENTICATION, network.manualPeer != null, failure) }
         active()
         status("CarPlay receiver MFi authentication accepted · phone AirPlay trust pending")
-        val projection = own { ProjectionReceiver(context, config.receiverAddress, surface, auth, config.display,
+        val projection = ownReceiver { ProjectionReceiver(context, config.receiverAddress, surface, auth, config.display,
             trustedOnly = true, runtimeCarDataFactory = { session, send, receipt ->
                 // Freeze truthful implemented capability flags per actual Wi-Fi link, not Bluetooth.
                 val qualifiedGps = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
@@ -253,7 +313,7 @@ class OalCarPlayRuntime(
                             ?.carBluetoothConnectionObserver?.subscribeEvidence(listener)
                     }.getOrNull()
                 }, receipt)
-            } }, onStatus = ::status).also { receiver = it } }
+            } }, onStatus = ::status) }
         // Log the actual decoder-qualified offer, not an earlier requested preset or coded viewport.
         active()
         onDisplayQualified(projection.displayConfiguration)
@@ -373,7 +433,7 @@ class OalCarPlayRuntime(
         touch(action, 0, listOf(CarPlayPointer(0, x, y)), width, height)
     }
     override fun telemetrySnapshot() = if (canceled.get()) null else receiver?.telemetrySnapshot()
-    override fun cancel() { canceled.set(true); receiver?.revokePendingAdmission() }
+    override fun cancel() { canceled.set(true); presentationWorker.shutdownNow(); receiver?.revokePendingAdmission() }
     override fun close() = synchronized(closeLock) {
         cancel()
         val retiring = synchronized(resourcesLock) { resources.toList().asReversed() }
@@ -408,7 +468,8 @@ class OalCarPlayRuntime(
         }
         deadlines.shutdownNow()
         failure?.let { throw it }
-        receiver = null
+        check(presentationWorker.awaitTermination(5, TimeUnit.SECONDS)) { "Presentation worker retirement timed out" }
+        synchronized(resourcesLock) { receiver = null; presentation = null }
         Unit
     }
     private companion object {

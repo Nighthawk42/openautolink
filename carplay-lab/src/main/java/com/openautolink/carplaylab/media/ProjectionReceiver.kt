@@ -29,7 +29,7 @@ enum class RuntimeControlFailureStage { IDENTIFICATION, AUTHENTICATION, TRANSPOR
 class ProjectionReceiver(
     context: Context,
     private val btMac: String,
-    private val surface: Surface,
+    surface: Surface,
     private val mfi: MfiAuthenticator,
     display: CarPlayDisplayPreferences = CarPlayDisplayPreferences(),
     // Production cannot enroll until the selected BT link proves the controller key. Bench stays explicit.
@@ -41,7 +41,8 @@ class ProjectionReceiver(
 ) : Closeable {
     init {
         require(btMac.matches(Regex("[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}")))
-        require(surface.isValid) { "Valid Surface required before receiver construction" }
+        // Caller qualifies the initial presentation before handoff. It can be destroyed
+        // during construction; reconcile exact receipts rather than abort the session owner.
     }
     private val videoSelection = CarPlayDisplayPolicy.videoSelection(display)
     private val displaySelection = CarPlayDisplaySelection(
@@ -111,7 +112,10 @@ class ProjectionReceiver(
     private val microphoneCapability = com.shilapi.xcertplay.media.AndroidMicrophoneSupport.probe(context)
     private val telemetry = ReceiverTelemetry(telemetryGenerations.incrementAndGet())
     fun telemetrySnapshot(): ReceiverTelemetrySnapshot = telemetry.snapshot(System.nanoTime())
-    private val sink = AndroidMediaSink(context, surface, display = displaySelection, onStatus = ::status, onSurfaceLost = ::close, telemetry = telemetry, videoSelection = videoSelection)
+    private val sink = AndroidMediaSink(context, surface, display = displaySelection, onStatus = ::status, telemetry = telemetry, videoSelection = videoSelection)
+    /** Presentation receipts do not take the session/control lifecycle lock or retire transport. */
+    fun attachSurface(surface: Surface) { if (!closed.get() && !admissionRevoked.get()) sink.attachSurface(surface) }
+    fun detachSurface(surface: Surface) { sink.detachSurface(surface) }
     private val engine = CarPlayMediaEngine(sink, microphoneEnabled = microphoneCapability.available,
         onDiagnostic = { session, message ->
             if (!closed.get() && !admissionRevoked.get() && session in sessions) status(message)
@@ -195,7 +199,8 @@ class ProjectionReceiver(
         admissionNetwork: CarPlayNetworkSelection? = selectedNetwork) = synchronized(lock) {
         check(!closed.get())
         check(!admissionRevoked.get()) { "Receiver admission revoked" }
-        check(surface.isValid) { "Valid Surface required" }
+        // Initial qualification is not a perpetual Surface lease. Caller reconciles newer
+        // attach/detach receipts around construction/start; transport may start offscreen.
         if (server != null) {
             require(policy?.peer == selected?.peer && network === selectedNetwork && admissionSelection === admissionNetwork)
             return@synchronized
