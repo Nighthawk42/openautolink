@@ -33,7 +33,8 @@ class RuntimeCarDataWiringTest {
         assertTrue(receiver.contains("carData?.handle(frame) != true"))
         assertTrue(receiver.contains("carData?.tick(session.encryptedEventReady)"))
         assertTrue(receiver.contains("channel.sendAndAwaitWritten(frame, 5_000)"))
-        assertTrue(receiver.contains("carData?.close()"))
-        assertTrue(receiver.indexOf("carData?.close()") < receiver.indexOf("closeRuntime({ channel.close() }"))
+        assertTrue(receiver.contains("carData?.let { retireCarData(session, it) }"))
+        assertTrue(receiver.contains("runCatching { owner.close() }.isSuccess"))
+        assertTrue(receiver.indexOf("carData?.let { retireCarData(session, it) }") < receiver.indexOf("closeRuntime({ channel.close() }"))
     }
 }

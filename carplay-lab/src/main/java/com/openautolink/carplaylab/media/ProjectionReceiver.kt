@@ -62,6 +62,7 @@ class ProjectionReceiver(
     private val closed = AtomicBoolean()
     private val admissionRevoked = AtomicBoolean()
     private val retirement = CountDownLatch(1)
+    private val retirementRunning = AtomicBoolean()
     private val lock = Any()
     private var server: ServerSocket? = null
     private var acceptThread: Thread? = null
@@ -276,7 +277,7 @@ class ProjectionReceiver(
             runtimeMetadata[session]?.offerArtwork(transfer)
     }
     private fun startRuntime(session: AirPlaySession, stream: BlockingDuplexByteStream): Boolean = synchronized(lock) {
-        if (closed.get() || admissionRevoked.get() || session !in sessions || tunnels.isNotEmpty()) return@synchronized false
+        if (closed.get() || admissionRevoked.get() || session !in sessions || tunnels.isNotEmpty() || runtimeLinks.isNotEmpty()) return@synchronized false
         val config = runtimeIdentification ?: return@synchronized false
         val channel = Iap2Session.openTunnel(stream, onArtwork = { transfer ->
             if (!closed.get() && !admissionRevoked.get() && runtimeOwner === session &&
@@ -286,7 +287,7 @@ class ProjectionReceiver(
         beginRuntime(session, channel)
     }
     private fun beginRuntime(session: AirPlaySession, channel: Iap2Session): Boolean = synchronized(lock) {
-        if (closed.get() || admissionRevoked.get() || session !in sessions || tunnels.isNotEmpty()) return@synchronized false
+        if (closed.get() || admissionRevoked.get() || session !in sessions || tunnels.isNotEmpty() || runtimeLinks.isNotEmpty()) return@synchronized false
         val config = runtimeIdentification ?: return@synchronized false
         tunnels[session] = channel
         runtimeOwner = session
@@ -309,8 +310,10 @@ class ProjectionReceiver(
                     }, ::status)
                     ownedCarData = carData
                     synchronized(lock) {
-                        check(!closed.get() && !admissionRevoked.get() && session in sessions)
+                        // Retain even a factory result arriving after cancellation. Its failed close
+                        // must remain available to receiver retirement, not only this worker's finally.
                         if (carData != null) runtimeLinks[session] = carData
+                        check(!closed.get() && !admissionRevoked.get() && session in sessions)
                     }
                     if (!wired) {
                         Iap2IdentificationClient(channel) { base -> carData?.identification(base) ?: base }.identify(config, 30_000)
@@ -359,9 +362,8 @@ class ProjectionReceiver(
                     metadata?.close()
                     runtimeMetadata.remove(session)
                     val carData = ownedCarData
-                    try { carData?.close() }
+                    try { carData?.let { retireCarData(session, it) } }
                     finally {
-                        runtimeLinks.remove(session)
                         // Keep tunnel registered until reporter and appearance retirement have acknowledged.
                         runCatching { com.openautolink.carplaylab.closeRuntime({ channel.close() }, { session.close() }) }
                         tunnels.remove(session, channel)
@@ -416,7 +418,7 @@ class ProjectionReceiver(
         runtimeMetadata.values.forEach { it.revoke() }
     }
     override fun close() {
-        if (!closed.compareAndSet(false, true)) { sink.close(); return }
+        if (!closed.compareAndSet(false, true)) { sink.close(); retryRetirement(); return }
         revokePendingAdmission()
         telemetry.retire()
         val retiring = synchronized(lock) {
@@ -425,16 +427,29 @@ class ProjectionReceiver(
         }
         retiring.forEach { runCatching { it.close() } }; tunnels.values.forEach { runCatching { it.close() } }; tunnels.clear()
         sink.close(); deadlines.shutdownNow(); input.shutdownNow(); runtime.shutdownNow(); statuses.shutdownNow()
+        retryRetirement()
+    }
+    /** Only the runtime worker, or retirement after that worker stops, closes exact car-data owners. */
+    private fun retireCarData(session: AirPlaySession, owner: RuntimeCarDataLink) {
+        if (runCatching { owner.close() }.isSuccess) runtimeLinks.remove(session, owner)
+    }
+    private fun retryRetirement() {
+        if (retirement.count == 0L || !retirementRunning.compareAndSet(false, true)) return
         // Control threads can still be persisting a pairing after close(); hold exact state lock until retired.
         Thread({
             try {
-                retiring.forEach { it.awaitControlStopped() }
+                allSessions.toList().forEach { it.awaitControlStopped() }
                 // A slow OS worker is not a permanent loss of the retirement retry path.
                 while (!runtime.awaitTermination(1, TimeUnit.SECONDS)) { /* exact owner retained */ }
                 while (!input.awaitTermination(1, TimeUnit.SECONDS)) { /* exact owner retained */ }
+                // Factories and their finally blocks have now stopped. Retry concrete cleanup once
+                // per close lifecycle; a failed exact owner fences storage release and acknowledgment.
+                runtimeLinks.entries.toList().forEach { (session, owner) -> retireCarData(session, owner) }
+                if (runtimeLinks.isNotEmpty()) return@Thread
                 persistence.close()
                 retirement.countDown()
             } catch (_: Exception) { /* Withhold acknowledgment; parent must not admit a successor. */ }
+            finally { retirementRunning.set(false) }
         }, "lab-media-state-release")
             .apply { isDaemon = true; start() }
     }
@@ -444,6 +459,7 @@ class ProjectionReceiver(
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         fun remainingNs() = (deadline - System.nanoTime()).coerceAtLeast(0)
         if (!retirement.await(remainingNs(), TimeUnit.NANOSECONDS)) return false
+        if (runtimeLinks.isNotEmpty()) return false
         if (!sink.awaitRetired(TimeUnit.NANOSECONDS.toMillis(remainingNs()))) return false
         acceptThread?.let { accepting ->
             if (accepting !== Thread.currentThread()) TimeUnit.NANOSECONDS.timedJoin(accepting, remainingNs())

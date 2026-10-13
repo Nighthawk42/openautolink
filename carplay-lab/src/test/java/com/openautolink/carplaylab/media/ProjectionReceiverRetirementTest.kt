@@ -32,7 +32,9 @@ import org.robolectric.shadows.ShadowMediaCodecList
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [32], manifest = Config.NONE)
 class ProjectionReceiverRetirementTest {
-    private fun receiver(): ProjectionReceiver {
+    private fun receiver(factory: ((com.shilapi.xcertplay.airplay.AirPlaySession,
+        (com.shilapi.xcertplay.iap2.wire.Iap2Frame) -> Unit, (String) -> Unit) ->
+        com.openautolink.carplaylab.intake.RuntimeCarDataLink)? = null): ProjectionReceiver {
         val caps = MediaCodecInfoBuilder.CodecCapabilitiesBuilder.newBuilder()
             .setMediaFormat(MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1280, 720))
             .setIsEncoder(false).setColorFormats(intArrayOf(2130708361))
@@ -47,7 +49,7 @@ class ProjectionReceiverRetirementTest {
         val context = RuntimeEnvironment.getApplication()
         java.io.File(context.noBackupFilesDir, "pairing-probe").deleteRecursively()
         return ProjectionReceiver(context, "02:00:00:00:00:01", surface,
-            mock(MfiAuthenticator::class.java), wired = true, onStatus = {})
+            mock(MfiAuthenticator::class.java), runtimeCarDataFactory = factory, wired = true, onStatus = {})
     }
 
     private fun sink(receiver: ProjectionReceiver): AndroidMediaSink =
@@ -58,6 +60,99 @@ class ProjectionReceiverRetirementTest {
         while (true) {
             try { latch.await(); return } catch (_: InterruptedException) { /* stalled platform call */ }
         }
+    }
+
+    /** Only protocol/OS boundaries are mocked; installation, worker finally and retirement are real. */
+    private fun startRuntime(receiver: ProjectionReceiver): com.shilapi.xcertplay.airplay.AirPlaySession {
+        receiver.setRuntimeIdentification(com.shilapi.xcertplay.transport.Iap2IdentificationConfig(
+            name = "OAL", modelIdentifier = "OAL", manufacturer = "OAL", serialNumber = "synthetic",
+            firmwareVersion = "1", hardwareVersion = "Android", carPlayUsbInterfaceNumber = 1, wireless = null))
+        val session = mock(com.shilapi.xcertplay.airplay.AirPlaySession::class.java)
+        `when`(session.controlAuthenticated).thenReturn(true)
+        @Suppress("UNCHECKED_CAST")
+        val sessions = ProjectionReceiver::class.java.getDeclaredField("sessions").apply { isAccessible = true }
+            .get(receiver) as MutableSet<com.shilapi.xcertplay.airplay.AirPlaySession>
+        sessions.add(session)
+        val channel = mock(com.shilapi.xcertplay.iap2.session.Iap2Session::class.java)
+        // End the real runtime after authentication so its first concrete removal runs in finally.
+        `when`(channel.isClosed).thenReturn(true)
+        assertTrue(receiver.startWiredRuntime(channel))
+        return session
+    }
+
+    private fun owners(receiver: ProjectionReceiver): Map<*, *> =
+        ProjectionReceiver::class.java.getDeclaredField("runtimeLinks").apply { isAccessible = true }
+            .get(receiver) as Map<*, *>
+
+    private class ExactGnssOwner : com.openautolink.carplaylab.intake.RuntimeCarDataLink {
+        val source = Any()
+        val removedSources = java.util.concurrent.CopyOnWriteArrayList<Any>()
+        val authenticated = java.util.concurrent.atomic.AtomicInteger()
+        val revoked = java.util.concurrent.atomic.AtomicBoolean()
+        val allowRemoval = java.util.concurrent.atomic.AtomicBoolean()
+        val firstRemoval = CountDownLatch(1)
+        override fun identification(base: com.shilapi.xcertplay.iap2.wire.Iap2Frame) = base
+        override fun authenticate() { check(!revoked.get()); authenticated.incrementAndGet() }
+        override fun handle(frame: com.shilapi.xcertplay.iap2.wire.Iap2Frame) = false
+        override fun tick(encryptedEventReady: Boolean) {}
+        override fun pollTimeout(maximumMs: Long) = maximumMs
+        override fun revoke() { revoked.set(true) }
+        override fun close() {
+            revoke()
+            removedSources.add(source) // Equivalent OS removeUpdates boundary, with exact identity.
+            firstRemoval.countDown()
+            check(allowRemoval.get()) { "synthetic removeUpdates failure" }
+        }
+    }
+
+    @Test fun receiverRetriesFailedExactGnssRemovalAndWithholdsAcknowledgmentUntilSuccess() {
+        val owner = ExactGnssOwner()
+        val receiver = receiver { _, _, _ -> owner }
+        try {
+            val session = startRuntime(receiver)
+            assertTrue(owner.firstRemoval.await(3, TimeUnit.SECONDS))
+            receiver.close()
+            assertFalse("failed GPS removal must fence successor admission", receiver.awaitClosed(500))
+            assertSame("worker finally must retain failed exact owner", owner, owners(receiver)[session])
+            assertTrue("receiver retirement must retry source removal", owner.removedSources.size >= 2)
+            receiver.close()
+            assertFalse("repeated failures must not acknowledge", receiver.awaitClosed(500))
+            assertSame(owner, owners(receiver)[session])
+            assertTrue(owner.revoked.get())
+            assertEquals(1, owner.authenticated.get())
+            owner.allowRemoval.set(true)
+            receiver.close()
+            assertTrue("real close retry must retire retained source", receiver.awaitClosed(3000))
+            assertTrue(owners(receiver).isEmpty())
+            assertTrue(owner.removedSources.all { it === owner.source })
+        } finally { owner.allowRemoval.set(true); receiver.close(); receiver.awaitClosed(3000) }
+    }
+
+    @Test fun canceledLateFactoryOwnerRemainsFencedAndRetryableWithoutBlockingRevocation() {
+        val owner = ExactGnssOwner()
+        val entered = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val receiver = receiver { _, _, _ -> entered.countDown(); ignoreInterruptUntil(resume); owner }
+        try {
+            val session = startRuntime(receiver)
+            assertTrue(entered.await(3, TimeUnit.SECONDS))
+            val revoked = CountDownLatch(1)
+            Thread { receiver.revokePendingAdmission(); revoked.countDown() }.start()
+            assertTrue("revocation cannot wait for a blocked factory", revoked.await(1, TimeUnit.SECONDS))
+            receiver.close()
+            assertFalse(receiver.awaitClosed(100))
+            resume.countDown()
+            assertTrue(owner.firstRemoval.await(3, TimeUnit.SECONDS))
+            assertFalse("late owner's failed cleanup cannot be lost", receiver.awaitClosed(500))
+            assertSame(owner, owners(receiver)[session])
+            assertTrue(owner.revoked.get())
+            assertEquals("late canceled owner cannot activate GPS", 0, owner.authenticated.get())
+            owner.allowRemoval.set(true)
+            receiver.close()
+            assertTrue(receiver.awaitClosed(3000))
+            assertTrue(owners(receiver).isEmpty())
+            assertTrue(owner.removedSources.all { it === owner.source })
+        } finally { resume.countDown(); owner.allowRemoval.set(true); receiver.close(); receiver.awaitClosed(3000) }
     }
 
     @Test
