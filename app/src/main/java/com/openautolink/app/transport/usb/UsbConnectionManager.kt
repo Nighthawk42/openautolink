@@ -127,6 +127,9 @@ class UsbConnectionManager(
 
     private var pendingCandidateGeneration: Long? = null
     private var admissionGeneration: Long? = null
+    // Fences observations spanning admission/release or stop/start, including null-owner ABA.
+    private var observationGeneration = 0L
+    private val explicitRetryDevices = mutableSetOf<String>()
 
     @Synchronized fun pendingDevice(generation: Long): UsbDevice? {
         val candidate = consent.current(generation) ?: return null
@@ -135,13 +138,26 @@ class UsbConnectionManager(
         }
     }
     @Synchronized fun stay(generation: Long) {
-        if (consent.stay(generation)) pendingCandidateGeneration = null
+        val name = consent.current(generation)?.deviceName
+        if (consent.stay(generation)) {
+            pendingCandidateGeneration = null
+            name?.let { explicitRetryDevices.remove(it); UsbAttachAuthorization.forget(it) }
+        }
     }
     /** Called only AFTER awaited projection retirement; presence is checked a second time. */
     @Synchronized fun accept(generation: Long): Boolean {
         val device = pendingDevice(generation) ?: return false
         if (dispatchOwnership.current() != null || retirementPending.get()) return false
         consent.accept(generation) ?: return false
+        observationGeneration++
+        // Admission supersedes passive authorization waits for other phones. Their
+        // late grants/timeouts must not publish over this selected generation.
+        osAuthorizationWaits.entries.removeAll { (name, wait) ->
+            if (name == device.deviceName) false else {
+                wait.job.cancel()
+                true
+            }
+        }
         pendingCandidateGeneration = null
         admissionGeneration = generation
         requestPermissionOrConnect(device, consentGranted = true)
@@ -149,6 +165,10 @@ class UsbConnectionManager(
     }
     @Synchronized private fun releaseSelection(token: UsbDispatchOwnership.Token): Boolean {
         if (!dispatchOwnership.release(token)) return false
+        observationGeneration++
+        osAuthorizationWaits.remove(token.deviceName)?.job?.cancel()
+        UsbAttachAuthorization.forget(token.deviceName)
+        explicitRetryDevices.remove(token.deviceName)
         clearPendingPermission(token.deviceName)
         val generation = admissionGeneration
         admissionGeneration = null
@@ -172,6 +192,8 @@ class UsbConnectionManager(
             dispatchOwnership.current()?.retiring == false && !retirementPending.get()
     @Synchronized fun retryCandidates() {
         if (!isRunning || dispatchOwnership.current() != null || retirementPending.get()) return
+        explicitRetryDevices.forEach { UsbAttachAuthorization.forget(it) }
+        explicitRetryDevices.clear()
         pendingCandidateGeneration?.let { onCandidateDetached(it) }
         pendingCandidateGeneration = null
         usbManager.deviceList.values.forEach {
@@ -276,6 +298,69 @@ class UsbConnectionManager(
 
     private var scanJob: Job? = null
 
+    private class OsAuthorizationWait(val device: UsbDevice, val consentGranted: Boolean,
+                                      val owner: UsbDispatchOwnership.Token?, val generation: Long) {
+        lateinit var job: Job
+    }
+    private val osAuthorizationWaits = mutableMapOf<String, OsAuthorizationWait>()
+
+    /** A budget bounds observation, NEVER triggers a fallback app request. Picker stays usable. */
+    @Synchronized private fun awaitOsAuthorization(device: UsbDevice, consentGranted: Boolean) {
+        val name = device.deviceName
+        val owner = dispatchOwnership.current()
+        if (!isRunning || retirementPending.get() || name in detachedDeviceNames ||
+            (owner != null && (owner.deviceName != name || owner.retiring || owner.reenumerating)) ||
+            !UsbAttachAuthorization.exact(device, usbManager.deviceList[name])) return
+        publishCandidates()
+        _connectionState.value = UsbConnectionState.AWAITING_USER_SELECTION
+        _status.value = "Waiting for Android USB authorization; dismiss its dialog before selecting a retry"
+        osAuthorizationWaits[name]?.let { existing ->
+            if (existing.owner === owner && existing.generation == observationGeneration) return
+            existing.job.cancel()
+        }
+        val wait = OsAuthorizationWait(device, consentGranted, owner, observationGeneration)
+        osAuthorizationWaits[name] = wait
+        wait.job = scope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            repeat(1_200) {
+                synchronized(this@UsbConnectionManager) {
+                    if (osAuthorizationWaits[name] !== wait) return@launch
+                    if (observationGeneration != wait.generation || dispatchOwnership.current() !== wait.owner ||
+                        wait.owner?.retiring == true || wait.owner?.reenumerating == true || retirementPending.get()) {
+                        osAuthorizationWaits.remove(name)
+                        return@launch
+                    }
+                    if (!isRunning || name in detachedDeviceNames ||
+                        !UsbAttachAuthorization.exact(device, usbManager.deviceList[name]) ||
+                        (wait.owner != null && !dispatchOwnership.isCurrent(wait.owner))) {
+                        osAuthorizationWaits.remove(name)
+                        wait.owner?.let { releaseSelection(it) }
+                        return@launch
+                    }
+                    if (usbManager.hasPermission(device) || UsbAttachAuthorization.canRequest(device)) {
+                        osAuthorizationWaits.remove(name)
+                        requestPermissionOrConnect(device, wait.consentGranted)
+                        return@launch
+                    }
+                }
+                delay(100)
+            }
+            synchronized(this@UsbConnectionManager) {
+                if (osAuthorizationWaits[name] !== wait) return@synchronized
+                osAuthorizationWaits.remove(name)
+                if (!isRunning || observationGeneration != wait.generation || dispatchOwnership.current() !== wait.owner ||
+                    wait.owner?.retiring == true || wait.owner?.reenumerating == true || retirementPending.get() ||
+                    name in detachedDeviceNames || !UsbAttachAuthorization.exact(device, usbManager.deviceList[name])) return@synchronized
+                rejectedDeviceNames.add(name)
+                wait.owner?.let { releaseSelection(it) }
+                if (dispatchOwnership.current() != null || admissionGeneration != null) return@synchronized
+                _connectionState.value = UsbConnectionState.AWAITING_USER_SELECTION
+                _status.value = "USB authorization not received; dismiss Android's dialog and select your phone to retry"
+                publishCandidates()
+            }
+        }
+        wait.job.start()
+    }
+
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             if (!isRunning) return
@@ -327,11 +412,14 @@ class UsbConnectionManager(
     }
 
     fun start() {
-        if (isRunning) return
-        isRunning = true
-        activeInstance = this
-        _connectionState.value = UsbConnectionState.IDLE
-        _status.value = "Waiting for USB device..."
+        synchronized(this) {
+            if (isRunning) return
+            isRunning = true
+            observationGeneration++
+            activeInstance = this
+            _connectionState.value = UsbConnectionState.IDLE
+            _status.value = "Waiting for USB device..."
+        }
 
         val filter = IntentFilter().apply {
             addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
@@ -348,11 +436,19 @@ class UsbConnectionManager(
     @Synchronized fun stop() {
         if (!isRunning) return
         isRunning = false
+        observationGeneration++
+        explicitRetryDevices.forEach { UsbAttachAuthorization.forget(it) }
+        explicitRetryDevices.clear()
         pendingCandidateGeneration?.let { consent.stay(it); onCandidateDetached(it) }
         pendingCandidateGeneration = null
         if (activeInstance === this) activeInstance = null
         scanJob?.cancel()
         scanJob = null
+        osAuthorizationWaits.values.forEach {
+            it.job.cancel()
+            UsbAttachAuthorization.forget(it.device.deviceName)
+        }
+        osAuthorizationWaits.clear()
         try {
             context.unregisterReceiver(usbReceiver)
         } catch (_: IllegalArgumentException) { }
@@ -429,26 +525,34 @@ class UsbConnectionManager(
     }
 
     private fun scanExistingDevices() {
-        if (!isRunning || dispatchOwnership.current() != null || retirementPending.get()) return
-        val devices = usbManager.deviceList
-        OalLog.i(TAG, "Scanning ${devices.size} existing USB devices")
-
-        // Auto-handle a device already in accessory mode — this is the return
-        // path after we triggered an AOA switch on a previous selection, so
-        // there's no point re-prompting the user. Permission is still requested
-        // (it persists across the re-enumeration on most cars but not all).
-        for ((_, device) in devices) {
-            if (UsbConstants.isAccessoryDevice(device.vendorId, device.productId)) {
-                OalLog.i(TAG, "Found device already in accessory mode: ${device.deviceName}")
-                detachedDeviceNames.remove(device.deviceName)
-                _connectionState.value = UsbConnectionState.ACCESSORY_DETECTED
-                requestPermissionOrConnect(device)
-                return
-            }
+        val generation = synchronized(this) {
+            if (!isRunning || dispatchOwnership.current() != null || admissionGeneration != null || retirementPending.get()) return
+            observationGeneration
         }
+        val devices = usbManager.deviceList
+        synchronized(this) {
+            // Enumeration is outside the monitor: retirement rescans must not block
+            // admission. Revalidate before ANY publication or authorization wait.
+            if (!isRunning || observationGeneration != generation || dispatchOwnership.current() != null ||
+                admissionGeneration != null || retirementPending.get()) return
+            OalLog.i(TAG, "Scanning ${devices.size} existing USB devices")
 
-        publishCandidates()
-        autoSelectIfUnambiguous()
+            // Already-switched accessories can start after cold launch too. Android owns
+            // attach/default authorization for this enumeration; without a fresh grant,
+            // observe it and leave the picker available rather than stacking an app dialog.
+            for ((_, device) in devices) {
+                if (UsbConstants.isAccessoryDevice(device.vendorId, device.productId)) {
+                    OalLog.i(TAG, "Found device already in accessory mode: ${device.deviceName}")
+                    detachedDeviceNames.remove(device.deviceName)
+                    _connectionState.value = UsbConnectionState.ACCESSORY_DETECTED
+                    requestPermissionOrConnect(device)
+                    return
+                }
+            }
+
+            publishCandidates()
+            autoSelectIfUnambiguous()
+        }
     }
 
     /**
@@ -468,9 +572,10 @@ class UsbConnectionManager(
      * The picker UI is retained as the fallback and as an escape hatch; it simply
      * should not be needed in the normal case.
      */
-    private fun autoSelectIfUnambiguous() {
+    @Synchronized private fun autoSelectIfUnambiguous() {
         if (!isRunning) return
-        if (currentPipe != null || connectClaimed.get() || dispatchOwnership.current() != null) return
+        if (currentPipe != null || connectClaimed.get() || dispatchOwnership.current() != null ||
+            admissionGeneration != null || retirementPending.get()) return
         if (_connectionState.value == UsbConnectionState.PERMISSION_REQUESTED) return
 
         val candidates = _availableDevices.value.filterNot { it.deviceName in rejectedDeviceNames }
@@ -541,6 +646,9 @@ class UsbConnectionManager(
         // that has opened endpoints but not yet published ownership must see this
         // tombstone and refuse to deliver the now-detached pipe.
         detachedDeviceNames.add(device.deviceName)
+        osAuthorizationWaits.remove(device.deviceName)?.job?.cancel()
+        UsbAttachAuthorization.forget(device.deviceName)
+        explicitRetryDevices.remove(device.deviceName)
         val pending = pendingCandidateGeneration
         if (consent.detach(device.deviceName)) {
             pendingCandidateGeneration = null
@@ -619,7 +727,7 @@ class UsbConnectionManager(
      * Re-enumerates attached USB devices and publishes the user-visible
      * candidate list. Hubs and mass-storage devices are filtered out.
      */
-    private fun publishCandidates() {
+    @Synchronized private fun publishCandidates() {
         // Deliberately NOT filtered by looksLikePhone(): a phone sitting in
         // "charging only" USB mode exposes no data interfaces, so a strict phone
         // filter would hide it and make it unreachable. Hiding the user's actual
@@ -642,6 +750,7 @@ class UsbConnectionManager(
                 .thenByDescending { it.isLikelyPhone }
                 .thenBy { it.friendlyName.lowercase() })
         _availableDevices.value = list
+        if (!isRunning || dispatchOwnership.current() != null || admissionGeneration != null || retirementPending.get()) return
         if (_connectionState.value == UsbConnectionState.IDLE && list.isNotEmpty()) {
             _connectionState.value = UsbConnectionState.AWAITING_USER_SELECTION
             _status.value = "Select a USB device to connect"
@@ -665,7 +774,7 @@ class UsbConnectionManager(
      * Called when the user taps a device in the picker. Looks the device up
      * by its stable [UsbDevice.deviceName] and starts the permission/AOA flow.
      */
-    private fun onUserSelectedDevice(deviceName: String) {
+    @Synchronized private fun onUserSelectedDevice(deviceName: String) {
         if (!isRunning) return
         val device = usbManager.deviceList[deviceName]
         if (device == null) {
@@ -673,6 +782,11 @@ class UsbConnectionManager(
             publishCandidates()
             return
         }
+        val owner = dispatchOwnership.current()
+        if (owner != null && (owner.deviceName != deviceName || owner.retiring)) return
+        osAuthorizationWaits.remove(deviceName)?.job?.cancel()
+        explicitRetryDevices.add(deviceName)
+        UsbAttachAuthorization.explicitRetry(device)
         OalLog.i(TAG, "User selected USB device: ${device.deviceName} " +
                 "VID=${String.format("%04X", device.vendorId)} " +
                 "PID=${String.format("%04X", device.productId)}")
@@ -700,6 +814,10 @@ class UsbConnectionManager(
         val owner = dispatchOwnership.current()
         if (!consentGranted && onCandidate != null &&
             (owner == null || owner.deviceName != device.deviceName || owner.retiring)) {
+            if (!UsbAttachAuthorization.canRequest(device) && !usbManager.hasPermission(device)) {
+                awaitOsAuthorization(device, consentGranted)
+                return
+            }
             offerCandidate(device)
             return
         }
@@ -737,21 +855,18 @@ class UsbConnectionManager(
                     "a USB session is already claimed (state=${_connectionState.value})")
             return
         }
+        if (pendingPermissionDevice.get() == device.deviceName) return
         if (usbManager.hasPermission(device)) {
+            UsbAttachAuthorization.forget(device.deviceName)
             onPermissionGranted(device)
             return
         }
-        // DOUBLE-PROMPT GUARD (GM AAOS).
-        //
-        // One physical plug-in can reach this method twice for the SAME device:
-        // scanExistingDevices() spots the accessory, and the ACTION_USB_DEVICE_ATTACHED
-        // broadcast fires for the same re-enumeration. Separately, the manifest
-        // intent-filter (usb_device_filter.xml) makes the OS raise its own dialog —
-        // the one carrying the "use by default" checkbox.
-        //
-        // On GM head units that checkbox never persists (known GM AAOS bug), so every
-        // redundant request is a dialog the user must physically dismiss. Collapse
-        // repeat requests for the same device to a single in-flight prompt.
+        if (!UsbAttachAuthorization.canRequest(device)) {
+            awaitOsAuthorization(device, consentGranted)
+            return
+        }
+        // Collapse duplicate *app-owned* requests. OS-matched automatic paths
+        // return above and never race Android's resolver/default confirmation.
         val key = device.deviceName
         if (!dispatchOwnership.beginPermission(token)) return
         if (!pendingPermissionDevice.compareAndSet(null, key)) {
@@ -761,6 +876,12 @@ class UsbConnectionManager(
         }
         _connectionState.value = UsbConnectionState.PERMISSION_REQUESTED
         _status.value = "Requesting USB permission..."
+        if (!UsbAttachAuthorization.takeRequest(device)) {
+            clearPendingPermission(key)
+            dispatchOwnership.permission(key, token.generation) // No OS request owns this latch.
+            awaitOsAuthorization(device, consentGranted)
+            return
+        }
         val request = runCatching {
             val permissionIntent = PendingIntent.getBroadcast(
                 context, token.generation.toInt(),

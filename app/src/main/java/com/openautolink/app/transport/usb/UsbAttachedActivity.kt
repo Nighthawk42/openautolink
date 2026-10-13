@@ -37,8 +37,13 @@ class UsbAttachedActivity : Activity() {
         if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
 
         @Suppress("DEPRECATION")
-        val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
-        OalLog.i(TAG, "USB device attached intent: ${device?.deviceName ?: "null"}")
+        val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE) ?: return
+        val usb = getSystemService(UsbManager::class.java) ?: return
+        // Exported Activity intents (including Boolean grant extras) are untrusted.
+        // Android grants before its authorized handoff; recheck the exact census entry.
+        if (!UsbAttachAuthorization.exact(device, usb.deviceList[device.deviceName]) ||
+            !usb.hasPermission(device)) return
+        OalLog.i(TAG, "Authorized USB device attached intent: ${device.deviceName}")
 
         // Launch MainActivity — it's singleTask so this brings it to front
         val mainIntent = Intent(this, MainActivity::class.java).apply {
