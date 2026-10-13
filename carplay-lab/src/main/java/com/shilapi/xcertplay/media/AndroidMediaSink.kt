@@ -167,6 +167,7 @@ class AndroidMediaSink(
         manager?.abandonAudioFocusRequest(focus)
         focus = newFocusRequest()
         val granted = manager?.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (closed.get()) return false // A late Binder result cannot revive a revoked owner.
         focusHeld = true
         permanentlyLost = !granted
         focusVolume = if (granted) 1f else 0f
@@ -274,6 +275,11 @@ class AndroidMediaSink(
             }
         } catch (_: InterruptedException) { /* shutdown */ }
         finally { release(); videoRetired.set(true) }
+    }
+    /** Nonblocking cancellation while user PLAY may be inside the platform focus call. */
+    fun revokePendingWork() {
+        if (closed.compareAndSet(false, true)) telemetry.retire()
+        videoThread.interrupt()
     }
     override fun close() {
         routeDiagnostics.close()

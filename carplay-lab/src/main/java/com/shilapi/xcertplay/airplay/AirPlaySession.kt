@@ -109,13 +109,15 @@ class AirPlaySession @JvmOverloads constructor(
     @Volatile private var mainScreenToken: Any? = null
 
     private val closed = AtomicBoolean(false)
+    private val cleanupStarted = AtomicBoolean(false)
     private val authenticated = AtomicBoolean(false)
     val controlAuthenticated: Boolean get() = authenticated.get()
     internal val isClosed: Boolean get() = closed.get()
     private val notified = AtomicBoolean(false)
-    private var eventServer: ServerSocket? = null
-    private var eventSocket: Socket? = null
-    private var eventCipher: ControlCipher? = null
+    private val eventTransportLock = Any()
+    @Volatile private var eventServer: ServerSocket? = null
+    @Volatile private var eventSocket: Socket? = null
+    @Volatile private var eventCipher: ControlCipher? = null
     private var eventCseq = 0
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
@@ -171,8 +173,23 @@ class AirPlaySession @JvmOverloads constructor(
         if (worker !== Thread.currentThread()) worker.join()
     }
 
+    /** Transport cancellation never owns the cipher/writer lock or invokes media/OS callbacks. */
+    fun cancelPendingIo() {
+        closed.set(true)
+        startup.close()
+        safeClose(socket)
+        val retiring = synchronized(eventTransportLock) {
+            val resources = eventServer to eventSocket
+            eventServer = null; eventSocket = null
+            resources
+        }
+        safeClose(retiring.first)
+        safeClose(retiring.second)
+    }
+
     override fun close() {
-        if (!closed.compareAndSet(false, true)) return
+        cancelPendingIo()
+        if (!cleanupStarted.compareAndSet(false, true)) return
         listener.onDebugLog("BENCH_DIAG sessionCloseCaller=" + Thread.currentThread().stackTrace.drop(2).take(4).joinToString("|") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" })
         startup.close()
         mainScreenToken = null
@@ -344,6 +361,7 @@ class AirPlaySession @JvmOverloads constructor(
         videoPlaybackAvailability.setDesired(allowed)
 
     private fun sendCommandLocked(command: Map<String, Any?>, extraHeaders: String = ""): Boolean {
+        if (closed.get()) return false
         val socket = eventSocket ?: return false
         val cipher = eventCipher ?: return false
         eventCseq++
@@ -444,9 +462,8 @@ class AirPlaySession @JvmOverloads constructor(
     }
 
     /** Transport truth, not RECORD/render/status readiness. */
-    val encryptedEventReady: Boolean get() = synchronized(eventWriteLock) {
+    val encryptedEventReady: Boolean get() =
         controlAuthenticated && !closed.get() && eventSocket?.isClosed == false && eventCipher != null
-    }
     /** Atomic readiness admission: never retain a stale vehicle sample before event readiness. */
     fun setNightModeIfEventReady(night: Boolean): Boolean = synchronized(eventWriteLock) {
         if (!encryptedEventReady) false else setNightMode(night)
@@ -863,7 +880,10 @@ class AirPlaySession @JvmOverloads constructor(
 
     private fun openEvent(): Int {
         val server = ServerSocket(0, 50, socketBinding?.local ?: InetAddress.getByName("::"))
-        eventServer = server
+        synchronized(eventTransportLock) {
+            if (closed.get()) { safeClose(server); error("Session closed") }
+            eventServer = server
+        }
         spawnEvent("airplay-event-accept") { acceptEvent(server) }
         return server.localPort
     }
@@ -876,10 +896,7 @@ class AirPlaySession @JvmOverloads constructor(
         keepAliveSocket = null
         keepAliveThread?.interrupt()
         keepAliveThread = null
-        safeClose(eventServer)
-        eventServer = null
-        safeClose(eventSocket)
-        eventSocket = null
+        cancelPendingIo()
         eventCipher = null
         eventThreads.forEach { it.interrupt() }
         eventThreads.clear()
@@ -900,7 +917,10 @@ class AirPlaySession @JvmOverloads constructor(
             socket.tcpNoDelay = true
             Unit
             listener.onDebugLog("BENCH_DIAG eventConnected")
-            eventSocket = socket
+            synchronized(eventTransportLock) {
+                if (closed.get()) { safeClose(socket); return }
+                eventSocket = socket
+            }
             val shared = pairVerify.shared
             if (shared == null) {
                 Unit
@@ -921,6 +941,7 @@ class AirPlaySession @JvmOverloads constructor(
                 32,
             )
             synchronized(eventWriteLock) {
+                if (closed.get()) return
                 eventCipher = ControlCipher(readKey, writeKey)
                 startup.eventReady()
                 sendPendingNightModeLocked()

@@ -63,6 +63,8 @@ class ProjectionReceiver(
     private val admissionRevoked = AtomicBoolean()
     private val retirement = CountDownLatch(1)
     private val retirementRunning = AtomicBoolean()
+    private val retirementRetryRequested = AtomicBoolean()
+    private val retirementLock = Any()
     private val lock = Any()
     private var server: ServerSocket? = null
     private var acceptThread: Thread? = null
@@ -382,11 +384,12 @@ class ProjectionReceiver(
         if (index !in 1..5 || !current()) return false
         return try {
             input.execute {
-                synchronized(lock) {
-                    if (!current()) return@execute
-                    val sent = (index != 1 || sink.requestFocusForUserPlay()) && session.sendMedia(index)
-                    status("media stage=media-control index=$index outcome=${if (sent) "sent" else "failed"}")
-                }
+                // Neither a Binder focus request nor an event write may own the lifecycle monitor.
+                // Revalidate the exact authenticated owner after focus, which can outlast revocation.
+                if (!current()) return@execute
+                val focused = index != 1 || sink.requestFocusForUserPlay()
+                val sent = focused && current() && session.sendMedia(index)
+                status("media stage=media-control index=$index outcome=${if (sent) "sent" else "failed"}")
             }
             true
         } catch (_: RejectedExecutionException) { false }
@@ -435,15 +438,17 @@ class ProjectionReceiver(
         runtimeMetadata.values.forEach { it.revoke() }
     }
     override fun close() {
-        if (!closed.compareAndSet(false, true)) { sink.close(); retryRetirement(); return }
+        if (!closed.compareAndSet(false, true)) { retryRetirement(); return }
         revokePendingAdmission()
         telemetry.retire()
         val retiring = synchronized(lock) {
             runCatching { server?.close() }; server = null; port = 0; active = null
             allSessions.toList()
         }
-        retiring.forEach { runCatching { it.close() } }; tunnels.values.forEach { runCatching { it.close() } }; tunnels.clear()
-        sink.close(); deadlines.shutdownNow(); input.shutdownNow(); runtime.shutdownNow(); statuses.shutdownNow()
+        // Reach actual transport cancellation before any callback/OS cleanup can wait for focus.
+        retiring.forEach { it.cancelPendingIo() }
+        sink.revokePendingWork()
+        deadlines.shutdownNow(); input.shutdownNow(); runtime.shutdownNow(); statuses.shutdownNow()
         retryRetirement()
     }
     /** Only the runtime worker, or retirement after that worker stops, closes exact car-data owners. */
@@ -451,22 +456,43 @@ class ProjectionReceiver(
         if (runCatching { owner.close() }.isSuccess) runtimeLinks.remove(session, owner)
     }
     private fun retryRetirement() {
-        if (retirement.count == 0L || !retirementRunning.compareAndSet(false, true)) return
+        synchronized(retirementLock) {
+            if (retirement.count == 0L) return
+            if (retirementRunning.get()) { retirementRetryRequested.set(true); return }
+            retirementRunning.set(true)
+            retirementRetryRequested.set(false)
+        }
         // Control threads can still be persisting a pairing after close(); hold exact state lock until retired.
         Thread({
             try {
+                // A blocked focus/write is cancellable, not acknowledged as retired. Keep the
+                // pairing lock and every exact resource until the concrete input worker exits.
+                while (!input.awaitTermination(1, TimeUnit.SECONDS)) { /* exact worker retained */ }
+                allSessions.toList().forEach { it.close() }
+                tunnels.values.forEach { it.close() }; tunnels.clear()
                 allSessions.toList().forEach { it.awaitControlStopped() }
                 // A slow OS worker is not a permanent loss of the retirement retry path.
                 while (!runtime.awaitTermination(1, TimeUnit.SECONDS)) { /* exact owner retained */ }
-                while (!input.awaitTermination(1, TimeUnit.SECONDS)) { /* exact owner retained */ }
+                sink.close()
                 // Factories and their finally blocks have now stopped. Retry concrete cleanup once
                 // per close lifecycle; a failed exact owner fences storage release and acknowledgment.
                 runtimeLinks.entries.toList().forEach { (session, owner) -> retireCarData(session, owner) }
                 if (runtimeLinks.isNotEmpty()) return@Thread
+                while (!sink.awaitRetired(1_000)) {
+                    // Coalesce Retry onto this cleanup owner, never the lifecycle caller.
+                    if (retirementRetryRequested.getAndSet(false)) sink.close()
+                }
                 persistence.close()
                 retirement.countDown()
             } catch (_: Exception) { /* Withhold acknowledgment; parent must not admit a successor. */ }
-            finally { retirementRunning.set(false) }
+            finally {
+                val retry = synchronized(retirementLock) {
+                    retirementRunning.set(false)
+                    retirementRetryRequested.getAndSet(false)
+                }
+                // A Retry delivered during failed cleanup must not be dropped with the worker.
+                if (retry) retryRetirement()
+            }
         }, "lab-media-state-release")
             .apply { isDaemon = true; start() }
     }
