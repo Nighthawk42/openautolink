@@ -12,12 +12,14 @@ internal class OalCarPlayIntakeLink(
     sendNight: (Boolean) -> Boolean,
     send: (Iap2Frame) -> Unit,
     receipt: (String) -> Unit,
+    frozenCapabilities: com.openautolink.carplaylab.intake.OalCarDataCapabilities? = null,
 ) : RuntimeCarDataLink {
-    private val initial = vehicle.snapshot()
-    private val capabilities = com.openautolink.carplaylab.intake.OalCarDataCapabilities(
-        location = gpsQualified, range = initial?.rangeKm != null,
-        currentEnergy = initial?.currentChargeWh != null, maximumEnergy = initial?.maxChargeWh != null,
-    )
+    private val capabilities = frozenCapabilities ?: vehicle.snapshot(receipt).let { initial ->
+        com.openautolink.carplaylab.intake.OalCarDataCapabilities(
+            location = gpsQualified, range = initial?.rangeKm != null,
+            currentEnergy = initial?.currentChargeWh != null, maximumEnergy = initial?.maxChargeWh != null,
+        )
+    }
     private val gps = gnss
     private val appearanceBridge = appearance
     private val ready = kotlinx.coroutines.flow.MutableStateFlow(false)
@@ -36,7 +38,7 @@ internal class OalCarPlayIntakeLink(
         }
     }
     private val reporter = com.openautolink.carplaylab.intake.OalIap2CarDataReporter(
-        capabilities, elapsedMs, gnss::latest, vehicle::snapshot, gnss::setActive,
+        capabilities, elapsedMs, gnss::latest, { vehicle.snapshot(receipt) }, gnss::setActive,
         { frame -> check(!retired.get()); send(frame) }, receipt,
     )
     override fun identification(base: Iap2Frame) = com.openautolink.carplaylab.intake.OalCarDataIdentification.apply(base, capabilities)

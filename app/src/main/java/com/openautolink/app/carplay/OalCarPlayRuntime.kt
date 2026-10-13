@@ -238,7 +238,7 @@ class OalCarPlayRuntime(
                     runCatching { context.getSystemService(LocationManager::class.java)?.isProviderEnabled(LocationManager.GPS_PROVIDER) == true }.getOrDefault(false)
                 OalCarPlayIntakeLink(qualifiedGps, OalCarPlayVehicleSnapshotAdapter(),
                     OalCarPlayGnssSnapshotAdapter(SystemClock::elapsedRealtime) { sink ->
-                        GnssForwarderImpl(context.applicationContext, sink)
+                        GnssForwarderImpl(context.applicationContext, sink, true)
                     }, SystemClock::elapsedRealtime, CarPlayAppearanceBridge(),
                     session::setNightModeIfEventReady, send, receipt)
             }, runtimeMetadataFactory = { receipt -> own { active(); OalCarPlayMetadataLink(SystemClock::elapsedRealtime, receipt, OalCarPlayMetadataHost(context.applicationContext)) } }, onStatus = ::status).also { receiver = it } }

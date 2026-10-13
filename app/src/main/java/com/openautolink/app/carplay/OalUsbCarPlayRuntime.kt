@@ -220,16 +220,18 @@ class OalUsbCarPlayRuntime(
         val gps=context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)==PackageManager.PERMISSION_GRANTED &&
             runCatching { context.getSystemService(LocationManager::class.java)?.isProviderEnabled(LocationManager.GPS_PROVIDER)==true }.getOrDefault(false)
         val vehicle=OalCarPlayVehicleSnapshotAdapter()
-        val snapshot=vehicle.snapshot()
+        val snapshot=vehicle.snapshot(::status)
         val capabilities=com.openautolink.carplaylab.intake.OalCarDataCapabilities(gps,snapshot?.rangeKm!=null,
             snapshot?.currentChargeWh!=null,snapshot?.maxChargeWh!=null)
+        val vehicleBootstrap=own { com.openautolink.carplaylab.intake.OalCarDataBootstrap(capabilities,SystemClock::elapsedRealtime,::status) }
         val identification=Iap2IdentificationConfig("OpenAutoLink","OAL-native-CarPlay","OpenAutoLink",
             "oal-private-receiver","0.1","Android",function.data.id,externalAccessoryProtocol="com.openautolink.carplaylab")
         val projection=own { ProjectionReceiver(context,identity,surface,auth,display,trustedOnly=true,
             runtimeCarDataFactory={ session,send,receipt ->
-                OalCarPlayIntakeLink(gps,vehicle,OalCarPlayGnssSnapshotAdapter(SystemClock::elapsedRealtime) {
-                    sink -> GnssForwarderImpl(context.applicationContext,sink)
-                },SystemClock::elapsedRealtime,CarPlayAppearanceBridge(),session::setNightModeIfEventReady,send,receipt)
+                vehicleBootstrap.wrap(OalCarPlayIntakeLink(gps,vehicle,OalCarPlayGnssSnapshotAdapter(SystemClock::elapsedRealtime) {
+                    sink -> GnssForwarderImpl(context.applicationContext,sink,true)
+                },SystemClock::elapsedRealtime,CarPlayAppearanceBridge(),session::setNightModeIfEventReady,send,receipt,
+                    frozenCapabilities=capabilities))
             },runtimeMetadataFactory={ receipt -> own {
                 active();OalCarPlayMetadataLink(SystemClock::elapsedRealtime,receipt,OalCarPlayMetadataHost(context.applicationContext))
             } },wired=true,onStatus=::status).also { receiver=it } }
@@ -238,10 +240,10 @@ class OalUsbCarPlayRuntime(
         com.openautolink.app.diagnostics.DiagnosticLog.i("carplay-scale",scale)
         projection.setRuntimeIdentification(identification)
         val csm=own { Iap2Session.open(carkit,onArtwork=projection::offerWiredArtwork) }
-        Iap2IdentificationClient(csm) { base -> com.openautolink.carplaylab.intake.OalCarDataIdentification.apply(base,capabilities) }
-            .identify(identification,30000)
+        Iap2IdentificationClient(csm,vehicleBootstrap::identification)
+            .identify(identification,30000,onOtherFrame=vehicleBootstrap::handle)
         status("CarPlay phone identification accepted")
-        Iap2MfiAuthenticationClient(auth).run(csm,30000) {}
+        Iap2MfiAuthenticationClient(auth).run(csm,30000,onOtherFrame=vehicleBootstrap::handle) {}
         active();status("CarPlay receiver MFi authentication accepted · phone AirPlay trust pending")
         if(projection.requiresControllerEnrollment) projection.authorizeFirstEnrollment(120000)
         projection.start(CarPlayNetworkSelection(local,exactNic.index,null))
@@ -265,6 +267,7 @@ class OalUsbCarPlayRuntime(
             }
             if(System.nanoTime()>readyDeadline) throw TimeoutException("USB AirPlay startup expired")
             val frame=csm.recv(500) ?: continue
+            if(vehicleBootstrap.handle(frame)) continue
             if(frame.messageId==0x4300) {
                 csm.send(Iap2CarPlayMessages.startSession(wiredIpv6Addresses=listOf(address),airPlayPort=projection.port,
                     deviceIdentifier=identity,publicKey=projection.publicKeyHex,sourceVersion="950.7.1"),5000)
