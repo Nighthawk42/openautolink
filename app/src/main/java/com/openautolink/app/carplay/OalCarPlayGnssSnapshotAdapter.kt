@@ -13,34 +13,48 @@ class OalCarPlayGnssSnapshotAdapter(
     private var retired = false
     private var generation = 0L
 
+    /** Caller holds this adapter's monitor. Do not lose an owner whose OS removal failed. */
+    private fun retireSource() {
+        val owner=source ?: return
+        owner.stop()
+        if (source===owner) source=null
+    }
+
     @Synchronized fun setActive(requestedActive: Boolean) {
-        if (retired || requestedActive == active) return
+        if (retired || (requestedActive == active && (active || source == null))) return
         generation++
-        active = requestedActive
+        active = false
         cache = com.openautolink.carplaylab.intake.OalNmeaCache(elapsedMs)
-        source?.stop()
-        source = null
-        if (!active) return
+        retireSource()
+        if (!requestedActive) return
+        active=true
         val ownerGeneration = generation
-        val owner = createSource { message ->
+        val owner = try { createSource { message ->
             synchronized(this) {
                 if (active && !retired && ownerGeneration == generation) cache.accept(message.nmea)
             }
+        } } catch (failure: Exception) {
+            active=false;generation++;throw failure
         }
         source = owner
-        try { owner.start() } catch (failure: Exception) {
-            active = false; generation++; source = null
-            try { owner.stop() } catch (_: Exception) { }
-            throw failure // Reporter catches without exporting text.
+        try {
+            owner.start()
+            if (!owner.isActive) { active=false;generation++;retireSource() }
+        } catch (failure: Exception) {
+            active=false;generation++
+            try {retireSource()} catch (cleanup: Exception) {failure.addSuppressed(cleanup)}
+            throw failure // Reporter catches without exporting text; failed exact owner stays retained.
         }
-        if (!owner.isActive) { active = false; generation++; source = null; owner.stop() }
     }
 
     @Synchronized fun latest(requested: Set<Int>): String? =
         if (active && !retired) cache.latest(requested) else null
 
     @Synchronized override fun close() {
-        if (retired) return
-        try { setActive(false) } finally { retired = true }
+        if (!retired) {
+            retired=true;active=false;generation++
+            cache=com.openautolink.carplaylab.intake.OalNmeaCache(elapsedMs)
+        }
+        retireSource() // Retry a failed removal even after the permanent callback fence is set.
     }
 }

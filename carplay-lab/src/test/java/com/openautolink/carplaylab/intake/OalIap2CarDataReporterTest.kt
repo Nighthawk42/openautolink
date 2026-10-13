@@ -11,7 +11,7 @@ class OalIap2CarDataReporterTest {
     private val sent = mutableListOf<Iap2Frame>()
     private val cache = OalNmeaCache { now }.also { it.accept(OalNmeaCacheTest.gga); it.accept(OalNmeaCacheTest.rmc) }
     private fun start(vararg selectors: Int, interval: Long = 1000) = Iap2Messages.buildRaw(0xFFFA) {
-        u16(0,0); selectors.forEach { void(it) }; u32(0x8001,interval)
+        u32(0,interval); selectors.forEach { void(it) }; if (1 in selectors) u32(0x8001,interval)
     }
     private fun link() = OalIap2CarDataReporter(
         OalCarDataCapabilities(location = true), { now }, cache::latest,
@@ -47,9 +47,9 @@ class OalIap2CarDataReporterTest {
     @Test fun pollTimeoutTracksDueAttemptNotSuccessfulSampleAndClampsShortIntervals() {
         val link=link(); assertEquals(60000L,link.pollTimeout(60000))
         link.authenticate(); link.handle(start(1,interval=1))
-        assertEquals(1000L,link.pollTimeout(60000))
-        now=999; assertEquals(1L,link.pollTimeout(60000))
-        now=1000; link.tick(); assertEquals(1000L,link.pollTimeout(60000))
+        assertEquals(250L,link.pollTimeout(60000))
+        now=249; assertEquals(1L,link.pollTimeout(60000))
+        now=250; link.tick(); assertEquals(250L,link.pollTimeout(60000))
         link.handle(Iap2Frame(0xFFFC,byteArrayOf(1))) // stop revokes even malformed payload
         assertEquals(60000L,link.pollTimeout(60000))
         link.close(); assertEquals(60000L,link.pollTimeout(60000))

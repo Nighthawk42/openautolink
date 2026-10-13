@@ -19,6 +19,7 @@ class Iap2MfiAuthenticationClient(
     fun run(
         session: Iap2Session,
         timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
+        onOtherFrame: (Iap2Frame) -> Boolean = {false},
         onProgress: (String) -> Unit = {},
     ) {
         require(timeoutMillis in 1..MAX_TIMEOUT_MILLIS) {
@@ -62,7 +63,7 @@ class Iap2MfiAuthenticationClient(
                     return
                 }
                 AUTHENTICATION_FAILED -> throw Iap2MfiAuthenticationException("iPhone sent AuthenticationFailed")
-                else -> throw Iap2MfiAuthenticationException(
+                else -> if (!onOtherFrame(frame)) throw Iap2MfiAuthenticationException(
                     "Unexpected iAP2 MFi message 0x${frame.messageId.toString(16).padStart(4, '0')}",
                 )
             }

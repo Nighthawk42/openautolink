@@ -44,16 +44,34 @@ class AndroidMediaSink(
         { it.isRetired }, { it.isClosed })
     private val microphoneOwners = ConcurrentHashMap.newKeySet<MicrophoneUplink>()
     private val manager = context.applicationContext.getSystemService(AudioManager::class.java)
-    private val focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+    private var focusRevision = 0L
+    private var focus = newFocusRequest()
+    private fun newFocusRequest(): AudioFocusRequest {
+        val revision = ++focusRevision
+        return AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
         .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
         .setOnAudioFocusChangeListener({ change ->
-            // This is OS focus, not a telephony transport claim.
-            tracks.values.forEach { it.volume(if (change < 0) 0f else 1f) }
-            report("media stage=audio-focus-change")
+            synchronized(this) {
+                if (!closed.get() && revision == focusRevision && focusHeld && !permanentlyLost) {
+                    // Delivered CAN_DUCK is permission to attenuate, not a full loss.
+                    // Automatic AAOS/HAL ducking can occur without this callback.
+                    when (change) {
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> focusVolume = 0.2f
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> focusVolume = 0f
+                        AudioManager.AUDIOFOCUS_LOSS -> { focusVolume = 0f; permanentlyLost = true }
+                        AudioManager.AUDIOFOCUS_GAIN -> focusVolume = 1f
+                    }
+                    tracks.values.forEach { it.volume(focusVolume) }
+                    report("media stage=audio-focus-change change=$change volumePercent=${(focusVolume * 100).toInt()}")
+                }
+            }
         }, Handler(Looper.getMainLooper())).build()
+    }
     private val tracks = ConcurrentHashMap<AudioStreamId, AudioOutputTrack>()
-    private var focusHeld = false
+    private var focusHeld = false // Request lifetime; transient loss retains this request.
+    private var focusVolume = 1f
+    private var permanentlyLost = false
     private var recovery: (() -> Unit)? = null
     private var diagnostic: ((String) -> Unit)? = null
     private val videoQueue = ArrayBlockingQueue<VideoJob>(24)
@@ -125,22 +143,41 @@ class AndroidMediaSink(
             tracks.remove(id, old)
         }
         if (tracks.size >= 8) { report("media stage=audio-owner-limit"); return }
-        if (!focusHeld) {
-            focusHeld = manager?.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            report(if (focusHeld) "media stage=audio-focus-granted" else "media stage=audio-focus-denied")
+        if (!focusHeld && !permanentlyLost) {
+            focus = newFocusRequest()
+            val granted = manager?.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            focusHeld = true // A live request, not permission to undo a transient/permanent loss.
+            focusVolume = if (granted) 1f else 0f
+            permanentlyLost = !granted
+            report(if (granted) "media stage=audio-focus-granted" else "media stage=audio-focus-denied")
         }
         telemetry.audioStreamStarted()
         val stream = audioOwners.incrementAndGet() // Local owner sequence, never a phone connection ID.
         val qualification = "stream=$stream type=${id.type} audioType=${format.audioType} codec=${format.codec}"
         report("media stage=audio-setup $qualification rate=${format.sampleRate} clock=${format.rtpClockRate} channels=${format.channels} spf=${format.samplesPerFrame}")
-        tracks[id] = AudioOutputTrack(format, firstSample, writtenBytes, telemetry, ::report, qualification)
+        tracks[id] = AudioOutputTrack(format, firstSample, writtenBytes, telemetry, ::report, qualification, focusVolume)
     }
     override fun onAudioRtp(id: AudioStreamId, format: AudioFormat, rtp: ByteArray, sample: Int) {
         tracks[id]?.submit(rtp, sample)
     }
+    /** No timer/packet/SETUP may reclaim permanent focus loss. Only explicit user PLAY calls here. */
+    @Synchronized fun requestFocusForUserPlay(): Boolean {
+        if (closed.get()) return false
+        if (focusHeld && !permanentlyLost && focusVolume > 0f) return true
+        manager?.abandonAudioFocusRequest(focus)
+        focus = newFocusRequest()
+        val granted = manager?.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (closed.get()) return false // A late Binder result cannot revive a revoked owner.
+        focusHeld = true
+        permanentlyLost = !granted
+        focusVolume = if (granted) 1f else 0f
+        tracks.values.forEach { it.volume(focusVolume) }
+        report(if (granted) "media stage=audio-focus-granted" else "media stage=audio-focus-denied")
+        return granted
+    }
     @Synchronized override fun onAudioStopped(id: AudioStreamId) {
         tracks[id]?.let { old -> old.close(); if (old.isRetired) tracks.remove(id, old) }
-        if (tracks.values.none { !it.isClosed }) { manager?.abandonAudioFocusRequest(focus); focusHeld = false }
+        if (tracks.values.none { !it.isClosed }) { manager?.abandonAudioFocusRequest(focus); focusHeld = false; focusRevision++ }
     }
     private fun runVideo() {
         var codec: MediaCodec? = null
@@ -239,6 +276,11 @@ class AndroidMediaSink(
         } catch (_: InterruptedException) { /* shutdown */ }
         finally { release(); videoRetired.set(true) }
     }
+    /** Nonblocking cancellation while user PLAY may be inside the platform focus call. */
+    fun revokePendingWork() {
+        if (closed.compareAndSet(false, true)) telemetry.retire()
+        videoThread.interrupt()
+    }
     override fun close() {
         routeDiagnostics.close()
         if (closed.compareAndSet(false, true)) telemetry.retire()
@@ -285,6 +327,7 @@ private class AudioOutputTrack(
     private val telemetry: com.openautolink.carplaylab.media.ReceiverTelemetry,
     private val report: (String) -> Unit,
     private val qualification: String,
+    initialVolume: Float,
 ) : Closeable {
     private val packets = AtomicLong()
     private val queueDrops = AtomicLong()
@@ -310,7 +353,7 @@ private class AudioOutputTrack(
     private val retired = AtomicBoolean()
     private val queue = ArrayBlockingQueue<Packet>(64)
     @Volatile private var track: AudioTrack? = null
-    @Volatile private var requestedVolume = 1f
+    @Volatile private var requestedVolume = initialVolume
     val isClosed: Boolean get() = closed.get()
     val isRetired: Boolean get() = retired.get() && !thread.isAlive
     private val thread = Thread(::run, "lab-audio-output").apply { isDaemon = true; start() }

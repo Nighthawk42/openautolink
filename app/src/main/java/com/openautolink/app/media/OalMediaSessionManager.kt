@@ -72,6 +72,24 @@ class OalMediaSessionManager private constructor(private val context: Context) {
     // Media control callback for routing GM's native MediaSession controls to AA.
     @Volatile
     var mediaControlCallback: MediaControlCallback? = null
+    private var carPlayControls: Pair<Any, MediaControlCallback>? = null
+
+    internal fun installCarPlayControls(owner: Any, callback: MediaControlCallback) = synchronized(sessionLock) {
+        carPlayControls = owner to callback
+    }
+    internal fun retireCarPlayControls(owner: Any) = synchronized(sessionLock) {
+        if (carPlayControls?.first === owner) carPlayControls = null
+    }
+    private fun dispatchMediaCommand(command: GmMediaControlPolicy.Command) {
+        val target = synchronized(sessionLock) { carPlayControls }
+        if (target != null) {
+            com.openautolink.app.carplay.MetadataHostOwnership.process.publish(target.first) {
+                target.second.onCommand(command)
+            }
+        } else com.openautolink.app.carplay.MetadataHostOwnership.process.legacy {
+            mediaControlCallback?.onCommand(command)
+        }
+    }
 
     interface MediaControlCallback {
         fun onCommand(command: GmMediaControlPolicy.Command)
@@ -84,23 +102,23 @@ class OalMediaSessionManager private constructor(private val context: Context) {
             mediaSession = MediaSessionCompat(context, "OpenAutoLinkMedia").apply {
                 setCallback(object : MediaSessionCompat.Callback() {
                     override fun onPlay() {
-                        mediaControlCallback?.onCommand(GmMediaControlPolicy.Command.PLAY)
+                        dispatchMediaCommand(GmMediaControlPolicy.Command.PLAY)
                     }
 
                     override fun onPause() {
-                        mediaControlCallback?.onCommand(GmMediaControlPolicy.Command.PAUSE)
+                        dispatchMediaCommand(GmMediaControlPolicy.Command.PAUSE)
                     }
 
                     override fun onStop() {
-                        mediaControlCallback?.onCommand(GmMediaControlPolicy.Command.STOP)
+                        dispatchMediaCommand(GmMediaControlPolicy.Command.STOP)
                     }
 
                     override fun onSkipToNext() {
-                        mediaControlCallback?.onCommand(GmMediaControlPolicy.Command.NEXT)
+                        dispatchMediaCommand(GmMediaControlPolicy.Command.NEXT)
                     }
 
                     override fun onSkipToPrevious() {
-                        mediaControlCallback?.onCommand(GmMediaControlPolicy.Command.PREVIOUS)
+                        dispatchMediaCommand(GmMediaControlPolicy.Command.PREVIOUS)
                     }
 
                     override fun onMediaButtonEvent(mediaButtonEvent: android.content.Intent): Boolean {
@@ -143,6 +161,7 @@ class OalMediaSessionManager private constructor(private val context: Context) {
             }
             mediaSession = null
             mediaControlCallback = null
+            carPlayControls = null
             cachedArtHash = 0
             cachedBitmap = null
             lastPushedPlaying = null

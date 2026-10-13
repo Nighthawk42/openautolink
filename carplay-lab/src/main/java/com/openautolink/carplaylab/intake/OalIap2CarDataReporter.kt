@@ -30,13 +30,18 @@ class OalIap2CarDataReporter(
     private var authenticated = false
     private var retired = false
     private var requested = emptySet<Int>()
-    private var lastLocationAttempt: Long? = null
-    private var locationInterval = 1000L
+    private val lastLocationAttempts = mutableMapOf<Int,Long>()
+    private var locationIntervals = emptyMap<Int,Long>()
     private var evActive = false
+    private var evGroups = emptySet<Int>()
     private var lastEvAttempt: Long? = null
     private var transmissionCount = 0L
     private val lastReceipts = mutableMapOf<Pair<Int,String>,Long>()
     private var suppressed = 0L
+
+    init {
+        runCatching { receipt("carplay-car-data-offer location=${capabilities.location} range=${capabilities.range} current=${capabilities.currentEnergy} maximum=${capabilities.maximumEnergy}") }
+    }
 
     @Synchronized fun authenticate() {
         if (!retired && !authenticated) { authenticated = true; log(0,"authenticated") }
@@ -49,37 +54,96 @@ class OalIap2CarDataReporter(
         when (id) {
             0xA102 -> { evActive = false; log(id,"stopped") }
             0xA100 -> {
-                // Only empty start has a pinned source contract. Do not guess selector/interval TLVs.
-                evActive = frame.payload.isEmpty() && (capabilities.range || capabilities.currentEnergy || capabilities.maximumEnergy)
-                log(id,if (evActive) "started" else "unsupported_request")
+                evGroups = try { parseEv(frame) } catch (failure: ContractRejection) {
+                    requestReceipt(frame,failure.code,failure.parameter,failure.length); emptySet()
+                }
+                evActive = evGroups.isNotEmpty()
+                if (evActive) requestReceipt(frame,"accepted",groups=evMask())
+                log(id,if (evActive) "started" else "unsupported_request",evMask())
                 tick()
             }
             0xFFFC -> { requested = emptySet(); setLocationActive(false); log(id,"stopped") }
             0xFFFA -> {
                 requested = emptySet()
-                if (!capabilities.location) { log(id,"disabled"); return true }
-                val parsed = try { parseLocation(frame) } catch (_: Exception) { null }
-                requested = parsed.orEmpty()
-                setLocationActive(requested.isNotEmpty())
+                locationIntervals = emptyMap()
+                if (!capabilities.location) {
+                    setLocationActive(false); requestReceipt(frame,"disabled"); log(id,"disabled"); return true
+                }
+                val parsed = try { parseLocation(frame) } catch (failure: ContractRejection) {
+                    requestReceipt(frame,failure.code,failure.parameter,failure.length); null
+                }
+                locationIntervals = parsed.orEmpty()
+                requested = locationIntervals.keys
                 val sentenceMask = (if (1 in requested) 1 else 0) or (if (2 in requested) 2 else 0)
-                log(id,if (requested.isNotEmpty()) "started" else "unsupported_request", sentenceMask)
+                if (requested.isNotEmpty()) requestReceipt(frame,"accepted",groups=sentenceMask)
+                setLocationActive(requested.isNotEmpty())
+                log(id,if (locationIntervals.isNotEmpty()) "started" else "unsupported_request", sentenceMask)
                 tick()
             }
         }
         return true
     }
 
-    private fun parseLocation(frame: Iap2Frame): Set<Int> {
-        require(frame.payload.size <= 128)
-        val body = Iap2BodyReader.of(frame)
+    private fun parseLocation(frame: Iap2Frame): Map<Int,Long> {
+        val body = checkedBody(frame,mapOf(0 to 4,1 to 0,2 to 0,4 to 0,0x8001 to 4,0x8002 to 4))
         val ids = body.list().map { it.id }
-        require(ids.distinct().size == ids.size && ids.all { it in setOf(0,1,2,4,0x8001) })
-        if (body.has(0)) require(body.u16(0) == 0)
-        ids.filter { it in setOf(1,2,4) }.forEach { body.void(it) }
-        val interval = body.optionalU32(0x8001) ?: 1000L
-        require(interval in 1..60_000)
-        locationInterval = interval.coerceAtLeast(1000)
-        return ids.filter { it in setOf(1,2) }.toSet() // PASCD intentionally unsupported.
+        val global = body.optionalU32(0)
+        if (global != null && global !in 1..60_000) throw ContractRejection("interval_bounds",0,4)
+        listOf(1,2).forEach { selector ->
+            if (body.has(selector or 0x8000)) {
+                if (!body.has(selector)) throw ContractRejection("orphan_interval",selector or 0x8000,4)
+                if (body.u32(selector or 0x8000) !in 1..60_000) throw ContractRejection("interval_bounds",selector or 0x8000,4)
+            }
+        }
+        // 250ms is the bounded local scheduling floor, not a protocol width or component ID.
+        val intervals = ids.filter { it in setOf(1,2) }.associateWith {
+            maxOf(global ?: 0L, body.optionalU32(it or 0x8000) ?: global ?: 1000L, 250L)
+        } // PASCD intentionally unsupported.
+        if (intervals.isEmpty()) throw ContractRejection("no_supported_groups")
+        return intervals
+    }
+
+    private fun parseEv(frame: Iap2Frame): Set<Int> {
+        val body = checkedBody(frame,mapOf(3 to 0,11 to 0,21 to 0))
+        val ids = body.list().map { it.id }
+        val supported = buildSet {
+            if (capabilities.range) { add(3); add(11) }
+            if (capabilities.currentEnergy || capabilities.maximumEnergy) add(21)
+        }
+        // Retain the prior empty-start compatibility; nonempty starts select status groups,
+        // not update scalars (e.g. group 21 authorizes current/max update IDs 22/23).
+        val selected = if (ids.isEmpty()) supported else ids.toSet().intersect(supported)
+        if (selected.isEmpty()) throw ContractRejection("no_supported_groups")
+        return selected
+    }
+
+    private class ContractRejection(val code: String,val parameter: Int=0,val length: Int=0) : RuntimeException()
+
+    private fun checkedBody(frame: Iap2Frame,widths: Map<Int,Int>): Iap2BodyReader {
+        if (frame.payload.size > 128) throw ContractRejection("oversized")
+        val body = try { Iap2BodyReader.of(frame) } catch (_: Exception) { throw ContractRejection("malformed") }
+        val seen = mutableSetOf<Int>()
+        body.list().forEach {
+            if (!seen.add(it.id)) throw ContractRejection("duplicate",it.id,it.payload.size)
+            val width = widths[it.id] ?: throw ContractRejection("unsupported_id",it.id,it.payload.size)
+            if (width != it.payload.size) throw ContractRejection("width",it.id,it.payload.size)
+        }
+        return body
+    }
+
+    private fun evMask() = (if (3 in evGroups) 1 else 0) or (if (11 in evGroups) 2 else 0) or (if (21 in evGroups) 4 else 0)
+
+    private fun requestReceipt(frame: Iap2Frame,result: String,parameter: Int=0,length: Int=0,groups: Int=0) {
+        val key = frame.messageId to "request_$result"
+        val now = elapsedMs()
+        val last = lastReceipts[key]
+        if (last != null && now >= last && now-last < 1000) return
+        lastReceipts[key] = now
+        // Numeric IDs/widths only; never interval values from rejected payloads or free-text errors.
+        val gga=if(frame.messageId==0xFFFA) locationIntervals[1] ?: 0 else 0
+        val rmc=if(frame.messageId==0xFFFA) locationIntervals[2] ?: 0 else 0
+        val line="carplay-car-data-request id=${frame.messageId} bytes=${frame.payload.size.coerceAtMost(65535)} result=$result parameter=${parameter.coerceIn(0,65535)} length=${length.coerceIn(0,129)} groups=$groups ggaMs=$gga rmcMs=$rmc"
+        runCatching { receipt(line) }
     }
 
     @Synchronized fun pollTimeout(remainingMillis: Long): Long {
@@ -89,7 +153,9 @@ class OalIap2CarDataReporter(
         fun until(last: Long?, interval: Long): Long =
             if (last == null) 1 else (interval - (now - last).coerceAtLeast(0)).coerceAtLeast(1)
         var timeout = remainingMillis
-        if (requested.isNotEmpty()) timeout = minOf(timeout,until(lastLocationAttempt,locationInterval))
+        if (requested.isNotEmpty()) locationIntervals.forEach { (selector,interval) ->
+            timeout = minOf(timeout,until(lastLocationAttempts[selector],interval))
+        }
         if (evActive) timeout = minOf(timeout,until(lastEvAttempt,30_000))
         return timeout
     }
@@ -102,23 +168,31 @@ class OalIap2CarDataReporter(
             val snapshot = try { latestEv() } catch (_: Exception) { null }
             val frame = snapshot?.let {
                 OalCarDataCodec.vehicle(OalEvSnapshot(
-                    it.rangeKm.takeIf { capabilities.range },
-                    it.currentChargeWh.takeIf { capabilities.currentEnergy },
-                    it.maxChargeWh.takeIf { capabilities.maximumEnergy },
+                    it.rangeKm.takeIf { capabilities.range && (3 in evGroups || 11 in evGroups) },
+                    it.currentChargeWh.takeIf { capabilities.currentEnergy && 21 in evGroups },
+                    it.maxChargeWh.takeIf { capabilities.maximumEnergy && 21 in evGroups },
                 ))
+            }?.let { encoded ->
+                Iap2Messages.buildRaw(0xA101) {
+                    Iap2BodyReader.of(encoded).list().filter {
+                        when (it.id) { 3,11 -> it.id in evGroups; 22,23 -> 21 in evGroups; else -> false }
+                    }.forEach { raw(it.id,it.payload) }
+                }
             }
             if (frame == null) log(0xA101,"source_absent") else transmit(frame)
         }
-        if (retired || requested.isEmpty() || !due(now,lastLocationAttempt,locationInterval)) return
-        lastLocationAttempt = now
-        val raw = try { latestNmea(requested) } catch (_: Exception) { null }
+        if (retired || requested.isEmpty()) return
+        val dueSentences = locationIntervals.filter { (selector,interval) -> due(now,lastLocationAttempts[selector],interval) }.keys
+        if (dueSentences.isEmpty()) return
+        dueSentences.forEach { lastLocationAttempts[it] = now }
+        val raw = try { latestNmea(dueSentences) } catch (_: Exception) { null }
         // Defense at the wire boundary: providers cannot sneak unrequested or unbounded sentences in.
         val nmea = raw?.takeIf { it.length <= 264 }?.let {
             val lines = it.trimEnd('\r','\n').split("\r\n")
             if (lines.size !in 1..2) null else {
                 val checked = OalNmeaCache { now }
                 lines.forEach(checked::accept)
-                checked.latest(requested)
+                checked.latest(dueSentences)
             }
         }
         if (nmea == null) log(0xFFFB,"source_absent")

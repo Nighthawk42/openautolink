@@ -16,12 +16,12 @@ internal class CarPlayStartup(
     private var recorded = false
     private var ready = false
     private var attempted = false
-    private var retired = false
+    private val retired = java.util.concurrent.atomic.AtomicBoolean()
     fun recordReplied() = synchronized(lock) { recorded = true; startIfReady() }
     fun eventReady() = synchronized(lock) { ready = true; startIfReady() }
-    fun close() = synchronized(lock) { retired = true }
+    fun close() { retired.set(true) }
     private fun startIfReady() {
-        if (!requestUiOnStartup || retired || attempted || !recorded || !ready) return
+        if (!requestUiOnStartup || retired.get() || attempted || !recorded || !ready) return
         attempted = true
         send(mapOf("type" to "requestUI"))
     }
