@@ -17,6 +17,12 @@ class UsbCarPlayPermissionTest {
         every { deviceId } returns 2
         every { vendorId } returns 0x05ac
         every { productId } returns 0x12a8
+        every { deviceClass } returns 0
+        every { deviceSubclass } returns 0
+        every { deviceProtocol } returns 0
+        every { interfaceCount } returns 0
+        every { manufacturerName } returns "Apple"
+        every { productName } returns "Phone"
     }
     private val capability = mockk<PendingIntent>(relaxed = true)
     private val receiver = slot<BroadcastReceiver>()
@@ -50,6 +56,60 @@ class UsbCarPlayPermissionTest {
         verify(exactly = 1) { context.unregisterReceiver(receiver.captured) }
         verify(exactly = 1) { capability.cancel() }
         verify(exactly = 1) { usb.requestPermission(device, capability) }
+    }
+    private fun osMatchedApple() {
+        every { device.deviceClass } returns 0
+        every { device.deviceSubclass } returns 0
+        every { device.deviceProtocol } returns 0
+        every { device.interfaceCount } returns 1
+        val mux = mockk<UsbInterface> {
+            every { interfaceClass } returns 255
+            every { interfaceSubclass } returns 254
+            every { interfaceProtocol } returns 2
+        }
+        every { device.getInterface(0) } returns mux
+    }
+    @Test fun osMatchedAppleWaitsForExternalGrantWithoutAppDialog() {
+        osMatchedApple()
+        var checks = 0
+        assertEquals(UsbCarPlayPermission.Result.GRANTED, await {
+            if (++checks == 3) granted = true
+            false
+        })
+        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
+        verify(exactly = 1) { context.unregisterReceiver(receiver.captured) }
+    }
+    @Test fun matchedReplacementWaitDoesNotInheritOriginalGrantOrPickerAuthority() {
+        osMatchedApple()
+        granted = true
+        assertEquals(UsbCarPlayPermission.Result.GRANTED, await())
+        granted = false
+        every { device.deviceName } returns "/dev/bus/usb/001/003"
+        every { device.deviceId } returns 3
+        every { usb.deviceList } returns hashMapOf(device.deviceName to device)
+        assertEquals(UsbCarPlayPermission.Result.TIMED_OUT, await())
+        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
+    }
+    @Test fun matchedWaitStillCancelsWithoutAnyAppRequest() {
+        osMatchedApple()
+        var checks = 0
+        assertEquals(UsbCarPlayPermission.Result.CANCELLED, await { ++checks >= 3 })
+        verify(exactly = 0) { usb.requestPermission(any<UsbDevice>(), any<PendingIntent>()) }
+        verify(exactly = 1) { context.unregisterReceiver(receiver.captured) }
+    }
+    @Test fun pickerSelectionAuthorizesOneExactAppleAppRequest() {
+        osMatchedApple()
+        every { context.getSystemService(Context.USB_SERVICE) } returns usb
+        var outcome: UsbCarPlayPermission.Result? = null
+        val manager = com.openautolink.app.transport.usb.UsbConnectionManager(context,
+            kotlinx.coroutines.test.TestScope(), {}, onIphoneSelected = { outcome = await(); true })
+        manager.javaClass.getDeclaredField("isRunning").apply { isAccessible = true }.set(manager, true)
+        every { usb.requestPermission(device, capability) } answers { granted = true; reply(true) }
+        manager.javaClass.getDeclaredMethod("onUserSelectedDevice", String::class.java)
+            .apply { isAccessible = true }.invoke(manager, device.deviceName)
+        assertEquals(UsbCarPlayPermission.Result.GRANTED, outcome)
+        verify(exactly = 1) { usb.requestPermission(device, capability) }
+        manager.stop()
     }
     @Test fun grantRequiresExactDeviceGenerationAndActualPermission() {
         every { usb.requestPermission(device, capability) } answers {
@@ -96,6 +156,12 @@ class UsbCarPlayPermissionTest {
         every { usb.requestPermission(device, capability) } throws SecurityException("test")
         try { await(); fail("Expected platform rejection") } catch (_: SecurityException) { }
         cleaned()
+    }
+    @Test fun cancellationBeforeRegistrationRevokesExplicitPickerAuthority() {
+        osMatchedApple()
+        com.openautolink.app.transport.usb.UsbAttachAuthorization.explicitRetry(device)
+        assertEquals(UsbCarPlayPermission.Result.CANCELLED, await { true })
+        assertFalse(com.openautolink.app.transport.usb.UsbAttachAuthorization.canRequest(device))
     }
     @Test fun cancellationBeforeStartDoesNotRegisterOrRequest() {
         assertEquals(UsbCarPlayPermission.Result.CANCELLED, await { true })

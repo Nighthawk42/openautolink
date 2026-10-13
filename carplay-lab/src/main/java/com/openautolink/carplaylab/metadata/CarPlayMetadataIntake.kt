@@ -8,7 +8,13 @@ data class CarPlayMediaMetadata(val title: String? = null, val artist: String? =
 
 /** Raw accessory-navigation vocabulary, not Android Auto enums. Geometry keeps signed degrees. */
 data class CarPlayNavigationMetadata(val maneuverType: Int, val drivingSide: Int?, val distanceMeters: Int?, val road: String?, val remainingSeconds: Long?, val remainingMeters: Int?, val junctionType: Int? = null, val junctionExitAngleDegrees: Int? = null, val junctionAnglesDegrees: List<Int>? = null)
+/** Route identity is independent of whether the selected instruction has arrived. */
+data class CarPlayRouteMetadata(val epoch: Long, val instruction: CarPlayNavigationMetadata?)
+
 class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
+    private var routeEpoch = 0L
+    val routeMetadata: CarPlayRouteMetadata? @Synchronized get() =
+        if (route) CarPlayRouteMetadata(routeEpoch, navigation) else null
     /** Numeric finite receipts only; callback failure cannot change parsing/publication. */
     var onDiagnostic: (String) -> Unit = {}
     private var parsedRoutes = 0L
@@ -49,22 +55,34 @@ class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
     private var seconds: Long? = null
     private var meters: Int? = null
     private var lastRoute: Long? = null
+    private var instructionExpired = false
     var navigation: CarPlayNavigationMetadata? = null
         private set
+    private companion object {
+        const val INSTRUCTION_STALE_MS = 30_000L
+        // Local finite ownership grace, not an Apple protocol timeout.
+        const val ROUTE_EXPIRES_MS = 120_000L
+    }
     @Synchronized fun tick() {
-        if (retired || lastRoute?.let { elapsedMs() - it >= 30000 } == true) {
-            val before = navigation
+        val age = lastRoute?.let { elapsedMs() - it } ?: return
+        val before = navigation
+        if (retired || age >= ROUTE_EXPIRES_MS) {
             clearRoute()
-            if (before != null) observe("lifecycle", "cleared", before, reason = if (retired) "revoke" else "stale")
+            observe("lifecycle", "cleared", before, reason = if (retired) "revoke" else "expired")
+        } else if (age >= INSTRUCTION_STALE_MS && !instructionExpired) {
+            // Keep the source epoch, but discard the stale instruction and its estimates.
+            navigation = null; maneuvers.clear(); instructionExpired = true
+            distance = null; road = null; seconds = null; meters = null
+            observe("lifecycle", "cleared", before, reason = "stale")
         }
     }
     private fun clearRoute() {
         route = false; index = null; distance = null; road = null; seconds = null; meters = null
-        lastRoute = null; maneuvers.clear(); navigation = null
+        lastRoute = null; maneuvers.clear(); navigation = null; instructionExpired = false
     }
     private fun publishRoute() {
         val m = maneuvers[index]
-        navigation = if (route && m != null) CarPlayNavigationMetadata(m.type,m.side,distance,m.road ?: road,seconds,meters,m.junction,m.exitAngle,m.angles) else null
+        navigation = if (route && m != null && lastRoute?.let { elapsedMs() - it < INSTRUCTION_STALE_MS } == true) CarPlayNavigationMetadata(m.type,m.side,distance,m.road ?: road,seconds,meters,m.junction,m.exitAngle,m.angles) else null
     }
     private fun navigationFrame(frame: Iap2Frame) {
         val b = Iap2BodyReader.of(frame)
@@ -82,6 +100,8 @@ class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
                 val raw = it.payload // exact two-byte width checked above
                 (((raw[0].toInt() and 255) shl 8) or (raw[1].toInt() and 255)).toShort().toInt()
             }?.let { java.util.Collections.unmodifiableList(it) }
+            // Enforce the prior route deadline only after every field is validated.
+            tick()
             if (maneuvers.size >= 8 && !maneuvers.containsKey(id)) {
                 // Future details must not evict the route's currently selected instruction.
                 maneuvers.keys.firstOrNull { it != index }?.let(maneuvers::remove)
@@ -89,17 +109,24 @@ class CarPlayMetadataIntake(private val elapsedMs: () -> Long) {
             maneuvers[id] = Maneuver(type,side,name,junction,exitAngle,angles)
         } else {
             val state = b.optionalU8(1)
-            val name = text(b,3,road)
-            val nextDistance = b.optionalU32(10)?.also { require(it <= Int.MAX_VALUE) }?.toInt() ?: distance
-            val nextSeconds = b.optionalU64(6)?.also { require(it >= 0) } ?: seconds
-            val nextMeters = b.optionalU32(7)?.also { require(it <= Int.MAX_VALUE) }?.toInt() ?: meters
+            val name = text(b,3,null)
+            val nextDistance = b.optionalU32(10)?.also { require(it <= Int.MAX_VALUE) }?.toInt()
+            val nextSeconds = b.optionalU64(6)?.also { require(it >= 0) }
+            val nextMeters = b.optionalU32(7)?.also { require(it <= Int.MAX_VALUE) }?.toInt()
             val current = b.optionalU16List(13)?.also { require(it.size <= 8) }
-            if (state == 0 || state == 2) { clearRoute(); return }
             if (state != null) require(state in 0..6) // accessoryd @0x10000443c; unknown stays rejected
+            // A recv may cross a deadline after the receiver's last tick. Resolve
+            // omitted-field inheritance against the post-expiry state, not old data.
+            tick()
+            if (state == 0 || state == 2) { clearRoute(); return }
             if (current != null) index = current.firstOrNull()
-            if (state != null || current?.isNotEmpty() == true) route = true
-            road = name; distance = nextDistance; seconds = nextSeconds; meters = nextMeters
-            lastRoute = elapsedMs()
+            if (state != null || current?.isNotEmpty() == true) {
+                if (!route) routeEpoch++
+                route = true
+            }
+            road = if (b.has(3)) name else road
+            distance = nextDistance ?: distance; seconds = nextSeconds ?: seconds; meters = nextMeters ?: meters
+            lastRoute = elapsedMs(); instructionExpired = false
         }
         publishRoute()
     }
