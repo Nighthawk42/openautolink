@@ -233,7 +233,17 @@ class OalUsbCarPlayRuntime(
                 },SystemClock::elapsedRealtime,CarPlayAppearanceBridge(),session::setNightModeIfEventReady,send,receipt,
                     frozenCapabilities=capabilities))
             },runtimeMetadataFactory={ session, receipt -> own {
-                active();OalCarPlayMetadataLink(SystemClock::elapsedRealtime,receipt,OalCarPlayMetadataHost(context.applicationContext) { index -> receiver?.mediaCommand(session,index) == true })
+                active()
+                val metadata = OalCarPlayMetadataLink(SystemClock::elapsedRealtime, receipt,
+                    OalCarPlayMetadataHost(context.applicationContext, receipt = receipt) { index ->
+                        receiver?.mediaCommand(session, index) == true
+                    })
+                CarPlayBluetoothDiagnosticLink(metadata, { listener ->
+                    runCatching {
+                        (context.applicationContext as? com.openautolink.app.OalApplication)
+                            ?.carBluetoothConnectionObserver?.subscribeEvidence(listener)
+                    }.getOrNull()
+                }, receipt)
             } },wired=true,onStatus=::status).also { receiver=it } }
         active();onDisplayQualified(projection.displayConfiguration)
         val scale=com.openautolink.carplaylab.media.CarPlayDisplayPolicy.scaleDiagnostic(projection.displayConfiguration)

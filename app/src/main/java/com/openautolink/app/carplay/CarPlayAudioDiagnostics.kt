@@ -7,6 +7,7 @@ object CarPlayAudioDiagnostics {
     private const val number = "[0-9]{1,19}"
     private const val optional = "($number|null)"
     private const val bool = "(true|false)"
+    private const val btState = "(disconnected|connecting|connected|disconnecting|stopped|started|off|turning_off|on|turning_on|unknown)"
     // Negotiated engine values are lowercased; offer rows use the protocol spelling.
     private const val audioType = "(compatibility|default|alert|media|telephony|speechRecognition|speechrecognition)"
     private const val codec = "(LPCM|OPUS|AAC_LC|AAC_ELD)"
@@ -79,11 +80,15 @@ object CarPlayAudioDiagnostics {
         "media stage=audio-setup stream=$number type=(100|101|102) audioType=$audioType codec=$codec rate=$number clock=$number channels=(1|2) spf=$number",
         "media stage=audio-track stream=$number type=(100|101|102) audioType=$audioType codec=$codec rate=$number channels=(1|2) capacity=$number",
         "media stage=audio-stats stream=$number type=(100|101|102) audioType=$audioType codec=$codec packets=$number queue=$number queueDrops=$number decoderDrops=$number written=$number zero=$number partial=$number errors=$number droppedBytes=$number underruns=$optional route=$optional ended=$bool",
-        "carplay-nav kind=(route|maneuver|lifecycle) parsed=$number failed=$number result=(parsed|failed|rejected|cleared) state=(unknown|active|stopped|arrived) current=(absent|empty|nonempty) cached=$bool publishable=$bool transition=(none|start|change|clear) reason=(none|stop|arrived|empty|cache_miss|stale|revoke)",
+        "carplay-nav kind=(route|maneuver|lifecycle) parsed=$number failed=$number result=(parsed|failed|rejected|cleared) state=(unknown|active|stopped|arrived) current=(absent|empty|nonempty) cached=$bool publishable=$bool transition=(none|start|change|clear) reason=(none|stop|arrived|empty|cache_miss|stale|expired|revoke)",
         "carplay-nav publication=returned guidance=$bool transition=(start|change|clear)",
+        "carplay-route publication=returned active=$bool instruction=(ready|loading|none) transition=(start|change|end)",
         "media stage=(audio-decoder-configured|audio-output-failed) codec=$codec",
         "media stage=audiotrack-written bytes=$number; human audibility unverified",
         "media stage=(audio-focus-change|audio-focus-granted|audio-focus-denied|audio-owner-limit|audio-retirement-pending|audio-queue-overflow|audio-decoder-backpressure|audio-write-backpressure|microphone-owner-busy|session-ended)",
+        "media stage=audio-focus-request reason=(stream-start|user-play) result=(granted|denied|retained|closed) revision=$number volumePercent=(0|20|100) mute=(permanent-loss|transient|denied|duck|unmuted)",
+        "media stage=audio-mute reason=(stream-start|focus-change) revision=$number volumePercent=(0|20|100) mute=(permanent-loss|transient|denied|duck|unmuted)",
+        "media stage=audio-volume stream=$number type=(100|101|102) audioType=$audioType codec=$codec scope=own requestedPercent=(0|20|100) effectivePercent=(0|20|100|null) mute=(permanent-loss|transient|denied|duck|unmuted) revision=$number",
         "media stage=audio-owners scope=own owners=[0-8] tracks=[0-8]",
         "media stage=audio-route stream=$number type=(100|101|102) audioType=$audioType codec=$codec scope=own usage=([0-9]{1,4}|null) content=([0-9]{1,4}|null) device=([0-9]{1,4}|null)",
         "media stage=device-playback-summary scope=device owner=unknown result=(ok|unavailable) observed=[0-9]{1,4} emitted=[0-8] truncated=$bool",
@@ -93,6 +98,16 @@ object CarPlayAudioDiagnostics {
         "media stage=microphone-format type=100 audioType=(default|telephony|speechrecognition) codec=LPCM rate=24000 channels=1 spf=480 source=(MIC|VOICE_COMMUNICATION|VOICE_RECOGNITION)",
         "media stage=microphone-format type=100 audioType=(default|telephony|speechrecognition) codec=OPUS rate=48000 channels=1 spf=(480|960) source=(MIC|VOICE_COMMUNICATION|VOICE_RECOGNITION)",
         "media stage=audio-focus-change change=(-3|-2|-1|1) volumePercent=(0|20|100)",
+        "media stage=media-command-ingress command=(PLAY|PAUSE|STOP|NEXT|PREVIOUS) controller=(bluetooth|car-service|system-ui|oem|other|unknown) sequence=$number elapsedMs=$number",
+        "media stage=media-command-queue index=[0-5] outcome=(accepted|deferred|declined) reason=(admitted|queue-full|stale-owner|invalid-index)",
+        "media stage=media-focus-recovery reason=user-play result=(permitted|denied|stale-owner)",
+        "BENCH_DIAG bluetoothHandoff requested=true policy=observe-only( handling=(unsupported-native-profile-handover|own-bootstrap-only))?",
+        "carplay-bt event=(hfp-client|a2dp-sink) state=(disconnected|connecting|connected|disconnecting|unknown) previous=(disconnected|connecting|connected|disconnecting|unknown) scope=device owner=unknown",
+        "carplay-bt event=hfp-audio state=(disconnected|connecting|connected|unknown) previous=(disconnected|connecting|connected|unknown) scope=device owner=unknown",
+        "carplay-bt event=hfp-voice state=(started|stopped|unknown) previous=unknown scope=device owner=unknown",
+        "carplay-bt event=adapter state=(on|off|turning-on|turning-off|unknown) previous=unknown scope=device owner=unknown",
+        "media stage=bluetooth-event scope=device owner=unknown event=(hfp-connection|a2dp-connection|hfp-audio|hfp-voice|adapter) state=$btState previous=$btState epoch=$number",
+        "media stage=bluetooth-observer scope=device owner=unknown enabled=$bool result=(attached|unavailable|disabled) epoch=$number",
         "media stage=media-control index=[1-5] outcome=(sent|failed)",
         "media stage=microphone-capture type=100 audioType=(default|telephony|speechrecognition) frames=$number nonzeroFrames=$number state=(1|3|unknown) ended=$bool",
         "media stage=microphone-policy scope=own source=(MIC|VOICE_COMMUNICATION|VOICE_RECOGNITION) rate=(24000|48000) permission=(granted|denied|unknown) mute=(true|false|unknown) route=(builtin|wired|usb|bluetooth|other|none|unknown) silenced=(true|false|unknown) result=(ok|partial|unavailable)",

@@ -50,11 +50,6 @@ class ClusterMainSession : Session() {
     companion object {
         private const val TAG = "ClusterMain"
 
-        /** Terminal CPManeuverType values that indicate navigation is complete. */
-        private val TERMINAL_TYPES = setOf(
-            "destination", "destination_left", "destination_right", "arrive"
-        )
-
         private const val ARRIVAL_TIMEOUT_MS = 10_000L
 
         private val primarySessions = GenerationOwnedSlot<ClusterMainSession>()
@@ -92,6 +87,7 @@ class ClusterMainSession : Session() {
     private var scope: CoroutineScope? = null
     private val navigationLifecycle = ClusterNavigationLifecyclePolicy()
     private var arrivalTimeoutJob: Job? = null
+    private var arrivalTerminalValidity: Long? = null
     private var bindingLease: ClusterBindingRegistry.SessionLease? = null
     private var tripOutcomeLogged = false
     private var observedRoute: Long? = null
@@ -232,6 +228,10 @@ class ClusterMainSession : Session() {
             primarySessions.isOwner(lease.generation, this)
     }
 
+    private data class StateUpdate(
+        val maneuver: ManeuverState?, val route: Long?, val active: Boolean, val terminalValidity: Long,
+    )
+
     private suspend fun collectNavigationState() {
         var debounceJob: Job? = null
 
@@ -239,30 +239,34 @@ class ClusterMainSession : Session() {
             ClusterNavigationState.state,
             ClusterNavigationState.vehicleEnergyForecast,
             ClusterNavigationState.recoveryDemand,
-        ) { _, _, _ ->
+            ClusterNavigationState.routeActive,
+            ClusterNavigationState.terminalValidity,
+        ) { _, _, _, _, _ ->
             synchronized(ClusterBindingLifecycle.lock) {
-                ClusterNavigationState.state.value to ClusterNavigationState.recoveryDemand.value
+                StateUpdate(ClusterNavigationState.state.value, ClusterNavigationState.recoveryDemand.value,
+                    ClusterNavigationState.isActive, ClusterNavigationState.terminalValidity.value)
             }
-        }.collectLatest { (maneuver, route) ->
+        }.collectLatest { (maneuver, route, active, terminalValidity) ->
             debounceJob?.cancel()
             debounceJob = scope?.launch {
                 delay(200)
                 synchronized(ClusterBindingLifecycle.lock) {
-                    processStateUpdate(maneuver, route)
+                    processStateUpdate(maneuver, route, active, terminalValidity)
                 }
             }
         }
     }
 
     /** Caller owns the lifecycle lock from snapshot validation through effects. */
-    private fun processStateUpdate(maneuver: ManeuverState?, route: Long?) {
+    private fun processStateUpdate(maneuver: ManeuverState?, route: Long?, active: Boolean, terminalValidity: Long) {
         fun isSnapshotCurrent(): Boolean = isCurrentPrimary() &&
             route == ClusterNavigationState.recoveryDemand.value &&
-            maneuver === ClusterNavigationState.state.value
+            terminalValidity == ClusterNavigationState.terminalValidity.value &&
+            maneuver === ClusterNavigationState.state.value && active == ClusterNavigationState.isActive
         if (!isSnapshotCurrent()) return
         val navManager = navigationManager ?: return
 
-        if (maneuver != null) {
+        if (active) {
             if (ClusterNavigationState.isRouteSuppressed) return
             if (observedRoute != route) {
                 arrivalTimeoutJob?.cancel()
@@ -300,7 +304,7 @@ class ClusterMainSession : Session() {
 
             try {
                 if (!isSnapshotCurrent()) return
-                val trip = buildTrip(maneuver)
+                val trip = if (maneuver != null) buildTrip(maneuver) else Trip.Builder().setLoading(true).build()
                 if (!isSnapshotCurrent()) return
                 navManager.updateTrip(trip)
                 if (!tripOutcomeLogged) {
@@ -308,10 +312,10 @@ class ClusterMainSession : Session() {
                     DiagnosticLog.i(
                         "cluster",
                         "Trip update outcome=sent generation=${bindingLease?.generation} " +
-                            "maneuver=${maneuver.type}",
+                            "maneuver=${maneuver?.type ?: "loading"}",
                     )
                 }
-                DiagnosticLog.d("cluster", "Trip: ${maneuver.type} distanceReported=${maneuver.distanceMeters != null} lanes=${maneuver.lanes?.size ?: 0}")
+                DiagnosticLog.d("cluster", "Trip: ${maneuver?.type ?: "loading"} distanceReported=${maneuver?.distanceMeters != null} lanes=${maneuver?.lanes?.size ?: 0}")
             } catch (e: Exception) {
                 Log.e(TAG, "updateTrip() failed: ${e.message}")
                 DiagnosticLog.e(
@@ -323,13 +327,21 @@ class ClusterMainSession : Session() {
             if (!isSnapshotCurrent()) return
 
             // Arrival timeout for terminal maneuver types
-            val maneuverName = maneuver.type.name.lowercase()
-            if (TERMINAL_TYPES.any { maneuverName.contains(it) }) {
+            if (ClusterNavigationState.isTerminal(maneuver)) {
+                if (arrivalTerminalValidity != terminalValidity) {
+                    arrivalTimeoutJob?.cancel()
+                    arrivalTimeoutJob = null
+                }
                 if (arrivalTimeoutJob?.isActive != true) {
+                    arrivalTerminalValidity = terminalValidity
                     arrivalTimeoutJob = scope?.launch {
                         delay(ARRIVAL_TIMEOUT_MS)
                         synchronized(ClusterBindingLifecycle.lock) {
                             if (!isCurrentPrimary() || route != ClusterNavigationState.recoveryDemand.value) return@synchronized
+                            // A restored terminal type cannot revive a revoked timer (ABA).
+                            if (terminalValidity != ClusterNavigationState.terminalValidity.value ||
+                                !ClusterNavigationState.isTerminal(ClusterNavigationState.state.value)
+                            ) return@synchronized
                             if (navigationLifecycle.onRouteTerminated() ==
                                 ClusterNavigationLifecyclePolicy.Action.END
                             ) {

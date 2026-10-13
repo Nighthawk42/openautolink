@@ -119,6 +119,60 @@ class CarPlayAudioDiagnosticsTest {
         assertNull(sanitize(9, markers[5].replace("state=active", "state=private")))
     }
 
+    @Test fun bluetoothQueueAndHandoverSchemasAreExactAndRetainedInActualArchive() {
+        val receipts = listOf(
+            "carplay-bt event=hfp-client state=connected previous=connecting scope=device owner=unknown",
+            "carplay-bt event=a2dp-sink state=disconnected previous=connected scope=device owner=unknown",
+            "carplay-bt event=hfp-audio state=connected previous=connecting scope=device owner=unknown",
+            "carplay-bt event=hfp-voice state=started previous=unknown scope=device owner=unknown",
+            "carplay-bt event=adapter state=turning-off previous=unknown scope=device owner=unknown",
+            "media stage=bluetooth-event scope=device owner=unknown event=hfp-voice state=started previous=unknown epoch=1",
+            "media stage=bluetooth-observer scope=device owner=unknown enabled=true result=attached epoch=1",
+            "BENCH_DIAG bluetoothHandoff requested=true policy=observe-only handling=unsupported-native-profile-handover",
+            "BENCH_DIAG bluetoothHandoff requested=true policy=observe-only handling=own-bootstrap-only",
+            "media stage=media-command-queue index=2 outcome=accepted reason=admitted",
+            "media stage=media-command-queue index=2 outcome=deferred reason=queue-full",
+            "media stage=media-command-queue index=0 outcome=declined reason=invalid-index",
+            "media stage=media-focus-recovery reason=user-play result=denied",
+            "carplay-route publication=returned active=true instruction=loading transition=start",
+            "carplay-route publication=returned active=false instruction=none transition=end",
+            "carplay-route publication=returned active=true instruction=ready transition=change",
+            "carplay-nav kind=lifecycle parsed=1 failed=0 result=cleared state=unknown current=absent cached=false publishable=false transition=clear reason=expired",
+            "media stage=media-command-ingress command=STOP controller=car-service sequence=1 elapsedMs=10",
+            "media stage=media-command-ingress command=STOP controller=car-service sequence=2 elapsedMs=10")
+        assertEquals("all finite schemas must survive",receipts,receipts.filter { sanitize(7,it)!=null })
+        val lines=mutableListOf<String>()
+        val reporter=CarPlayAudioDiagnosticReporter(7,System::nanoTime,lines::add)
+        receipts.forEach { receipt ->
+            assertNotNull(receipt,sanitize(7,receipt))
+            listOf(" package=private", " device=private", " address=private", "\n", "\u0000").forEach { assertNull(sanitize(7,receipt+it)) }
+            reporter.record(receipt)
+        }
+        listOf(
+            receipts[0].replace("event=hfp-client","event=private"),
+            receipts[0].replace("state=connected","state=private"),
+            receipts[2].replace("state=connected","state=disconnecting"),
+            receipts[3].replace("previous=unknown","previous=started"),
+            receipts[4].replace("state=turning-off","state=turning_off"),
+            receipts[10].replace("outcome=deferred","outcome=private"),
+            receipts[8].replace("handling=own-bootstrap-only","handling=all-profiles-disabled"),
+            receipts[13].replace("instruction=loading","instruction=private"),
+            receipts[13].replace("transition=start","transition=private"),
+            receipts[16].replace("reason=expired","reason=private"),
+            "media stage=media-command-ingress command=STOP controller=private"
+        ).forEach { assertNull(it,sanitize(7,it)) }
+        val folder=java.nio.file.Files.createTempDirectory(java.nio.file.Path.of(System.getProperty("java.io.tmpdir")),"bt-audio-export").toFile()
+        try {
+            val contents=lines.joinToString("\n",postfix="\n")
+            val log=java.io.File(folder,"oal_audio.log").apply { writeText(contents) }
+            val plan=com.openautolink.app.diagnostics.LogUploadArchive.select(listOf(log),log.lastModified())
+            com.openautolink.app.diagnostics.LogUploadArchive.create(plan,folder).use { archive ->
+                java.util.zip.ZipFile(archive.file).use { zip ->
+                    assertEquals(contents,zip.getInputStream(zip.getEntry(log.name)).bufferedReader().readText())
+                }
+            }
+        } finally { folder.deleteRecursively() }
+    }
     @Test fun selectedNumericSetupFieldsSurviveWithLocalSessionQualification() {
         val message = "BENCH_DIAG streamType=100 audioFormat=536870912 hasConnectionId=true hasSeed=false"
         assertEquals("CARPLAY_AUDIO session=7 $message", sanitize(7, message))

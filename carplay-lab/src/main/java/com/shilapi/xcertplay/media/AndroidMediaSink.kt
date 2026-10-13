@@ -57,13 +57,14 @@ class AndroidMediaSink(
                     // Delivered CAN_DUCK is permission to attenuate, not a full loss.
                     // Automatic AAOS/HAL ducking can occur without this callback.
                     when (change) {
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> focusVolume = 0.2f
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> focusVolume = 0f
-                        AudioManager.AUDIOFOCUS_LOSS -> { focusVolume = 0f; permanentlyLost = true }
-                        AudioManager.AUDIOFOCUS_GAIN -> focusVolume = 1f
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> { focusVolume = 0.2f; muteReason = "duck" }
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> { focusVolume = 0f; muteReason = "transient" }
+                        AudioManager.AUDIOFOCUS_LOSS -> { focusVolume = 0f; permanentlyLost = true; muteReason = "permanent-loss" }
+                        AudioManager.AUDIOFOCUS_GAIN -> { focusVolume = 1f; muteReason = "unmuted" }
                     }
-                    tracks.values.forEach { it.volume(focusVolume) }
+                    tracks.values.forEach { it.volume(focusVolume, muteReason, focusRevision) }
                     report("media stage=audio-focus-change change=$change volumePercent=${(focusVolume * 100).toInt()}")
+                    reportMute("focus-change")
                 }
             }
         }, Handler(Looper.getMainLooper())).build()
@@ -72,6 +73,13 @@ class AndroidMediaSink(
     private var focusHeld = false // Request lifetime; transient loss retains this request.
     private var focusVolume = 1f
     private var permanentlyLost = false
+    private var muteReason = "unmuted"
+    private fun reportMute(reason: String) {
+        report("media stage=audio-mute reason=$reason revision=$focusRevision volumePercent=${(focusVolume * 100).toInt()} mute=$muteReason")
+    }
+    private fun reportFocus(reason: String, result: String) {
+        report("media stage=audio-focus-request reason=$reason result=$result revision=$focusRevision volumePercent=${(focusVolume * 100).toInt()} mute=$muteReason")
+    }
     private var recovery: (() -> Unit)? = null
     private var diagnostic: ((String) -> Unit)? = null
     private val videoQueue = ArrayBlockingQueue<VideoJob>(24)
@@ -85,9 +93,12 @@ class AndroidMediaSink(
     private val videoThread = Thread(::runVideo, "lab-video").apply { isDaemon = true; start() }
     private val routeDiagnostics = PassiveAudioRouteDiagnostics(manager, {
         // Include closed-but-not-retired platform owners: zero must not hide a stalled release.
-        val owners = tracks.values.filter { !it.isRetired }.take(8)
+        val (owners, volumes) = synchronized(this) {
+            val retained = tracks.values.filter { !it.isRetired }.take(8)
+            retained to retained.map { it.volumeReceipt() }
+        }
         val receipts = owners.mapNotNull { it.routeReceipt() }
-        listOf("media stage=audio-owners scope=own owners=${owners.size} tracks=${receipts.size}") + receipts
+        listOf("media stage=audio-owners scope=own owners=${owners.size} tracks=${receipts.size}") + receipts + volumes
     }, ::report)
     private sealed class VideoJob {
         class Config(val codec: VideoCodec, val bytes: ByteArray) : VideoJob()
@@ -149,30 +160,35 @@ class AndroidMediaSink(
             focusHeld = true // A live request, not permission to undo a transient/permanent loss.
             focusVolume = if (granted) 1f else 0f
             permanentlyLost = !granted
+            muteReason = if (granted) "unmuted" else "denied"
             report(if (granted) "media stage=audio-focus-granted" else "media stage=audio-focus-denied")
+            reportFocus("stream-start", if (granted) "granted" else "denied")
         }
         telemetry.audioStreamStarted()
         val stream = audioOwners.incrementAndGet() // Local owner sequence, never a phone connection ID.
         val qualification = "stream=$stream type=${id.type} audioType=${format.audioType} codec=${format.codec}"
         report("media stage=audio-setup $qualification rate=${format.sampleRate} clock=${format.rtpClockRate} channels=${format.channels} spf=${format.samplesPerFrame}")
-        tracks[id] = AudioOutputTrack(format, firstSample, writtenBytes, telemetry, ::report, qualification, focusVolume)
+        reportMute("stream-start")
+        tracks[id] = AudioOutputTrack(format, firstSample, writtenBytes, telemetry, ::report, qualification, focusVolume, muteReason, focusRevision)
     }
     override fun onAudioRtp(id: AudioStreamId, format: AudioFormat, rtp: ByteArray, sample: Int) {
         tracks[id]?.submit(rtp, sample)
     }
     /** No timer/packet/SETUP may reclaim permanent focus loss. Only explicit user PLAY calls here. */
     @Synchronized fun requestFocusForUserPlay(): Boolean {
-        if (closed.get()) return false
-        if (focusHeld && !permanentlyLost && focusVolume > 0f) return true
+        if (closed.get()) { reportFocus("user-play", "closed"); return false }
+        if (focusHeld && !permanentlyLost && focusVolume > 0f) { reportFocus("user-play", "retained"); return true }
         manager?.abandonAudioFocusRequest(focus)
         focus = newFocusRequest()
         val granted = manager?.requestAudioFocus(focus) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        if (closed.get()) return false // A late Binder result cannot revive a revoked owner.
+        if (closed.get()) { reportFocus("user-play", "closed"); return false } // Late Binder cannot revive a revoked owner.
         focusHeld = true
         permanentlyLost = !granted
         focusVolume = if (granted) 1f else 0f
-        tracks.values.forEach { it.volume(focusVolume) }
+        muteReason = if (granted) "unmuted" else "denied"
+        tracks.values.forEach { it.volume(focusVolume, muteReason, focusRevision) }
         report(if (granted) "media stage=audio-focus-granted" else "media stage=audio-focus-denied")
+        reportFocus("user-play", if (granted) "granted" else "denied")
         return granted
     }
     @Synchronized override fun onAudioStopped(id: AudioStreamId) {
@@ -328,6 +344,8 @@ private class AudioOutputTrack(
     private val report: (String) -> Unit,
     private val qualification: String,
     initialVolume: Float,
+    initialMuteReason: String,
+    initialFocusRevision: Long,
 ) : Closeable {
     private val packets = AtomicLong()
     private val queueDrops = AtomicLong()
@@ -354,6 +372,9 @@ private class AudioOutputTrack(
     private val queue = ArrayBlockingQueue<Packet>(64)
     @Volatile private var track: AudioTrack? = null
     @Volatile private var requestedVolume = initialVolume
+    private data class VolumeObservation(val requestedPercent: Int, val mute: String, val revision: Long)
+    @Volatile private var volumeObservation = VolumeObservation((initialVolume * 100).toInt(), initialMuteReason, initialFocusRevision)
+    @Volatile private var appliedPercent: Int? = null
     val isClosed: Boolean get() = closed.get()
     val isRetired: Boolean get() = retired.get() && !thread.isAlive
     private val thread = Thread(::run, "lab-audio-output").apply { isDaemon = true; start() }
@@ -364,7 +385,19 @@ private class AudioOutputTrack(
         if (queue.offer(Packet(bytes,sample))) telemetry.audioPacketAccepted()
         else { queueDrops.incrementAndGet(); report("media stage=audio-queue-overflow") }
     }
-    fun volume(value: Float) { requestedVolume = value }
+    fun volume(value: Float, mute: String, revision: Long) {
+        requestedVolume = value
+        volumeObservation = VolumeObservation((value * 100).toInt(), mute, revision)
+    }
+    /** Cached requested attenuation + last successful local setVolume, not a HAL gain query. */
+    fun volumeReceipt(): String {
+        val requested = volumeObservation
+        return "media stage=audio-volume $qualification scope=own requestedPercent=${requested.requestedPercent} effectivePercent=$appliedPercent mute=${requested.mute} revision=${requested.revision}"
+    }
+    private fun applyVolume(built: AudioTrack) {
+        val value = requestedVolume
+        if (built.setVolume(value) == AudioTrack.SUCCESS) appliedPercent = (value * 100).toInt()
+    }
     fun routeReceipt(): String? {
         val current = track ?: return null
         val attrs = runCatching { current.audioAttributes }.getOrNull()
@@ -402,14 +435,14 @@ private class AudioOutputTrack(
             current = built; track = built
             require(built.state == AudioTrack.STATE_INITIALIZED)
             report("media stage=audio-track $qualification rate=$rate channels=$channels capacity=${built.bufferSizeInFrames}")
-            if (!closed.get()) { built.setVolume(requestedVolume); built.play() }
+            if (!closed.get()) { applyVolume(built); report(volumeReceipt()); built.play() }
         }
         fun writePcm(pcm: ByteArray) {
             val built = checkNotNull(current)
             var offset = 0
             val deadline = System.nanoTime() + 250_000_000L
             while (offset < pcm.size && !closed.get()) {
-                built.setVolume(requestedVolume)
+                applyVolume(built)
                 // Nonblocking writes allow the owner to observe retirement without cross-thread codec calls.
                 val count = built.write(pcm,offset,pcm.size-offset,AudioTrack.WRITE_NON_BLOCKING)
                 if (count < 0) writeErrors++

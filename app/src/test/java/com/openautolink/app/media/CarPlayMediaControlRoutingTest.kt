@@ -78,6 +78,77 @@ class CarPlayMediaControlRoutingTest {
             verify(exactly=1) { aa.onCommand(GmMediaControlPolicy.Command.STOP) }
         } finally { MetadataHostOwnership.process.retire(owner) {}; manager.release() }
     }
+    @Test fun originalCommandsAreOwnerQualifiedAndRetainedInActualUploadArchive() {
+        val (manager, callback) = manager()
+        val owner = Any()
+        val lines = mutableListOf<String>()
+        val reporter = com.openautolink.app.carplay.CarPlayAudioDiagnosticReporter(7, System::nanoTime, lines::add)
+        val received = mutableListOf<GmMediaControlPolicy.Command>()
+        val control = object : OalMediaSessionManager.MediaControlCallback {
+            override fun onCommand(command: GmMediaControlPolicy.Command) { received.add(command) }
+        }
+        assertTrue(MetadataHostOwnership.process.claim(owner))
+        try {
+            val install = manager.javaClass.declaredMethods.find { it.name == "installCarPlayControls\$app_debug" && it.parameterCount == 3 }
+                ?: manager.javaClass.declaredMethods.find { it.name.startsWith("installCarPlayControls") && !it.name.endsWith("\$default") && it.parameterCount == 3 }
+            assertNotNull("optional exact-owner diagnostic observer is missing", install)
+            val observer: (String) -> Unit = reporter::record
+            install!!.apply { isAccessible = true }.invoke(manager, owner, control, observer)
+            callback.onPlay(); callback.onPause(); callback.onStop(); callback.onStop()
+            assertEquals(listOf(GmMediaControlPolicy.Command.PLAY, GmMediaControlPolicy.Command.PAUSE, GmMediaControlPolicy.Command.STOP, GmMediaControlPolicy.Command.STOP), received)
+            val expected = listOf("PLAY", "PAUSE", "STOP", "STOP").map {
+                "CARPLAY_AUDIO session=7 media stage=media-command-ingress command=$it controller=unknown"
+            }
+            val boundary=Regex(" sequence=([0-9]+) elapsedMs=([0-9]+)$")
+            assertTrue("source-boundary sequence and elapsedMs are required",lines.all { boundary.containsMatchIn(it) })
+            assertEquals(expected,lines.map { it.replace(boundary, "") })
+            assertEquals(listOf(1L,2L,3L,4L),lines.map { boundary.find(it)!!.groupValues[1].toLong() })
+            val elapsed=lines.map { boundary.find(it)!!.groupValues[2].toLong() }
+            assertTrue(elapsed.zipWithNext().all { (a,b) -> b>=a })
+            assertTrue("two immediate identical native STOPs must both survive export",elapsed.last()-elapsed[elapsed.lastIndex-1]<1000)
+            val snapshot=lines.toList()
+            MetadataHostOwnership.process.retire(owner) {}
+            callback.onStop()
+            assertEquals("retired owners cannot emit diagnostics or controls", snapshot, lines)
+            assertEquals(4, received.size)
+            val folder = java.nio.file.Files.createTempDirectory(java.nio.file.Path.of(System.getProperty("java.io.tmpdir")), "command-export").toFile()
+            try {
+                val log = java.io.File(folder, "oal_audio.log").apply { writeText(lines.joinToString("\n", postfix="\n")) }
+                val plan = com.openautolink.app.diagnostics.LogUploadArchive.select(listOf(log), log.lastModified())
+                com.openautolink.app.diagnostics.LogUploadArchive.create(plan, folder).use { archive ->
+                    java.util.zip.ZipFile(archive.file).use { zip ->
+                        assertEquals(log.readText(), zip.getInputStream(zip.getEntry(log.name)).bufferedReader().readText())
+                    }
+                }
+            } finally { folder.deleteRecursively() }
+        } finally { MetadataHostOwnership.process.retire(owner) {}; manager.release() }
+    }
+    @Test fun frameworkControllerPackagesReduceToFiniteClassesWithoutSuppressingControls() {
+        val (manager, callback) = manager()
+        val owner = Any(); val receipts = mutableListOf<String>(); var controls = 0
+        assertTrue(MetadataHostOwnership.process.claim(owner))
+        try {
+            manager.installCarPlayControls(owner, object : OalMediaSessionManager.MediaControlCallback {
+                override fun onCommand(command: GmMediaControlPolicy.Command) { controls++ }
+            }, receipts::add)
+            listOf("com.android.bluetooth" to "bluetooth", "com.android.car" to "car-service", "com.android.systemui" to "system-ui", "com.gm.rhmi" to "oem", "com.gm.gmaudio.server" to "oem", "com.gm.private.address" to "other").forEach { (pkg, category) ->
+                every { anyConstructed<MediaSessionCompat>().currentControllerInfo } returns androidx.media.MediaSessionManager.RemoteUserInfo(pkg, 123, 456)
+                callback.onStop()
+                assertTrue(receipts.last().matches(Regex("media stage=media-command-ingress command=STOP controller=$category sequence=[0-9]+ elapsedMs=[0-9]+")))
+            }
+            manager.installCarPlayControls(owner, object : OalMediaSessionManager.MediaControlCallback {
+                override fun onCommand(command: GmMediaControlPolicy.Command) { controls++ }
+            }, receipts::add)
+            callback.onStop()
+            assertTrue("reinstalling same owner must retain source sequence",receipts.last().contains(" sequence=7 "))
+            manager.installCarPlayControls(owner, object : OalMediaSessionManager.MediaControlCallback {
+                override fun onCommand(command: GmMediaControlPolicy.Command) { controls++ }
+            }) { throw IllegalStateException("observer private error") }
+            callback.onStop()
+            assertEquals(8, controls)
+            assertTrue(receipts.all { !it.contains("com.") && !it.contains(" uid=") && !it.contains(" pid=") })
+        } finally { MetadataHostOwnership.process.retire(owner) {}; manager.release() }
+    }
     @Test fun carPlayOwnedStopNeverFallsBackToAndroidAuto() {
         val (manager,callback)=manager()
         val aa=mockk<OalMediaSessionManager.MediaControlCallback>(relaxed=true)

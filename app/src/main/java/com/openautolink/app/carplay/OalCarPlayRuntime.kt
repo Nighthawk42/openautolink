@@ -241,7 +241,19 @@ class OalCarPlayRuntime(
                         GnssForwarderImpl(context.applicationContext, sink, true)
                     }, SystemClock::elapsedRealtime, CarPlayAppearanceBridge(),
                     session::setNightModeIfEventReady, send, receipt)
-            }, runtimeMetadataFactory = { session, receipt -> own { active(); OalCarPlayMetadataLink(SystemClock::elapsedRealtime, receipt, OalCarPlayMetadataHost(context.applicationContext) { index -> receiver?.mediaCommand(session,index) == true }) } }, onStatus = ::status).also { receiver = it } }
+            }, runtimeMetadataFactory = { session, receipt -> own {
+                active()
+                val metadata = OalCarPlayMetadataLink(SystemClock::elapsedRealtime, receipt,
+                    OalCarPlayMetadataHost(context.applicationContext, receipt = receipt) { index ->
+                        receiver?.mediaCommand(session, index) == true
+                    })
+                CarPlayBluetoothDiagnosticLink(metadata, { listener ->
+                    runCatching {
+                        (context.applicationContext as? com.openautolink.app.OalApplication)
+                            ?.carBluetoothConnectionObserver?.subscribeEvidence(listener)
+                    }.getOrNull()
+                }, receipt)
+            } }, onStatus = ::status).also { receiver = it } }
         // Log the actual decoder-qualified offer, not an earlier requested preset or coded viewport.
         active()
         onDisplayQualified(projection.displayConfiguration)

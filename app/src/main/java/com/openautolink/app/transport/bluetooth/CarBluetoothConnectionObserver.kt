@@ -44,6 +44,33 @@ class CarBluetoothConnectionObserver internal constructor(
         // are verified in GM HeadsetClientStateMachine:1865 and A2dpSinkStateMachine:275.
         const val HFP_CLIENT_ACTION = "android.bluetooth.headsetclient.profile.action.CONNECTION_STATE_CHANGED"
         const val A2DP_SINK_ACTION = "android.bluetooth.a2dp-sink.profile.action.CONNECTION_STATE_CHANGED"
+        // Source-verified vehicle-side actions. AG_EVENT includes unrelated fields:
+        // only an explicitly present VOICE_RECOGNITION extra is a speech receipt.
+        const val HFP_AUDIO_ACTION = "android.bluetooth.headsetclient.profile.action.AUDIO_STATE_CHANGED"
+        const val HFP_AG_ACTION = "android.bluetooth.headsetclient.profile.action.AG_EVENT"
+        const val HFP_VOICE_EXTRA = "android.bluetooth.headsetclient.extra.VOICE_RECOGNITION"
+    }
+
+    private val evidenceLock = Any()
+    private val evidenceListeners = mutableSetOf<(String) -> Unit>()
+
+    /** Exact-link, passive diagnostic subscription; never provides selected-phone identity. */
+    fun subscribeEvidence(listener: (String) -> Unit): AutoCloseable {
+        synchronized(evidenceLock) {
+            check(evidenceListeners.size < 4) { "Bluetooth evidence subscription capacity" }
+            evidenceListeners.add(listener)
+        }
+        return AutoCloseable { synchronized(evidenceLock) { evidenceListeners.remove(listener) } }
+    }
+
+    private fun evidence(event: String, state: String, previous: String = "unknown") {
+        synchronized(evidenceLock) {
+            val receipt = "carplay-bt event=$event state=$state previous=$previous scope=device owner=unknown"
+            evidenceListeners.toList().forEach { listener ->
+                // Diagnostic failure must not invalidate profile observation or Bluetooth.
+                try { listener(receipt) } catch (_: RuntimeException) { }
+            }
+        }
     }
 
     private val devices = mutableMapOf<BluetoothDevice, String>()
@@ -71,6 +98,8 @@ class CarBluetoothConnectionObserver internal constructor(
             val filter = IntentFilter().apply {
                 addAction(HFP_CLIENT_ACTION)
                 addAction(A2DP_SINK_ACTION)
+                addAction(HFP_AUDIO_ACTION)
+                addAction(HFP_AG_ACTION)
                 addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
             }
             // Bluetooth is a separate privileged UID, not the system UID: NOT_EXPORTED
@@ -149,6 +178,34 @@ class CarBluetoothConnectionObserver internal constructor(
                         else -> null
                     }
                     session.power(on, generation)
+                    val powerState = when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                        BluetoothAdapter.STATE_ON -> "on"
+                        BluetoothAdapter.STATE_OFF -> "off"
+                        BluetoothAdapter.STATE_TURNING_ON -> "turning-on"
+                        BluetoothAdapter.STATE_TURNING_OFF -> "turning-off"
+                        else -> "unknown"
+                    }
+                    evidence("adapter", powerState)
+                }
+                HFP_AUDIO_ACTION -> {
+                    if (session.state.adapterOn == false) return
+                    fun audioState(value: Int) = when (value) {
+                        0 -> "disconnected"
+                        1 -> "connecting"
+                        2 -> "connected"
+                        else -> "unknown"
+                    }
+                    evidence("hfp-audio", audioState(intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)),
+                        audioState(intent.getIntExtra(BluetoothProfile.EXTRA_PREVIOUS_STATE, -1)))
+                }
+                HFP_AG_ACTION -> {
+                    if (session.state.adapterOn == false || !intent.hasExtra(HFP_VOICE_EXTRA)) return
+                    val voiceState = when (intent.getIntExtra(HFP_VOICE_EXTRA, -1)) {
+                        0 -> "stopped"
+                        1 -> "started"
+                        else -> "unknown"
+                    }
+                    evidence("hfp-voice", voiceState)
                 }
                 HFP_CLIENT_ACTION, A2DP_SINK_ACTION -> {
                     if (session.state.adapterOn == false || session.state.unknown == CarBluetoothUnknown.CAPACITY) return
@@ -168,8 +225,11 @@ class CarBluetoothConnectionObserver internal constructor(
                     }
                     val id = devices.getOrPut(device) { "local-${++nextDeviceId}" }
                     val profile = if (intent.action == HFP_CLIENT_ACTION) CarBluetoothProfile.HFP_CLIENT else CarBluetoothProfile.A2DP_SINK
-                    session.profile(id, profile, connection(intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)),
-                        connection(intent.getIntExtra(BluetoothProfile.EXTRA_PREVIOUS_STATE, -1)), generation)
+                    val current = connection(intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1))
+                    val previous = connection(intent.getIntExtra(BluetoothProfile.EXTRA_PREVIOUS_STATE, -1))
+                    session.profile(id, profile, current, previous, generation)
+                    evidence(if (profile == CarBluetoothProfile.HFP_CLIENT) "hfp-client" else "a2dp-sink",
+                        current.name.lowercase(), previous.name.lowercase())
                 }
                 else -> return
             }

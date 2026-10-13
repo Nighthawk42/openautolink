@@ -5,6 +5,26 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OalCarPlayMetadataLinkTest {
+    @Test fun routePublicationReceiptIdentifiesLoadingWithoutClaimingInstructionOrEnd() {
+        val lines = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val publications = java.util.concurrent.LinkedBlockingQueue<Boolean>()
+        val host = object : CarPlayMetadataHost {
+            override fun start() = true
+            override fun publish(media: com.openautolink.carplaylab.metadata.CarPlayMediaMetadata?, navigation: com.openautolink.carplaylab.metadata.CarPlayNavigationMetadata?, artwork: ByteArray?) { publications.offer(navigation != null) }
+            override fun close() {}
+        }
+        val link = OalCarPlayMetadataLink({ 0L }, lines::add, host)
+        try {
+            link.authenticate()
+            assertNotNull(publications.poll(5, java.util.concurrent.TimeUnit.SECONDS))
+            link.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+            assertEquals(false, publications.poll(5, java.util.concurrent.TimeUnit.SECONDS))
+            link.close()
+            assertTrue("after-return receipt must identify a known loading route", lines.contains("carplay-route publication=returned active=true instruction=loading transition=start"))
+            assertFalse(lines.any { it.startsWith("carplay-route") && it.contains("transition=end") })
+        } finally { link.close() }
+    }
+
     @Test fun routeReceiptsDistinguishFailuresCacheMissesAndClearWithoutRoadOrIds() {
         var now = 0L
         val receipts = mutableListOf<String>()
@@ -92,7 +112,12 @@ class OalCarPlayMetadataLinkTest {
         val host = java.lang.reflect.Proxy.newProxyInstance(hostType!!.classLoader, arrayOf(hostType)) { _, method, args ->
             when (method.name) {
                 "start" -> true
-                "publish" -> { title = (args[0] as com.openautolink.carplaylab.metadata.CarPlayMediaMetadata).title; published.countDown(); Unit }
+                "publish", "publishRoute" -> {
+                    (args[0] as? com.openautolink.carplaylab.metadata.CarPlayMediaMetadata)?.let {
+                        title = it.title; published.countDown()
+                    }
+                    Unit
+                }
                 "close" -> { retired = true; Unit }
                 else -> Unit
             }
