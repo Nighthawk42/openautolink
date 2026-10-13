@@ -28,13 +28,26 @@ Existing OS grants work after cold process/manager startup too. The exported
 attach Activity's Intent and any Boolean grant extra are not authorization.
 
 If the OS dialog was denied/dismissed, or a previously connected device is
-still plugged in without authorization: first dismiss the OS USB resolver,
-then explicitly select the phone in OAL's USB picker (return to the picker after
-a failed CarPlay attempt). This is deliberate recovery, not automatic
-reprompting. A plain automatic rescan/restart does not authorize an app request.
-Replug is another fresh attach opportunity. The picker remains usable during
-an automatic wait and after timeout; timeout never raises another dialog. A cancelled wait,
-exact detach or terminal app-request denial cannot be upgraded by a late grant.
+still plugged in without authorization: first dismiss/finish the OS USB resolver,
+then explicitly select the exact phone in OAL's USB picker. Pending Apple USB
+authorization exposes this picker with CarPlay enabled even while Android Auto
+uses its normal Wireless/WPP mode; changing the saved AA transport to USB is not
+required. The picker is available on either projection screen when the manager
+is awaiting selection, and does not cover Settings, Diagnostics or the safe-area
+editor. If a failed CarPlay attempt is no longer awaiting selection, the existing
+Retry CarPlay/USB action retires that attempt and restores the passive same-cable
+wait; select the phone in the picker afterwards. The retry itself does not grant
+permission authority. A picker row tap grants one exact-device permission
+request, not permission transfer or permission to replace the active projection:
+existing Switch/Stay and awaited retirement still apply. Stay revokes the request
+authority without starting CarPlay. No visibility change writes saved AA/CarPlay
+settings or initiates a permission request.
+
+This is deliberate recovery, not automatic reprompting. A plain automatic
+rescan/restart does not authorize an app request. Replug is another fresh attach
+opportunity. The picker remains usable during an automatic wait and after timeout;
+timeout never raises another dialog. A cancelled wait, exact detach or terminal
+app-request denial cannot be upgraded by a late grant.
 
 CarPlay's replacement wait retains its existing 15-second transition budget;
 no unconditional settling sleep is added. That deadline bounds startup, not
