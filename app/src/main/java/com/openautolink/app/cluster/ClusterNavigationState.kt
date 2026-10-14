@@ -19,13 +19,24 @@ object ClusterNavigationState {
 
     private val _state = MutableStateFlow<ManeuverState?>(null)
     val state: StateFlow<ManeuverState?> = _state.asStateFlow()
+    private val _routeActive = MutableStateFlow(false)
+    internal val routeActive: StateFlow<Boolean> = _routeActive.asStateFlow()
     private var routeEpoch = 0L
     private val _recoveryDemand = MutableStateFlow<Long?>(null)
     internal val recoveryDemand: StateFlow<Long?> = _recoveryDemand.asStateFlow()
 
+    // Revocation survives StateFlow conflation and the consumer's Trip debounce.
+    private val _terminalValidity = MutableStateFlow(0L)
+    internal val terminalValidity: StateFlow<Long> = _terminalValidity.asStateFlow()
+    internal fun isTerminal(maneuver: ManeuverState?): Boolean {
+        val name = maneuver?.type?.name?.lowercase() ?: return false
+        return listOf("destination", "destination_left", "destination_right", "arrive")
+            .any { name.contains(it) }
+    }
+
     internal val isRouteSuppressed: Boolean
         get() = synchronized(ClusterBindingLifecycle.lock) {
-            _state.value != null && _recoveryDemand.value == null
+            _routeActive.value && _recoveryDemand.value == null
         }
 
     /** Host stop belongs to the route, not to the replaceable consumer. */
@@ -44,13 +55,15 @@ object ClusterNavigationState {
     var distanceUnits: String = "auto"
 
     /** True when navigation is actively routing. */
-    val isActive: Boolean get() = _state.value != null
+    val isActive: Boolean get() = _routeActive.value
 
     fun update(maneuver: ManeuverState) = com.openautolink.app.carplay.MetadataHostOwnership.process.legacy { updateHost(maneuver) }
 
-    internal fun updateHost(maneuver: ManeuverState) {
+    internal fun updateHost(maneuver: ManeuverState?) {
         synchronized(ClusterBindingLifecycle.lock) {
-            if (_state.value == null) _recoveryDemand.value = ++routeEpoch
+            if (isTerminal(_state.value) && !isTerminal(maneuver)) _terminalValidity.value++
+            if (!_routeActive.value) _recoveryDemand.value = ++routeEpoch
+            _routeActive.value = true
             _state.value = maneuver
         }
     }
@@ -59,7 +72,9 @@ object ClusterNavigationState {
 
     internal fun clearHost() {
         synchronized(ClusterBindingLifecycle.lock) {
+            _terminalValidity.value++
             _state.value = null
+            _routeActive.value = false
             _recoveryDemand.value = null
             vehicleEnergyForecast.value = null
         }

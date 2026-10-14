@@ -223,11 +223,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        // Foreground Surface-owned CarPlay has no background service/start policy.
-        // This does not alter AA wake/start behavior; CarPlay reconnect stays explicit.
-        if (com.openautolink.app.carplay.CarPlayOwnership.process.blocksAndroidAuto) {
-            ViewModelProvider(this)[ProjectionViewModel::class.java].stopCarPlay()
-        }
+        // Backgrounding loses presentation, not the CarPlay session. Surface callbacks
+        // detach video; explicit Stop/Exit and ignition-off still retire exact owners.
         com.openautolink.app.diagnostics.DiagnosticLog.i("lifecycle", "MainActivity.onStop")
         com.openautolink.app.wake.PreWakeMonitor.reportActivity(
             com.openautolink.app.wake.PreWakeActivityCallback.STOP

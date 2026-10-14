@@ -100,6 +100,23 @@ private fun CarPlayRecoveryPanel(
     }
 }
 
+/** Same compact, passive treatment as AA's keyframe wait; never owns projected input. */
+@Composable
+private fun CarPlayVideoWaitIndicator(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color(0x99000000))
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+            .testTag("carPlayVideoWaitIndicator"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        CircularProgressIndicator(Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+        Text("Waiting for video\u2026", style = MaterialTheme.typography.bodyMedium, color = Color.White)
+    }
+}
+
 /** Confirmation only: the ViewModel owns routing, permissions and exact-generation retirement. */
 @Composable
 private fun UsbHotPlugSwitchDialog(
@@ -176,6 +193,20 @@ fun ProjectionScreen(
     // a codec/Surface re-init and the black frames that come with it.
     var showDiagnostics by rememberSaveable { mutableStateOf(false) }
 
+    // USB authorization recovery is independent of the saved AA/WPP mode and
+    // must also survive CarPlay's early return below. Observation is not consent.
+    val transportMode by viewModel.transportMode.collectAsStateWithLifecycle()
+    val usbState by com.openautolink.app.transport.usb.UsbConnectionManager
+        .connectionState.collectAsStateWithLifecycle()
+    val usbDevices by com.openautolink.app.transport.usb.UsbConnectionManager
+        .availableDevices.collectAsStateWithLifecycle()
+    val showUsbPicker = usbHotPlugPrompt == null && !showCarPlaySafeEditor &&
+        (!carPlayState.selected || usbState == com.openautolink.app.transport.usb.UsbConnectionState.AWAITING_USER_SELECTION) &&
+        UsbPickerVisibility.shouldShow(
+            transportMode, showSettings, showDiagnostics,
+            carPlayEnabled = carPlayEnabled, usbState = usbState, devices = usbDevices,
+        )
+
     LaunchedEffect(showSettings) {
         viewModel.setSettingsOpen(showSettings)
     }
@@ -226,6 +257,12 @@ fun ProjectionScreen(
                 showSettings = showSettings, showDiagnostics = showDiagnostics,
                 onSettings = { showSettings = true },
             )
+            if (CarPlayVideoWaitPolicy.shouldShow(
+                    carPlayState, carPlayEnabled,
+                    showSettings || showDiagnostics || showCarPlaySafeEditor || showUsbPicker || usbHotPlugPrompt != null || usbSwitchFailure != null,
+                )) {
+                CarPlayVideoWaitIndicator(Modifier.align(Alignment.BottomCenter).padding(bottom = 48.dp))
+            }
             if (showSettings) settingsOverlay(
                 { showSettings = false }, { showSettings = false; showDiagnostics = true },
                 { showCarPlaySafeEditor = true })
@@ -233,7 +270,7 @@ fun ProjectionScreen(
             // Same exact parent and constraints as CarPlayProjectionLayer, above settings chrome.
             if (showCarPlaySafeEditor) carPlaySafeEditorOverlay { showCarPlaySafeEditor = false }
         }
-        if (!showSettings && !showDiagnostics && !carPlayState.busy &&
+        if (!showSettings && !showDiagnostics && !showUsbPicker && !carPlayState.busy &&
             !carPlayState.evidence.videoRendered && carPlayState.failure == null) {
             Box(Modifier.fillMaxSize()) {
                 CarPlayRecoveryPanel(
@@ -246,7 +283,7 @@ fun ProjectionScreen(
             }
         }
 
-        if (!showSettings && !showDiagnostics && usbHotPlugPrompt == null) carPlayState.failure?.let { failure ->
+        if (!showSettings && !showDiagnostics && usbHotPlugPrompt == null && !showUsbPicker) carPlayState.failure?.let { failure ->
             androidx.compose.material3.AlertDialog(
                 modifier = Modifier.testTag("carPlayFailure"),
                 onDismissRequest = viewModel::dismissCarPlayFailure,
@@ -271,6 +308,9 @@ fun ProjectionScreen(
         }
         androidx.activity.compose.BackHandler(!showCarPlaySafeEditor && (showSettings || showDiagnostics)) {
             showSettings = false; showDiagnostics = false
+        }
+        if (showUsbPicker) {
+            UsbDevicePickerOverlay(onOpenSettings = { showSettings = true })
         }
         return
     }
@@ -780,8 +820,7 @@ fun ProjectionScreen(
         // The USB picker is above the floating controls in this Box. Never let
         // it cover Settings/Diagnostics, and offer an explicit way back to the
         // transport settings even while no phone is plugged in.
-        val transportMode by viewModel.transportMode.collectAsStateWithLifecycle()
-        if (usbHotPlugPrompt == null && UsbPickerVisibility.shouldShow(transportMode, showSettings, showDiagnostics)) {
+        if (showUsbPicker) {
             UsbDevicePickerOverlay(onOpenSettings = { showSettings = true })
         }
 
@@ -1555,12 +1594,11 @@ private fun SafeAreaOverlay(
 }
 
 /**
- * Modal picker for USB transport mode.
+ * Modal picker for USB transport or explicit same-cable CarPlay authorization recovery.
  *
- * Shown only while the USB transport is selected and there is no active
- * AA session yet. Lists every non-hub USB device currently attached to the
- * head unit with a friendly name. Tapping a device triggers the OS USB
- * permission prompt and then the AOA v2 switch + connect flow.
+ * Lists attached non-hub devices. A row tap grants exact single-use recovery
+ * authority; existing Switch/Stay and awaited retirement still precede startup.
+ * Apple devices use CarPlay, never the Android Auto accessory switch.
  */
 @Composable
 private fun UsbDevicePickerOverlay(onOpenSettings: () -> Unit) {
@@ -1608,7 +1646,7 @@ private fun UsbDevicePickerOverlay(onOpenSettings: () -> Unit) {
                         text = if (devices.isEmpty())
                             "Plug your phone into the car's USB port. Detected USB devices will appear here."
                         else
-                            "Tap your phone in the list. The car will request permission, then switch it to Android Auto accessory mode.",
+                            "Dismiss Android's USB dialog first, then tap your phone to authorize a USB permission request. Apple phones use CarPlay; Android phones use Android Auto. Your normal connection settings will not change.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

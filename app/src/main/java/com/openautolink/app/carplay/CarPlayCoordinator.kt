@@ -1,5 +1,6 @@
 package com.openautolink.app.carplay
 
+import android.view.Surface
 import java.io.Closeable
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -9,6 +10,10 @@ interface CarPlayRuntime : Closeable {
     fun run()
     /** Nonblocking revocation; subsequent resource installation/effects must fail closed. */
     fun cancel()
+    /** Presentation only; never cancel transport/audio or wait for decoder retirement. */
+    fun attachSurface(surface: Surface) {}
+    /** Ignore stale Surface callbacks; only the exact current presentation can detach. */
+    fun detachSurface(surface: Surface) {}
     /** Constant-space observed receiver counters, never inferred from status strings. */
     fun telemetrySnapshot(): com.openautolink.carplaylab.media.ReceiverTelemetrySnapshot? = null
 }
@@ -26,7 +31,12 @@ data class CarPlayUiState(
     val status: String = "CarPlay ready",
     val evidence: CarPlayEvidence = CarPlayEvidence(),
     val failure: CarPlayFailureUi? = null,
-)
+    /** Revoked by Stop/failure, independently of the worker's retirement-in-progress busy flag. */
+    val videoWaitActive: Boolean = true,
+) {
+    val waitingForVideo: Boolean get() = selected && busy && videoWaitActive && failure == null &&
+        evidence.telemetry?.presentationRendered != true
+}
 
 /** One worker serializes complete AA retirement, CarPlay setup, and full receiver retirement.
  * No preference or Bluetooth-friendly name starts this owner. Stop keeps CP selected; only explicit
@@ -35,9 +45,14 @@ data class CarPlayUiState(
 class CarPlayCoordinator(
     private val ownership: CarPlayOwnership = CarPlayOwnership.process,
     private val retireAndroidAuto: () -> Unit,
+    private val sessionLeases: CarPlaySessionLeaseSource = CarPlaySessionLeaseSource.NONE,
     private val onState: (CarPlayUiState) -> Unit,
 ) : Closeable {
-    private class Attempt(val token: CarPlayOwnership.Token) {
+    // Preserve positional and trailing-onState callers as well as existing named arguments.
+    constructor(ownership: CarPlayOwnership, retireAndroidAuto: () -> Unit, onState: (CarPlayUiState) -> Unit) :
+        this(ownership, retireAndroidAuto, CarPlaySessionLeaseSource.NONE, onState)
+
+    private class Attempt(val token: CarPlayOwnership.Token, val initialSurface: Surface?, val sessionLease: CarPlaySessionLease) {
         val canceled = AtomicBoolean()
         @Volatile var runtime: CarPlayRuntime? = null
     }
@@ -46,6 +61,7 @@ class CarPlayCoordinator(
     private val interrupter = Executors.newSingleThreadExecutor { Thread(it, "oal-carplay-revoke").apply { isDaemon = true } }
     private var token: CarPlayOwnership.Token? = null
     private var current: Attempt? = null
+    private var presentation: Surface? = null
     private var state = CarPlayUiState()
     private var closed = false
     private var commandEpoch = 0L
@@ -53,7 +69,11 @@ class CarPlayCoordinator(
     fun connect(enabled: Boolean, factory: ((String) -> Unit) -> CarPlayRuntime): Boolean = synchronized(lock) {
         if (closed || !enabled || current != null) return false
         val lease = token ?: ownership.reserve(enabled)?.also { token = it } ?: return false
-        val attempt = Attempt(lease)
+        val sessionLease = try { sessionLeases.acquire() } catch (_: Exception) {
+            publish(CarPlayUiState(selected = true, status = "CarPlay protection unavailable · reconnect while app is visible"))
+            return false
+        }
+        val attempt = Attempt(lease, presentation, sessionLease)
         current = attempt
         publish(CarPlayUiState(selected = true, busy = true, status = "Retiring Android Auto before CarPlay"))
         worker.execute { run(attempt, factory) }
@@ -63,18 +83,28 @@ class CarPlayCoordinator(
     private fun run(attempt: Attempt, factory: ((String) -> Unit) -> CarPlayRuntime) {
         var failedStatus: String? = null
         try {
+            // OS acceptance is not promotion. Never retire AA/bootstrap transport unprotected.
+            attempt.sessionLease.awaitReady()
             // Return means real stop completion, never an IDLE snapshot.
             retireAndroidAuto()
             ownership.acknowledgeAaRetired(attempt.token)
             if (attempt.canceled.get() || !ownership.canBootstrap(attempt.token)) return
             val runtime = factory { message -> record(attempt, message) }
-            attempt.runtime = runtime
+            synchronized(lock) {
+                attempt.runtime = runtime
+                if (current === attempt && !attempt.canceled.get()) {
+                    // A destroy/replacement may arrive while the factory is blocked. Never
+                    // revive its original target when installing this exact runtime.
+                    attempt.initialSurface?.takeIf { it !== presentation }?.let(runtime::detachSurface)
+                    presentation?.let(runtime::attachSurface)
+                }
+            }
             if (attempt.canceled.get()) runtime.cancel() else runtime.run()
         } catch (failure: CarPlayConnectionFailure) {
             failedStatus = "CarPlay connection failed · reconnect or Return to Android Auto"
             synchronized(lock) {
                 if (current === attempt && !attempt.canceled.get()) {
-                    publish(state.copy(status = failedStatus, failure = CarPlayFailureUi(
+                    publish(state.copy(status = failedStatus, videoWaitActive = false, failure = CarPlayFailureUi(
                         failure.kind, failure.manualPeer, failure.userGuidance +
                             if (!failure.manualPeer && failure.kind in setOf(
                                 CarPlayFailureKind.RUNTIME_STARTUP_TIMEOUT,
@@ -86,10 +116,12 @@ class CarPlayCoordinator(
         } catch (failure: Exception) {
             failedStatus = "CarPlay failed type=${failure.javaClass.simpleName}; check setup / reconnect"
             if (!attempt.canceled.get()) record(attempt, failedStatus)
+            synchronized(lock) { if (current === attempt) publish(state.copy(videoWaitActive = false)) }
         } finally {
             try {
                 attempt.runtime?.cancel()
                 attempt.runtime?.close()
+                attempt.sessionLease.release() // Only exact concrete runtime close acknowledges retirement.
                 attempt.runtime = null
                 ownership.acknowledgeCarPlayRetired(attempt.token)
                 synchronized(lock) {
@@ -111,6 +143,22 @@ class CarPlayCoordinator(
             publish(state.copy(status = message.take(220), evidence = state.evidence.accept(message)))
         }
     }
+    fun attachSurface(surface: Surface) = synchronized(lock) {
+        if (closed || presentation === surface) return@synchronized
+        presentation = surface
+        current?.takeUnless { it.canceled.get() }?.runtime?.attachSurface(surface)
+        if (current?.canceled?.get() == false)
+            publish(state.copy(evidence = state.evidence.copy(telemetry = null)))
+    }
+
+    fun detachSurface(surface: Surface) = synchronized(lock) {
+        if (presentation !== surface) return@synchronized
+        presentation = null
+        current?.takeUnless { it.canceled.get() }?.runtime?.detachSurface(surface)
+        if (current?.canceled?.get() == false)
+            publish(state.copy(evidence = state.evidence.copy(telemetry = null)))
+    }
+
     /** Called at UI sampling cadence, not from media callbacks. Exact attempt gates retirement. */
     fun refreshTelemetry() = synchronized(lock) {
         val attempt = current ?: return@synchronized
@@ -130,13 +178,14 @@ class CarPlayCoordinator(
         val attempt = current ?: return@synchronized
         attempt.canceled.set(true)
         attempt.runtime?.cancel()
-        publish(state.copy(status = "Stopping CarPlay; waiting for exact receiver/control retirement"))
+        publish(state.copy(videoWaitActive = false, status = "Stopping CarPlay; waiting for exact receiver/control retirement"))
         // Socket closure breaks blocking connect/recv. Never close/join MediaCodec on UI thread.
         interrupter.execute { runCatching { attempt.runtime?.close() } }
         // Also retries a previously failed close after the original worker returned.
         worker.execute {
             if (current === attempt && attempt.runtime != null) {
                 runCatching { attempt.runtime?.close(); attempt.runtime = null }.onSuccess {
+                    attempt.sessionLease.release()
                     ownership.acknowledgeCarPlayRetired(attempt.token)
                     synchronized(lock) { if (current === attempt) { current = null; publish(state.copy(busy = false, evidence = CarPlayEvidence(), status = "CarPlay stopped")) } }
                 }

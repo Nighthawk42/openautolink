@@ -7,23 +7,31 @@ import com.openautolink.app.data.AppPreferences
 import com.openautolink.app.media.OalMediaSessionManager
 import com.openautolink.carplaylab.metadata.CarPlayMediaMetadata
 import com.openautolink.carplaylab.metadata.CarPlayNavigationMetadata
+import com.openautolink.carplaylab.metadata.CarPlayRouteMetadata
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 
 internal interface CarPlayMetadataHost : AutoCloseable {
     fun start(): Boolean
     fun publish(media: CarPlayMediaMetadata?, navigation: CarPlayNavigationMetadata?, artwork: ByteArray?)
+    /** Compatibility bridge for hosts that consume only instruction metadata. */
+    fun publishRoute(media: CarPlayMediaMetadata?, route: CarPlayRouteMetadata?, artwork: ByteArray?) =
+        publish(media, route?.instruction, artwork)
 }
 
 /** Exact authenticated Wi-Fi link owns the existing host adapters, never a new MediaSession. */
 internal class OalCarPlayMetadataHost(private val context: Context,
+    private val receipt: (String) -> Unit = {},
     private val mediaCommand: (Int) -> Boolean = { false }) : CarPlayMetadataHost {
+    // Retain the existing JVM constructor and trailing-lambda command call sites.
+    constructor(context: Context, mediaCommand: (Int) -> Boolean) : this(context, {}, mediaCommand)
     private val owner = Any()
     private var cluster: ClusterManager? = null
     private var mediaManager: OalMediaSessionManager? = null
     private var previousMedia: CarPlayMediaMetadata? = null
     private var previousArt: ByteArray? = null
     private var previousNavigation: CarPlayNavigationMetadata? = null
+    private var previousRoute: CarPlayRouteMetadata? = null
     override fun start(): Boolean {
         val preferences = AppPreferences.getInstance(context)
         val enabled = runBlocking { preferences.clusterNavigation.first() }
@@ -47,7 +55,7 @@ internal class OalCarPlayMetadataHost(private val context: Context,
                     }
                     mediaCommand(index)
                 }
-            })
+            }, onDiagnostic = receipt)
             if (enabled) cluster = ClusterManager(context).also { it.setClusterEnabled(true) }
         }
         return true
@@ -59,11 +67,29 @@ internal class OalCarPlayMetadataHost(private val context: Context,
                 if (maneuver != null) ClusterNavigationState.updateHost(maneuver) else ClusterNavigationState.clearHost()
                 previousNavigation = navigation
             }
-            if (media != null && (media != previousMedia || !artwork.contentEquals(previousArt))) {
-                mediaManager?.updateCarPlay(owner, media, artwork, clearArtwork = artwork == null)
-                previousMedia = media
-                previousArt = artwork?.copyOf()
+            publishMedia(media, artwork)
+        }
+    }
+    override fun publishRoute(media: CarPlayMediaMetadata?, route: CarPlayRouteMetadata?, artwork: ByteArray?) {
+        MetadataHostOwnership.process.publish(owner) {
+            if (route != previousRoute) {
+                if (route == null) ClusterNavigationState.clearHost()
+                else {
+                    // A stop/start may be coalesced by the link worker. Its source epoch still
+                    // replaces the old route, even if the new instruction is identical or absent.
+                    if (previousRoute?.epoch != route.epoch) ClusterNavigationState.clearHost()
+                    ClusterNavigationState.updateHost(route.instruction?.let(CarPlayClusterMetadataAdapter::maneuver))
+                }
+                previousRoute = route
             }
+            publishMedia(media, artwork)
+        }
+    }
+    private fun publishMedia(media: CarPlayMediaMetadata?, artwork: ByteArray?) {
+        if (media != null && (media != previousMedia || !artwork.contentEquals(previousArt))) {
+            mediaManager?.updateCarPlay(owner, media, artwork, clearArtwork = artwork == null)
+            previousMedia = media
+            previousArt = artwork?.copyOf()
         }
     }
     override fun close() {
@@ -73,7 +99,7 @@ internal class OalCarPlayMetadataHost(private val context: Context,
             mediaManager?.resetHostToIdle()
             cluster?.release()
             cluster = null
-            previousMedia = null; previousArt = null; previousNavigation = null
+            previousMedia = null; previousArt = null; previousNavigation = null; previousRoute = null
         }
     }
 }

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.523
+
+### CarPlay first-video recovery
+- Fix a configuration-publication race introduced with 0.1.521 background-video retention that could discard the first keyframe arriving while the decoder worker waited for input.
+- Preserve the current decoder and queued frames for identical codec configuration notifications; genuinely changed configurations still create a new fenced decoder receipt.
+- Add bounded configuration, decoder-reconfiguration and recovery-reason diagnostics without exporting raw codec data.
+- Preserve surface/session ownership, stale callback rejection, background retention, audio and USB permission behavior.
+- Debug/release suites passed per variant: app 1,344, receiver 478, companion 118; one optional private-archive app replay test skipped per variant. Independent scoped review passed.
+- Vehicle first-video latency, sustained rendering and unplug/replug recovery still require verification. No guarantee of under-10-second startup or a single USB permission prompt.
+
+## 0.1.522
+
+### USB startup recovery
+- Fix the 0.1.521 silent authorization wait after USB mode switching that could cancel startup and return to the phone picker.
+- Request permission for the exact admitted initial/replacement device when Android has not granted access, preserving the same connection attempt and platform authorization checks.
+- Two real permission approvals can still be necessary across USB re-enumeration; a single system prompt is not guaranteed. Vehicle verification remains pending.
+
+### CarPlay startup feedback
+- Show a compact Waiting for video indicator until the current presentation actually renders a frame.
+- Fence queued USB/Wi-Fi presentation replacements against predecessor rendered telemetry, and hide the indicator on stop/failure and behind projection dialogs.
+- Debug/release unit suites passed: app 1,344, receiver 467 and companion 118 tests per variant; one private-archive-dependent app test skipped per variant.
+- No companion behavior changes or claim of faster final-approval-to-first-render timing.
+
 ## 0.1.520
 
 ### Android Auto USB

@@ -131,6 +131,7 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
 
     @Volatile private var carPlayRuntime: com.openautolink.app.carplay.OalCarPlayRuntime? = null
     private val carPlayCoordinator = com.openautolink.app.carplay.CarPlayCoordinator(
+        sessionLeases = com.openautolink.app.carplay.CarPlaySessionLeases.forContext(application),
         retireAndroidAuto = {
             kotlinx.coroutines.runBlocking {
                 // Stop and await the advertiser BEFORE SessionManager clears its WPP owner.
@@ -521,6 +522,9 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
                 val runtime = com.openautolink.app.carplay.OalUsbCarPlayRuntime(getApplication(), usbDevice, display, surface, report,
                     onDisplayQualified = { _carPlayDisplay.value = it },
                     onReenumerationStarted = beginTransition, onReplacementAccepted = acceptReplacement)
+                // The captured valid surface qualified this session's geometry only. The
+                // coordinator installs the latest presentation after factory completion.
+                runtime.detachSurface(surface)
                 usbCarPlayRuntime = runtime
                 object : com.openautolink.app.carplay.CarPlayRuntime by runtime {
                     override fun close() { runtime.close(); retired() }
@@ -530,7 +534,7 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
                 check(saved.connectionMode == "wireless" && usbOverrideGeneration == null) { "Wireless CarPlay not opted in" }
                 com.openautolink.app.carplay.OalCarPlayRuntime(getApplication(), config, surface, report,
                     onDisplayQualified = { _carPlayDisplay.value = it })
-                    .also { carPlayRuntime = it }
+                    .also { runtime -> runtime.detachSurface(surface); carPlayRuntime = runtime }
             }
         }
     fun reconnectCarPlay() {
@@ -629,13 +633,15 @@ class ProjectionViewModel(application: Application) : AndroidViewModel(applicati
             ),
         )
     }
-    fun onCarPlaySurfaceAvailable(surface: Surface) { carPlaySurface.value = surface }
+    fun onCarPlaySurfaceAvailable(surface: Surface) {
+        carPlaySurface.value = surface
+        carPlayCoordinator.attachSurface(surface)
+    }
     fun onCarPlaySurfaceDestroyed(surface: Surface) {
         if (carPlaySurface.value !== surface) return
         carPlaySurface.value = null
         carPlayViewport.value = null
-        // A replacement surface requires a new receiver, never reuses a stale MediaCodec target.
-        carPlayCoordinator.stop()
+        carPlayCoordinator.detachSurface(surface)
     }
     fun onCarPlayTouch(event: MotionEvent, width: Int, height: Int) {
         val pointers = (0 until event.pointerCount).map { index ->

@@ -5,6 +5,112 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarPlayMetadataIntakeTest {
+    @Test fun acceptedRouteCrossingInstructionDeadlinePurgesOldDetailsAndEstimates() {
+        var now = 0L
+        val intake = CarPlayMetadataIntake { now }.apply { authenticate() }
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)); string(3,"Old road"); u32(10,10); u64(6,20); u32(7,30) })
+        val epoch = intake.routeMetadata?.epoch
+        now = 29_999; intake.tick()
+        now = 30_001
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+        assertNull("route renewal must first purge the crossed instruction deadline", intake.navigation)
+        assertEquals(epoch, intake.routeMetadata?.epoch)
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,3) })
+        val fresh = requireNotNull(intake.navigation)
+        assertEquals(3, fresh.maneuverType)
+        assertNull(fresh.road); assertNull(fresh.distanceMeters)
+        assertNull(fresh.remainingSeconds); assertNull(fresh.remainingMeters)
+    }
+
+    @Test fun acceptedRouteCrossingOwnershipDeadlineCreatesNewEpochWithoutOldCache() {
+        var now = 0L
+        val intake = CarPlayMetadataIntake { now }.apply { authenticate() }
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+        val epoch = intake.routeMetadata?.epoch
+        now = 119_999; intake.tick()
+        now = 120_001
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+        assertNotEquals("route renewal cannot erase a crossed ownership deadline", epoch, intake.routeMetadata?.epoch)
+        assertNull(intake.navigation)
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,3) })
+        assertEquals(3, intake.navigation?.maneuverType)
+    }
+
+    @Test fun acceptedManeuverCrossingOwnershipDeadlineCannotRetainOldRoute() {
+        var now = 0L
+        val intake = CarPlayMetadataIntake { now }.apply { authenticate() }
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+        val epoch = intake.routeMetadata?.epoch
+        now = 119_999; intake.tick()
+        now = 120_001
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,8); u8(3,3) })
+        assertNull("maneuver traffic must enforce old ownership expiry", intake.routeMetadata)
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+        assertNotEquals(epoch, intake.routeMetadata?.epoch)
+        assertNull("old selected detail must be purged", intake.navigation)
+    }
+
+    @Test fun invalidFramesCrossingDeadlinesLeaveOldSnapshotUntouchedUntilTick() {
+        for (deadline in listOf(30_000L, 120_000L)) {
+            var now = 0L
+            val intake = CarPlayMetadataIntake { now }.apply { authenticate() }
+            intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+            intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+            now = deadline - 1; intake.tick()
+            val before = intake.routeMetadata
+            now = deadline + 1
+            intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,99); u16List(13,listOf(8)) })
+            assertEquals(before, intake.routeMetadata)
+            intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,8); u8(3,3); bytes(11,byteArrayOf(1)) })
+            assertEquals(before, intake.routeMetadata)
+            intake.tick()
+            assertNull(intake.navigation)
+            if (deadline == 120_000L) assertNull(intake.routeMetadata)
+        }
+    }
+
+    @Test fun staleLoadingRouteDiscardsCachedFutureDetailsBeforeFreshSelection() {
+        var now = 0L
+        val intake = CarPlayMetadataIntake { now }
+        intake.authenticate()
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(8)) })
+        val epoch = intake.routeMetadata?.epoch
+        assertNull(intake.navigation)
+        now = 30_000; intake.tick()
+        intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+        assertNull("stale cached future instruction must not be replayed", intake.navigation)
+        assertEquals(epoch, intake.routeMetadata?.epoch)
+        intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,3) })
+        assertEquals(3, intake.navigation?.maneuverType)
+    }
+
+    @Test fun staleInstructionDegradesAtThirtySecondsButRouteExpiresAtTwoMinutesWithoutFreshRoute() {
+        var now = 0L
+        val intake = CarPlayMetadataIntake { now }
+        intake.authenticate()
+        fun details() = intake.handle(Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+        fun route() = intake.handle(Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+        details(); route()
+        val epoch = requireNotNull(intake.routeMetadata).epoch
+        now = 29_999; intake.tick(); assertNotNull(intake.navigation)
+        now = 30_000; intake.tick()
+        assertNull("stale turn must disappear", intake.navigation)
+        assertNotNull("instruction expiry is not route termination", intake.routeMetadata)
+        assertEquals(epoch, intake.routeMetadata?.epoch)
+        details()
+        assertNull("maneuver-only traffic cannot revive stale route guidance", intake.navigation)
+        now = 119_999; intake.tick(); assertNotNull(intake.routeMetadata)
+        now = 120_000; intake.tick(); assertNull(intake.routeMetadata)
+        route()
+        assertNull("expired route cannot reuse previous cached instruction", intake.navigation)
+        assertNotEquals(epoch, intake.routeMetadata?.epoch)
+        details(); assertNotNull(intake.navigation)
+    }
+
     @Test fun firstParseFailuresAndFirstManeuverAreNotHiddenBySameWindowRoute() {
         val lines = mutableListOf<String>()
         val intake = CarPlayMetadataIntake { 0L }.apply { onDiagnostic = lines::add }

@@ -94,6 +94,126 @@ class ClusterLateRecoveryTest {
         return lease
     }
 
+    private fun metadataLink(clock: () -> Long = { 0L }): Pair<com.openautolink.app.carplay.OalCarPlayMetadataLink, java.util.concurrent.BlockingQueue<String>> {
+        val prefs = mockk<com.openautolink.app.data.AppPreferences>()
+        mockkObject(com.openautolink.app.data.AppPreferences.Companion)
+        every { com.openautolink.app.data.AppPreferences.getInstance(any()) } returns prefs
+        every { prefs.clusterNavigation } returns kotlinx.coroutines.flow.flowOf(false)
+        every { prefs.distanceUnits } returns kotlinx.coroutines.flow.flowOf("auto")
+        mockkObject(com.openautolink.app.media.OalMediaSessionManager.Companion)
+        every { com.openautolink.app.media.OalMediaSessionManager.getInstance(any()) } returns mockk(relaxed = true)
+        val receipts = java.util.concurrent.LinkedBlockingQueue<String>()
+        val host = com.openautolink.app.carplay.OalCarPlayMetadataHost(context)
+        return com.openautolink.app.carplay.OalCarPlayMetadataLink(clock, { receipts.offer(it) }, host) to receipts
+    }
+
+    private fun awaitPublication(receipts: java.util.concurrent.BlockingQueue<String>, guidance: Boolean) {
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
+        while (true) {
+            val line = receipts.poll(maxOf(1L, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS)
+            assertNotNull("metadata publication must return", line)
+            if (line.startsWith("carplay-nav publication=returned guidance=$guidance")) return
+            assertTrue("metadata publication must return", System.nanoTime() < deadline)
+        }
+    }
+
+    @Test
+    fun activeCacheMissSendsLoadingTripWithoutEndingOrReplayingOldTurn() {
+        ClusterMainSession().onCreateScreen(Intent())
+        val trips = mutableListOf<androidx.car.app.navigation.model.Trip>()
+        every { navigation.updateTrip(capture(trips)) } just Runs
+        val (link, receipts) = metadataLink()
+        try {
+            link.authenticate()
+            link.handle(com.shilapi.xcertplay.iap2.message.Iap2Messages.buildRaw(0x5202) { u16(1,7); u8(3,2) })
+            link.handle(com.shilapi.xcertplay.iap2.message.Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(7)) })
+            awaitPublication(receipts, true)
+            advance(300)
+            val epoch = ClusterNavigationState.recoveryDemand.value
+            assertNotNull(epoch)
+            link.handle(com.shilapi.xcertplay.iap2.message.Iap2Messages.buildRaw(0x5201) { u8(1,1); u16List(13,listOf(8)) })
+            awaitPublication(receipts, false)
+            advance(300)
+            verify(exactly = 0) { navigation.navigationEnded() }
+            assertEquals(epoch, ClusterNavigationState.recoveryDemand.value)
+            assertTrue(ClusterNavigationState.isActive)
+            assertNull(ClusterNavigationState.state.value)
+            assertTrue(trips.last().isLoading)
+            assertTrue(trips.last().steps.isEmpty())
+            assertTrue(trips.last().stepTravelEstimates.isEmpty())
+            link.handle(com.shilapi.xcertplay.iap2.message.Iap2Messages.buildRaw(0x5202) { u16(1,8); u8(3,3) })
+            awaitPublication(receipts, true)
+            advance(300)
+            assertEquals(epoch, ClusterNavigationState.recoveryDemand.value)
+            verify(exactly = 1) { navigation.navigationStarted() }
+            assertFalse(trips.last().isLoading)
+        } finally { link.close() }
+    }
+
+    @Test
+    fun restoredTerminalWithinLoadingDebounceGetsANewArrivalDeadline() {
+        ClusterMainSession().onCreateScreen(Intent())
+        val terminal = maneuver.copy(type = ManeuverType.DESTINATION)
+        ClusterNavigationState.update(terminal)
+        advance(10_100)
+        val epoch = ClusterNavigationState.recoveryDemand.value
+        ClusterNavigationState.updateHost(null)
+        advance(50)
+        ClusterNavigationState.updateHost(terminal)
+        advance(100) // Old deadline passed, restored Trip still pending.
+        verify(exactly = 0) { navigation.navigationEnded() }
+        assertEquals(epoch, ClusterNavigationState.recoveryDemand.value)
+        assertFalse(ClusterNavigationState.isRouteSuppressed)
+        advance(100) // Restored terminal submitted at 10_350.
+        advance(9_999)
+        verify(exactly = 0) { navigation.navigationEnded() }
+        advance(1)
+        verify(exactly = 1) { navigation.navigationEnded() }
+        assertTrue(ClusterNavigationState.isRouteSuppressed)
+    }
+
+    @Test
+    fun restoredTerminalWithinNonterminalDebounceGetsANewArrivalDeadline() {
+        ClusterMainSession().onCreateScreen(Intent())
+        val terminal = maneuver.copy(type = ManeuverType.DESTINATION)
+        ClusterNavigationState.update(terminal)
+        advance(10_100)
+        ClusterNavigationState.update(maneuver)
+        advance(50)
+        ClusterNavigationState.update(terminal)
+        advance(100)
+        verify(exactly = 0) { navigation.navigationEnded() }
+        assertFalse(ClusterNavigationState.isRouteSuppressed)
+        advance(10_100)
+        verify(exactly = 1) { navigation.navigationEnded() }
+        assertTrue(ClusterNavigationState.isRouteSuppressed)
+    }
+
+    @Test
+    fun unchangedTerminalRefreshKeepsOriginalArrivalDeadline() {
+        ClusterMainSession().onCreateScreen(Intent())
+        val terminal = maneuver.copy(type = ManeuverType.DESTINATION)
+        ClusterNavigationState.update(terminal)
+        advance(5_000)
+        ClusterNavigationState.update(terminal.copy(distanceMeters = 90))
+        advance(5_199)
+        verify(exactly = 0) { navigation.navigationEnded() }
+        advance(1)
+        verify(exactly = 1) { navigation.navigationEnded() }
+        assertTrue(ClusterNavigationState.isRouteSuppressed)
+    }
+
+    @Test
+    fun loadingSnapshotRevokesArrivalEvenBeforeDebouncedTripSubmission() {
+        ClusterMainSession().onCreateScreen(Intent())
+        ClusterNavigationState.update(maneuver.copy(type = ManeuverType.DESTINATION))
+        advance(10_100) // Timer is due at 10_200; next Trip submission is due at 10_300.
+        ClusterNavigationState.updateHost(null)
+        advance(200)
+        verify(exactly = 0) { navigation.navigationEnded() }
+        assertFalse(ClusterNavigationState.isRouteSuppressed)
+    }
+
     @Test
     fun cancelledClearCallbackCannotAdoptUnrestrictedDemand() {
         ClusterBindingState.unregisterSession(ready())

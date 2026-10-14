@@ -11,7 +11,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
-/** One exact-device request per call. No retries; the receiver and capability die with this wait. */
+/** One exact-device permission request/wait per admitted startup stage. A manifest
+ * match is not a grant; replacements require their own actual platform permission.
+ * No automatic retries or permission transfer. */
 object UsbCarPlayPermission {
     const val REENUMERATION_TIMEOUT_MS = 15_000L
     private const val PERMISSION_TIMEOUT_MS = 120_000L
@@ -20,8 +22,10 @@ object UsbCarPlayPermission {
 
     fun await(context: Context, usb: UsbManager, device: UsbDevice,
               timeoutMs: Long = PERMISSION_TIMEOUT_MS, isCancelled: () -> Boolean): Result {
-        if (isCancelled()) return Result.CANCELLED
-        if (timeoutMs <= 0) return Result.TIMED_OUT
+        val early = if (isCancelled()) Result.CANCELLED else if (timeoutMs <= 0) Result.TIMED_OUT else null
+        if (early != null) {
+            return early
+        }
         val generation = generations.incrementAndGet()
         val action = "${context.packageName}.CARPLAY_USB_PERMISSION.$generation"
         val lock = Any()
@@ -58,19 +62,22 @@ object UsbCarPlayPermission {
             capability = PendingIntent.getBroadcast(context, generation.toInt(),
                 Intent(action).setPackage(context.packageName).putExtra("generation", generation),
                 PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_ONE_SHOT)
+            // Android can race this call with an OS/default grant; requestPermission
+            // also resolves immediately when it finds the device already authorized.
             usb.requestPermission(device, capability)
             val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
             while (true) {
                 if (isCancelled()) return Result.CANCELLED
                 if (!attached()) return Result.DETACHED
+                val resolved = synchronized(lock) { result }
+                if (resolved != null) {
+                    return if (resolved == Result.GRANTED && !usb.hasPermission(device)) Result.DENIED else resolved
+                }
+                // Saved defaults/OS confirmation grant without our PendingIntent callback.
+                if (usb.hasPermission(device)) return Result.GRANTED
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0) return Result.TIMED_OUT
-                if (done.await(minOf(remaining, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS)) {
-                    if (isCancelled()) return Result.CANCELLED
-                    val resolved = synchronized(lock) { checkNotNull(result) }
-                    return if (resolved == Result.GRANTED && (!attached() || !usb.hasPermission(device)))
-                        Result.DETACHED else resolved
-                }
+                done.await(minOf(remaining, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS)
             }
         } finally {
             try { capability?.cancel() } finally { context.unregisterReceiver(receiver) }

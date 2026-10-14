@@ -21,7 +21,7 @@ Android Auto and CarPlay share one app, with independent connection settings. **
 [![Release](https://github.com/mossyhub/openautolink/actions/workflows/release-apk.yml/badge.svg)](https://github.com/mossyhub/openautolink/releases/latest)
 
 > [!IMPORTANT]
-> **Locked GM production vehicles require Google Play delivery.** They do not permit ADB installation or APK sideloading. Ask privately to join the maintainer's Play test group through [XDA](https://xdaforums.com/t/open-source-openautolink-wireless-android-auto-bridge-for-aaos-gm-evs.4785192/) or [Reddit](https://www.reddit.com/user/IPickedThisUserID/), providing the Google-account email used by your vehicle. **Never post your email publicly.** Places are limited; the group supports up to 100 testers. Independent Play publishing is also available.
+> **Locked GM production vehicles require Google Play delivery.** They do not permit ADB installation or APK sideloading. **New tester intake is temporarily paused: the current internal tests are full, and wider Community distribution is not ready.** [Request membership in the OpenAutoLink Google Group](https://groups.google.com/g/openautolink-testers) using the Google account signed into the vehicle's Play Store to join the **waitlist**, then wait for the maintainer's readiness announcement. Group approval is **not** an instruction to opt into Play or install now. See the [waitlist details below](#car-app-on-a-locked-gm-vehicle). Independent Play publishing is also available.
 
 ## Choose your phone and connection
 
@@ -29,7 +29,7 @@ Android Auto and CarPlay share one app, with independent connection settings. **
 |---|---|---|---|
 | Android Auto, wireless | Bluetooth + car Wi-Fi (WPP) | **Yes**, for GM wireless | Use WPP for Android Auto 17.4+ |
 | Android Auto, USB | USB cable | **No** | GM requests USB permission on each connection |
-| CarPlay, USB | USB cable | **No iPhone companion** | Data-capable USB port/cable, authentication identity and USB/VPN consent required |
+| CarPlay, USB | USB cable; iPhone unpaired from vehicle Bluetooth | **No iPhone companion** | Music and calls use USB; data-capable port/cable, authentication identity and USB/VPN consent required |
 | CarPlay, wireless | Bluetooth + Wi-Fi | **No iPhone companion** | Available for development; not working in the maintainer's vehicle |
 | CarPlay, shared Wi-Fi | Existing Wi-Fi network | **No iPhone companion** | Advanced wireless network configuration; not a USB requirement |
 
@@ -59,7 +59,7 @@ Check the notes for your installed build: internal Play builds can include chang
 
 - No iPhone companion app or additional projection hardware.
 - **USB projection**, with wireless connection retained separately for development.
-- **Video, touch and audio**. Music playback quality is still being refined.
+- **Video, touch, music and phone calls over USB**. Incoming and outgoing calls were confirmed on the maintainer's Blazer EV without vehicle Bluetooth. [Leave the iPhone unpaired from vehicle Bluetooth](#usb-1) to avoid repeated music pauses.
 - **Multi-touch gestures**, including map pinch-to-zoom.
 - **Adjustable video quality, Fit to window and safe-control calibration** for wide or curved screens.
 - **Music information and artwork on supported vehicle displays**. Cluster route guidance is still being refined.
@@ -69,7 +69,16 @@ Check the notes for your installed build: internal Play builds can include chang
 
 ### Car app on a locked GM vehicle
 
-**Recommended:** request a place in the maintainer's Google Play test group using the private contact links above. Install/update through the vehicle's Play Store.
+**For new testers: join the temporary Google Group waitlist, not an active installation flow.** Current internal tests are full and new tester intake is paused while the maintainer works out wider distribution.
+
+1. On a **computer**, sign into the **same Google account used by the vehicle's Play Store**. Open the [OpenAutoLink testers Google Group](https://groups.google.com/g/openautolink-testers) and **request membership**.
+2. **Wait for the maintainer to announce that wider distribution is ready.** Even if group membership is approved, **do not attempt Community Play opt-in or installation yet**. Membership is a waitlist place, not Play access or a guaranteed installation date.
+
+The Community release (`com.openautolink.app`, version code 522) and Automotive form-factor opt-in have been submitted to Google Play, but **are not approved yet**. Community installation on a vehicle has **not been verified**. The maintainer hopes to have wider distribution sorted out in **about a week**, but this is an estimate, not a promise; Google's review and availability timing are outside the maintainer's control. Installation instructions will be announced when the route is ready.
+
+**No DM or separate email collection is required to request group membership.** Do not post your account email publicly. Check the Google Group's description and welcome panel for current guidance; a separate custom welcome email is not guaranteed.
+
+**Existing original-app and capacity-clone internal testers:** keep your current working installation and testing program, and continue updating that existing app through Google Play. **Do not uninstall, switch packages or migrate now.** The waitlist does not change your current enrollment. For installations and updates, the car itself needs internet-connected Wi-Fi or its data service; [an OnStar data plan is not required](#car-internet-no-onstar-data-plan-required).
 
 **Independent publishing:** use the [one-command personal AAB builder](docs/build-aab.md) and [GM installation guide](docs/install-gm.md). Preserve the builder's signing/state directory: later Play updates must use the same application ID and signing key.
 
@@ -89,7 +98,7 @@ For wireless Android Auto, install `openautolink-companion-vX.Y.Z.apk` from the 
 
 ### iPhone
 
-No OAL iPhone companion is required. For **USB**, connect a data-capable cable; Bluetooth pairing and car Wi-Fi fields are not required for wired startup. For **wireless**, pair through the **car's system Bluetooth settings** and configure the wireless fields below. USB Trust approval is separate from Bluetooth pairing; maintainer Play builds include the required authentication files.
+No OAL iPhone companion is required. For **USB**, connect a data-capable cable and **leave the iPhone unpaired from vehicle Bluetooth** to avoid GM Bluetooth competing with CarPlay and constantly pausing media. Music and calls work over USB; car Wi-Fi fields are not required for wired startup. For **wireless**, pair through the **car's system Bluetooth settings** and configure the wireless fields below. USB Trust approval is separate from Bluetooth pairing; maintainer Play builds include the required authentication files.
 
 ### Other AAOS systems
 
@@ -146,9 +155,12 @@ If you previously turned off iPhone projection, OAL retains that choice. Only in
 
 ### USB
 
-1. Select **CarPlay connection → USB** and save.
-2. Connect the iPhone to a data-capable head-unit USB port with a data-capable cable. If another projection is active, choose **Switch** to attempt temporary USB takeover.
-3. Accept Android USB access and OAL's local VPN consent when requested. If the iPhone asks to trust the connection, unlock it and approve **Trust** on the iPhone itself.
+1. **Do not pair the iPhone to the vehicle's Bluetooth for USB CarPlay.** If it is already paired, forget/remove the pairing so it does not reconnect. With the iPhone connected to vehicle Bluetooth, GM's native Bluetooth playback control competes with CarPlay and music can constantly pause after pressing Play.
+2. Select **CarPlay connection → USB** and save.
+3. Connect the iPhone to a data-capable head-unit USB port with a data-capable cable. If another projection is active, choose **Switch** to attempt temporary USB takeover.
+4. Accept Android USB access and OAL's local VPN consent when requested. If the iPhone asks to trust the connection, unlock it and approve **Trust** on the iPhone itself.
+
+**Music and calls work over USB without vehicle Bluetooth.** The maintainer confirmed music playback plus both outgoing and incoming CarPlay calls on the 2024 Chevrolet Blazer EV with the iPhone disconnected from vehicle Bluetooth. This is a setup correction, not a requirement to turn off the car's entire Bluetooth adapter. **Do not apply it to wireless Android Auto:** keep that Android phone's required Bluetooth pairing and **Phone calls** profile enabled.
 
 USB CarPlay does not require Bluetooth pairing or Wi-Fi setup. The VPN permission is used locally for the USB connection—not an Internet VPN service. Another active VPN can conflict. USB access and permission support vary by head unit.
 
@@ -195,7 +207,9 @@ Under **CarPlay → CarPlay UI scale**:
 
 ## Keep incoming and active calls in Android Auto or CarPlay on GM
 
-The same vehicle settings apply to **both Android Auto and Apple CarPlay**. To stop GM's native Phone app from covering the projected incoming-call and in-call controls on the center display:
+For **USB CarPlay**, leave the iPhone unpaired from vehicle Bluetooth: incoming and outgoing calls work over USB, and avoiding the Bluetooth connection prevents repeated music pauses. The native Bluetooth Phone-app settings below are not required for that Bluetooth-free CarPlay setup.
+
+For **Android Auto**, or when managing native GM call-screen behavior, use these vehicle settings to stop GM's native Phone app from covering the projected incoming-call and in-call controls on the center display:
 
 1. Open the vehicle's native **Phone** app.
 2. Tap the **Settings** gear.
@@ -288,7 +302,7 @@ Developer guides:
 
 Use [GitHub issues](https://github.com/mossyhub/openautolink/issues) for reproducible defects and [XDA](https://xdaforums.com/t/open-source-openautolink-wireless-android-auto-bridge-for-aaos-gm-evs.4785192/) for setup and owner reports. Include exact builds, reproduction steps and logs.
 
-**Polestar and other non-GM AAOS testers are especially welcome.** Both Android and iPhone owners are welcome. Contact the maintainer privately for Play access—never request or supply account emails publicly. Public GitHub builds omit private CarPlay authentication assets; see the build policy before choosing that installation route.
+**Polestar and other non-GM AAOS testers are especially welcome.** Both Android and iPhone owners are welcome. For future maintainer Play access, join the [temporary Google Group waitlist](#car-app-on-a-locked-gm-vehicle) and wait for the readiness announcement; new intake is paused, and group approval does not enable Community installation now. No DM or separate email collection is required. Group membership does not establish vehicle compatibility. Public GitHub builds omit private CarPlay authentication assets; see the build policy before choosing that installation route.
 
 ## Acknowledgments
 
