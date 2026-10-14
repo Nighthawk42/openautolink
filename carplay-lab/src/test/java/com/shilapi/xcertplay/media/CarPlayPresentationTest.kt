@@ -31,7 +31,7 @@ class CarPlayPresentationTest {
         assertNotNull("public $name(Surface) presentation receipt required", method)
         method!!.invoke(sink, surface)
     }
-    private class Decoder {
+    private class Decoder(kind: VideoCodec = VideoCodec.H264) {
         val configuredSurface = AtomicReference<Surface>()
         val format = AtomicReference<MediaFormat>()
         val listener = AtomicReference<MediaCodec.OnFrameRenderedListener>()
@@ -41,11 +41,11 @@ class CarPlayPresentationTest {
         val codec: MediaCodec = mock(MediaCodec::class.java)
         init {
             val caps = MediaCodecInfoBuilder.CodecCapabilitiesBuilder.newBuilder()
-                .setMediaFormat(MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC,1280,720))
+                .setMediaFormat(MediaFormat.createVideoFormat(if (kind == VideoCodec.H264) MediaFormat.MIMETYPE_VIDEO_AVC else MediaFormat.MIMETYPE_VIDEO_HEVC,1280,720))
                 .setIsEncoder(false).setColorFormats(intArrayOf(2130708361))
                 .setProfileLevels(arrayOf(MediaCodecInfo.CodecProfileLevel().apply {
-                    profile = MediaCodecInfo.CodecProfileLevel.AVCProfileHigh
-                    level = MediaCodecInfo.CodecProfileLevel.AVCLevel52
+                    profile = if (kind == VideoCodec.H264) MediaCodecInfo.CodecProfileLevel.AVCProfileHigh else MediaCodecInfo.CodecProfileLevel.HEVCProfileMain
+                    level = if (kind == VideoCodec.H264) MediaCodecInfo.CodecProfileLevel.AVCLevel52 else MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel31
                 })).build()
             val info = MediaCodecInfoBuilder.newBuilder().setName("test.avc").setIsEncoder(false).setCapabilities(caps).build()
             `when`(codec.codecInfo).thenReturn(info); `when`(codec.name).thenReturn("test.avc")
@@ -65,6 +65,7 @@ class CarPlayPresentationTest {
     private class Fixture(
         val surface: Surface = Surface(SurfaceTexture(0)),
         private val statusObserver: (String) -> Unit = {},
+        private val kind: VideoCodec = VideoCodec.H264,
         setup: (Decoder) -> Unit = {},
     ) {
         val created = LinkedBlockingQueue<Decoder>()
@@ -74,21 +75,247 @@ class CarPlayPresentationTest {
         val telemetry = ReceiverTelemetry(1)
         val sink = AndroidMediaSink(RuntimeEnvironment.getApplication(),surface,
             display = CarPlayDisplaySelection(CarPlayDisplayPreferences(),"test.avc",false),
-            videoSelection = CarPlayVideoSelection(1280,720,30,"test.avc"), telemetry = telemetry,
-            videoCodecFactory = { Decoder().also { setup(it); created.offer(it) }.codec },
+            videoSelection = CarPlayVideoSelection(1280,720,30,"test.avc","test.hevc"), telemetry = telemetry,
+            videoCodecFactory = { Decoder(kind).also { setup(it); created.offer(it) }.codec },
             onStatus = {
                 statuses.add(it)
-                if (it == "media stage=h264-configured") configured.offer(it)
+                if (it == "media stage=h264-configured" || it == "media stage=h265-configured") configured.offer(it)
                 statusObserver(it)
             })
         init { sink.setVideoRecoveryHandler(110) { recovery.incrementAndGet() } }
-        fun config() { sink.onVideoCodec(110, VideoCodec.H264); sink.onVideoConfig(110, GeneratedHevcFixture.avcc) }
+        fun config() { sink.onVideoCodec(110, kind); sink.onVideoConfig(110, if (kind == VideoCodec.H264) GeneratedHevcFixture.avcc else GeneratedHevcFixture.hvcc) }
         fun decoder(): Decoder {
             assertNotNull("production worker configure receipt", configured.poll(3,TimeUnit.SECONDS))
             return checkNotNull(created.poll(3,TimeUnit.SECONDS))
         }
         fun close() { sink.close(); assertTrue(sink.awaitRetired(3000)); surface.release() }
     }
+    private class PollGate(sink: AndroidMediaSink) {
+        val entered = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        init {
+            val once = java.util.concurrent.atomic.AtomicBoolean()
+            sink.beforeVideoPoll = {
+                if (once.compareAndSet(false, true)) {
+                    entered.countDown()
+                    check(resume.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue("actual worker parked after config snapshot", entered.await(3, TimeUnit.SECONDS))
+        }
+    }
+    private val idr get() = byteArrayOf(0,0,0,1,0x65,0)
+    private fun changedConfig() = GeneratedHevcFixture.avcc.copyOf().apply { this[41] = (this[41].toInt() xor 1).toByte() }
+    private fun parkedConfigIdr(changed: Boolean) {
+        val f = Fixture()
+        var gate: PollGate? = null
+        try {
+            val old = if (changed) { f.config(); f.decoder() } else null
+            gate = PollGate(f.sink)
+            if (changed) f.sink.onVideoConfig(110, changedConfig()) else f.config()
+            f.sink.onVideoFrame(110, idr)
+            gate.resume.countDown()
+            val fresh = f.decoder()
+            assertTrue("same waking IDR must reach new decoder", fresh.queued.await(3, TimeUnit.SECONDS))
+            old?.listener?.get()?.onFrameRendered(old.codec,1,1)
+            assertNull("predecessor callback fenced", f.telemetry.snapshot(1).renderedFrames)
+            fresh.listener.get().onFrameRendered(fresh.codec,2,2)
+            assertEquals(1L, f.telemetry.snapshot(2).renderedFrames)
+            assertTrue(fresh.effectThreads.all { it == "lab-video" })
+        } finally { gate?.resume?.countDown(); f.close() }
+    }
+    @Test fun initialConfigIdrWakingParkedPollRenders() = parkedConfigIdr(false)
+    @Test fun changedConfigIdrWakingParkedPollRenders() = parkedConfigIdr(true)
+    @Test fun duplicateConfigDuringBlockedConfigureKeepsCandidate() {
+        val entered = CountDownLatch(1); val resume = CountDownLatch(1)
+        val f = Fixture { decoder ->
+            doAnswer { entered.countDown(); ignoreInterrupt(resume); null }.`when`(decoder.codec)
+                .configure(any(MediaFormat::class.java),any(Surface::class.java),isNull(),eq(0))
+        }
+        try {
+            f.config(); assertTrue(entered.await(3,TimeUnit.SECONDS))
+            val candidate = checkNotNull(f.created.poll(3,TimeUnit.SECONDS))
+            val config = latestReceipt(f.sink)
+            f.sink.onVideoConfig(110,GeneratedHevcFixture.avcc.copyOf())
+            assertSame("exact duplicate must retain in-flight receipt",config,latestReceipt(f.sink))
+            f.sink.onVideoFrame(110,idr)
+            resume.countDown()
+            assertTrue(candidate.queued.await(3,TimeUnit.SECONDS))
+            verify(candidate.codec).start(); verify(candidate.codec,never()).release()
+            candidate.listener.get().onFrameRendered(candidate.codec,1,1)
+            assertEquals(1L,f.telemetry.snapshot(1).renderedFrames)
+            assertTrue(f.created.isEmpty())
+        } finally { resume.countDown(); f.close() }
+    }
+    @Test fun duplicateConfigPreservesQueuedDeltasAnchorAndCurrentCallback() {
+        val f = Fixture(); var gate: PollGate? = null
+        try {
+            f.config(); val decoder = f.decoder()
+            f.sink.onVideoFrame(110,idr)
+            assertTrue(decoder.queued.await(3,TimeUnit.SECONDS))
+            gate = PollGate(f.sink)
+            val receipt = latestReceipt(f.sink)
+            val recoveries = f.recovery.get()
+            val delta = byteArrayOf(0,0,0,1,0x41,0)
+            f.sink.onVideoFrame(110,delta)
+            f.sink.onVideoConfig(110,GeneratedHevcFixture.avcc.copyOf())
+            f.sink.onVideoFrame(110,delta)
+            assertSame(receipt,latestReceipt(f.sink))
+            assertEquals(2,(field(f.sink,"videoQueue").get(f.sink) as java.util.Queue<*>).size)
+            decoder.listener.get().onFrameRendered(decoder.codec,1,1)
+            assertEquals(1L,f.telemetry.snapshot(1).renderedFrames)
+            gate.resume.countDown()
+            verify(decoder.codec,timeout(3000).times(3)).queueInputBuffer(anyInt(),anyInt(),anyInt(),anyLong(),anyInt())
+            val settled = PollGate(f.sink)
+            try {
+                assertTrue(f.created.isEmpty()); assertEquals(recoveries,f.recovery.get())
+                verify(decoder.codec,never()).release()
+            } finally { settled.resume.countDown() }
+        } finally { gate?.resume?.countDown(); f.close() }
+    }
+    @Test fun duplicateRecoveryFeedbackConfigIdrRendersWithoutReconfigureLoop() {
+        val f = Fixture(); var gate: PollGate? = null
+        try {
+            gate = PollGate(f.sink)
+            f.sink.setVideoRecoveryHandler(110) {
+                f.recovery.incrementAndGet()
+                f.sink.onVideoConfig(110,GeneratedHevcFixture.avcc.copyOf())
+                f.sink.onVideoFrame(110,idr)
+            }
+            f.config(); gate.resume.countDown()
+            val decoder = f.decoder()
+            assertTrue("recovery's config + IDR reaches worker",decoder.queued.await(3,TimeUnit.SECONDS))
+            val settled = PollGate(f.sink)
+            try {
+                assertTrue("duplicate feedback must not recreate",f.created.isEmpty())
+                assertEquals(1,f.recovery.get()); verify(decoder.codec,times(1)).start()
+                decoder.listener.get().onFrameRendered(decoder.codec,1,1)
+                assertEquals(1L,f.telemetry.snapshot(1).renderedFrames)
+            } finally { settled.resume.countDown() }
+        } finally { gate?.resume?.countDown(); f.close() }
+    }
+    @Test fun changedConfigAbaMintsFreshReceiptsClearsOldFramesAndFencesCallback() {
+        val f = Fixture(); var gate: PollGate? = null
+        try {
+            f.config(); val old = f.decoder(); val a = latestReceipt(f.sink)
+            gate = PollGate(f.sink)
+            f.sink.onVideoFrame(110,idr)
+            f.sink.onVideoConfig(110,changedConfig()); val b = latestReceipt(f.sink)
+            assertNotSame(a,b)
+            assertEquals(0,(field(f.sink,"videoQueue").get(f.sink) as java.util.Queue<*>).size)
+            f.config(); val freshA = latestReceipt(f.sink)
+            assertNotSame(a,freshA); assertNotSame(b,freshA)
+            f.sink.onVideoFrame(110,idr)
+            gate.resume.countDown(); val fresh = f.decoder()
+            assertTrue(fresh.queued.await(3,TimeUnit.SECONDS))
+            verify(old.codec,never()).queueInputBuffer(anyInt(),anyInt(),anyInt(),anyLong(),anyInt())
+            old.listener.get().onFrameRendered(old.codec,1,1)
+            assertNull(f.telemetry.snapshot(1).renderedFrames)
+            fresh.listener.get().onFrameRendered(fresh.codec,2,2)
+            assertEquals(1L,f.telemetry.snapshot(2).renderedFrames)
+        } finally { gate?.resume?.countDown(); f.close() }
+    }
+    @Test fun duplicateWhileDetachedRetainsConfigButReattachHasFreshOwner() {
+        val f = Fixture()
+        try {
+            f.config(); val old = f.decoder(); val config = latestReceipt(f.sink)
+            f.sink.detachSurface(f.surface)
+            assertTrue(old.released.await(3,TimeUnit.SECONDS))
+            f.config(); assertSame(config,latestReceipt(f.sink))
+            f.sink.attachSurface(f.surface); val fresh = f.decoder()
+            assertNotSame(old.codec,fresh.codec)
+            f.sink.onVideoFrame(110,idr); assertTrue(fresh.queued.await(3,TimeUnit.SECONDS))
+            old.listener.get().onFrameRendered(old.codec,1,1)
+            assertNull(f.telemetry.snapshot(1).renderedFrames)
+            fresh.listener.get().onFrameRendered(fresh.codec,2,2)
+            assertEquals(1L,f.telemetry.snapshot(2).renderedFrames)
+        } finally { f.close() }
+    }
+    @Test fun canonicalDuplicateDedupsButCodecAnnouncementMismatchStillRejects() {
+        val f = Fixture(); var gate: PollGate? = null
+        try {
+            gate = PollGate(f.sink)
+            f.config(); val receipt = latestReceipt(f.sink)
+            val data = GeneratedHevcFixture.avcc
+            val box = ByteBuffer.allocate(data.size+8).putInt(data.size+8).put("avcC".toByteArray()).put(data).array()
+            f.sink.onVideoConfig(110,box)
+            assertSame(receipt,latestReceipt(f.sink))
+            // Test the existing mismatch guard without widening the decoder qualification policy.
+            f.sink.onVideoCodec(110,VideoCodec.H265)
+            assertThrows(IllegalArgumentException::class.java) { f.sink.onVideoConfig(110,data) }
+            assertSame(receipt,latestReceipt(f.sink))
+        } finally { gate?.resume?.countDown(); f.close() }
+    }
+    @Test fun configDiagnosticReceiptsAreBoundedAndContainOnlyLocalIdentityAndCounters() {
+        val f = Fixture(); var gate: PollGate? = null
+        try {
+            gate = PollGate(f.sink)
+            f.config()
+            repeat(100) { f.sink.onVideoConfig(110,GeneratedHevcFixture.avcc.copyOf()) }
+            f.sink.onVideoConfig(110,changedConfig()); f.config()
+            val lines = f.statuses.filter { it.startsWith("media stage=video-config ") }
+            assertEquals(listOf(
+                "media stage=video-config action=accepted receipt=1 count=1 codec=H264",
+                "media stage=video-config action=duplicate receipt=1 count=1 codec=H264",
+                "media stage=video-config action=duplicate receipt=1 count=2 codec=H264",
+                "media stage=video-config action=duplicate receipt=1 count=3 codec=H264",
+                "media stage=video-config action=duplicate receipt=1 count=4 codec=H264",
+                "media stage=video-config action=duplicate receipt=1 count=32 codec=H264",
+                "media stage=video-config action=duplicate receipt=1 count=64 codec=H264",
+                "media stage=video-config action=duplicate receipt=1 count=96 codec=H264",
+                "media stage=video-config action=accepted receipt=2 count=2 codec=H264",
+                "media stage=video-config action=accepted receipt=3 count=3 codec=H264"),lines)
+        } finally { gate?.resume?.countDown(); f.close() }
+    }
+    @Test fun hevcParkedPollInitialChangedAndDuplicateRecoveryIdrRender() {
+        val f = Fixture(kind = VideoCodec.H265); var gate: PollGate? = null
+        val hevcIdr = byteArrayOf(0,0,0,1,0x26,1,0)
+        try {
+            gate = PollGate(f.sink)
+            val data = AtomicReference(GeneratedHevcFixture.hvcc)
+            f.sink.setVideoRecoveryHandler(110) {
+                f.recovery.incrementAndGet()
+                f.sink.onVideoConfig(110,data.get().copyOf())
+                f.sink.onVideoFrame(110,hevcIdr)
+            }
+            f.config(); f.sink.onVideoFrame(110,hevcIdr); gate.resume.countDown()
+            val old = f.decoder(); assertTrue(old.queued.await(3,TimeUnit.SECONDS))
+            old.listener.get().onFrameRendered(old.codec,1,1)
+            assertEquals(1L,f.telemetry.snapshot(1).renderedFrames)
+            gate = PollGate(f.sink)
+            assertTrue("duplicate HEVC feedback creates no successor",f.created.isEmpty())
+            data.set(data.get().copyOf().apply { this[lastIndex] = (this[lastIndex].toInt() xor 1).toByte() })
+            f.sink.onVideoConfig(110,data.get()); f.sink.onVideoFrame(110,hevcIdr)
+            gate.resume.countDown(); val fresh = f.decoder()
+            assertTrue("changed HEVC config's waking IDR is admitted",fresh.queued.await(3,TimeUnit.SECONDS))
+            old.listener.get().onFrameRendered(old.codec,2,2)
+            assertEquals(1L,f.telemetry.snapshot(2).renderedFrames)
+            fresh.listener.get().onFrameRendered(fresh.codec,3,3)
+            assertEquals(2L,f.telemetry.snapshot(3).renderedFrames)
+            assertTrue(fresh.effectThreads.all { it == "lab-video" })
+        } finally { gate?.resume?.countDown(); f.close() }
+    }
+    @Test fun reconfigureAndRecoveryReasonsDistinguishInputTimeoutFromOversize() {
+        for (reason in listOf("input-timeout","input-size")) {
+            val recovered = CountDownLatch(1)
+            val f = Fixture(statusObserver = {
+                if (it.startsWith("media stage=video-recovery reason=$reason ")) recovered.countDown()
+            })
+            var gate: PollGate? = null
+            try {
+                f.config(); val decoder = f.decoder(); gate = PollGate(f.sink)
+                assertTrue(f.statuses.contains("media stage=video-reconfigure reason=config-change receipt=1 count=1"))
+                assertTrue(f.statuses.contains("media stage=video-recovery reason=config-change receipt=1 count=1"))
+                if (reason == "input-timeout") `when`(decoder.codec.dequeueInputBuffer(anyLong())).thenReturn(-1)
+                f.sink.onVideoFrame(110,if (reason == "input-timeout") idr else idr + ByteArray(5000))
+                gate.resume.countDown()
+                assertTrue("bounded recovery reason receipt $reason",recovered.await(3,TimeUnit.SECONDS))
+                assertTrue(decoder.released.await(3,TimeUnit.SECONDS))
+            } finally { gate?.resume?.countDown(); f.close() }
+        }
+    }
+    private fun latestReceipt(sink: AndroidMediaSink) =
+        (field(sink,"latestVideoConfig").get(sink) as AtomicReference<*>).get()
     @Test fun detachReattachUsesFreshCodecAndStaleDetachCannotRemoveSuccessor() {
         val f = Fixture(); val successor = Surface(SurfaceTexture(1))
         try {
