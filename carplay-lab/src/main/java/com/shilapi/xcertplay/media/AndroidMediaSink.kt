@@ -83,8 +83,13 @@ class AndroidMediaSink(
     }
     @Volatile private var recovery: (() -> Unit)? = null
     @Volatile private var diagnostic: ((String) -> Unit)? = null
+    // Package-internal test boundary: park the actual owner after its config snapshot, before poll.
+    @Volatile internal var beforeVideoPoll: (() -> Unit)? = null
     private val videoQueue = ArrayBlockingQueue<VideoJob>(24)
     private val latestVideoConfig = java.util.concurrent.atomic.AtomicReference<VideoConfig?>()
+    // Session-local counters only; never log codec records, hashes or connection identifiers.
+    private var acceptedVideoConfigs = 0L // onVideoConfig monitor
+    private var duplicateVideoConfigs = 0L
     private val rendered = AtomicLong()
     private val writtenBytes = AtomicLong()
     private val audioOwners = AtomicLong()
@@ -114,7 +119,8 @@ class AndroidMediaSink(
         val receipts = owners.mapNotNull { it.routeReceipt() }
         listOf("media stage=audio-owners scope=own owners=${owners.size} tracks=${receipts.size}") + receipts + volumes
     }, ::report)
-    private class VideoConfig(val codec: VideoCodec, val bytes: ByteArray)
+    private class VideoConfig(val codec: VideoCodec, val bytes: ByteArray, val receipt: Long)
+    private fun videoReceiptDue(count: Long) = count <= 4 || count % 32 == 0L
     private sealed class VideoJob {
         class Frame(val bytes: ByteArray, val presentation: VideoPresentation.Receipt, val config: VideoConfig?) : VideoJob()
         class Reset(val presentation: VideoPresentation.Receipt) : VideoJob()
@@ -130,9 +136,18 @@ class AndroidMediaSink(
         if (closed.get() || type != 110) return
         val (actual, data) = ScreenCodec.detectConfig(codecData)
         require(actual == announcedCodec) { "Video codec/config mismatch" }
+        val previous = latestVideoConfig.get()
+        // Compare only the current canonical record: A -> B -> A must mint a fresh receipt.
+        if (previous?.codec == actual && previous.bytes.contentEquals(data)) {
+            val count = ++duplicateVideoConfigs
+            if (videoReceiptDue(count)) report("media stage=video-config action=duplicate receipt=${previous.receipt} count=$count codec=${actual.name}")
+            return
+        }
         // Config must outlive frame overflow and presentation loss. One latest immutable receipt.
-        latestVideoConfig.set(VideoConfig(actual,data.copyOf()))
+        val count = ++acceptedVideoConfigs
+        latestVideoConfig.set(VideoConfig(actual,data.copyOf(),count))
         videoQueue.clear()
+        if (videoReceiptDue(count)) report("media stage=video-config action=accepted receipt=$count count=$count codec=${actual.name}")
     }
     override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
         if (closed.get() || type != 110) return
@@ -219,6 +234,8 @@ class AndroidMediaSink(
         var activeCodec = VideoCodec.H264
         var anchored = false
         var lastRecoveryNs = 0L
+        var reconfigurations = 0L
+        var recoveries = 0L
         var observed = presentation.snapshot()
         fun visible() = !closed.get() && presentation.isCurrent(observed) &&
             observed.surface?.isValid == true && latestVideoConfig.get() === config
@@ -230,18 +247,23 @@ class AndroidMediaSink(
             codec = null
             anchored = false
         }
-        fun recover(force: Boolean = false) {
+        fun recover(reason: String, force: Boolean = false) {
             anchored = false
             if (!visible()) return
+            // Recovery-path entry, not proof the throttled forceKeyFrame was sent.
+            val count = ++recoveries
+            if (videoReceiptDue(count)) report("media stage=video-recovery reason=$reason receipt=${config?.receipt ?: 0} count=$count")
             val now = System.nanoTime()
             if (force || now - lastRecoveryNs > 1_000_000_000L) { lastRecoveryNs = now; recovery?.invoke() }
         }
-        fun configure(job: VideoConfig) {
+        fun configure(job: VideoConfig, reason: String) {
             release()
             activeCodec = job.codec
             val fmt = CarPlayVideoQualification.mediaFormat(job.codec,job.bytes,videoSelection)
             val target = observed
             if (!visible()) return
+            val count = ++reconfigurations
+            if (videoReceiptDue(count)) report("media stage=video-reconfigure reason=$reason receipt=${job.receipt} count=$count")
             val candidate = videoCodecFactory(checkNotNull(videoSelection.decoderName(job.codec)))
             val generation = codecGeneration.get()
             val firstRendered = AtomicBoolean()
@@ -314,24 +336,32 @@ class AndroidMediaSink(
                         release()
                         if (desired.surface != null) {
                             report("media stage=presentation-attached generation=${desired.generation}")
-                            config?.let { configure(it) }; recover(force = true)
+                            config?.let { configure(it,"presentation") }; recover("presentation",force = true)
                         } else report("media stage=presentation-detached generation=${desired.generation}")
                     } else if (configChanged && desired.surface != null) {
-                        config?.let { configure(it) }; recover()
+                        config?.let { configure(it,"config-change") }; recover("config-change")
                     }
                     if (observed.surface == null) {
                         videoQueue.clear()
                         TimeUnit.MILLISECONDS.sleep(10)
                         continue
                     }
+                    beforeVideoPoll?.invoke()
                     when (val job = videoQueue.poll(10, TimeUnit.MILLISECONDS)) {
-                        is VideoJob.Reset -> if (job.presentation === observed) { release(); recover() }
+                        is VideoJob.Reset -> if (job.presentation === observed) { release(); recover("queue-reset") }
                         is VideoJob.Frame -> {
+                            // A config can be published while poll blocks. Reconcile on the owner
+                            // before admitting this same waking frame; never relabel stale work.
+                            if (job.presentation === observed && job.config === latestVideoConfig.get() &&
+                                job.config !== config) {
+                                config = job.config
+                                config?.let { configure(it,"config-change") }; recover("config-change")
+                            }
                             if (job.presentation !== observed || job.config !== config || !visible()) continue
                             val bytes = MediaCodecSupport.toAnnexB(job.bytes)
                             val idr = MediaCodecSupport.isRandomAccess(bytes, activeCodec)
-                            if (!anchored && !idr) { recover(); continue }
-                            if (codec == null) config?.let { configure(it) }
+                            if (!anchored && !idr) { recover("unanchored"); continue }
+                            if (codec == null) config?.let { configure(it,"missing-codec") }
                             val current = codec ?: continue
                             drain(current)
                             var index = current.dequeueInputBuffer(0)
@@ -340,16 +370,16 @@ class AndroidMediaSink(
                                 drain(current); index = current.dequeueInputBuffer(5000)
                             }
                             if (!visible()) continue
-                            if (index < 0) { release(); recover(); continue }
+                            if (index < 0) { release(); recover("input-timeout"); continue }
                             val input = checkNotNull(current.getInputBuffer(index)); input.clear()
-                            if (bytes.isEmpty() || bytes.size > input.remaining()) { release(); recover(); continue }
+                            if (bytes.isEmpty() || bytes.size > input.remaining()) { release(); recover("input-size"); continue }
                             input.put(bytes); current.queueInputBuffer(index, 0, bytes.size, System.nanoTime() / 1000, 0)
                             anchored = true
                         }
                         null -> Unit
                     }
                     codec?.let { drain(it) }
-                } catch (_: Exception) { release(); report("media stage=video-decoder-failed"); recover() }
+                } catch (_: Exception) { release(); report("media stage=video-decoder-failed"); recover("decoder-failed") }
             }
         } catch (_: InterruptedException) { /* shutdown */ }
         finally { release(); videoRetired.set(true); report("media stage=video-retired") }

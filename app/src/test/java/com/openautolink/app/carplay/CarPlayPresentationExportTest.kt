@@ -18,6 +18,11 @@ class CarPlayPresentationExportTest {
             "media stage=presentation-rendered generation=4 codecGeneration=5",
             "media stage=surface-lost",
             "media stage=video-retired",
+            "media stage=video-config action=accepted receipt=1 count=1 codec=H265",
+            "media stage=video-config action=duplicate receipt=1 count=32 codec=H265",
+            "media stage=video-reconfigure reason=config-change receipt=2 count=2",
+            "media stage=video-recovery reason=input-timeout receipt=2 count=3",
+            "media stage=video-recovery reason=input-size receipt=2 count=4",
         )
         val lines = mutableListOf<String>()
         val reporter = CarPlayAudioDiagnosticReporter(7, { 1L }, lines::add)
@@ -47,6 +52,11 @@ class CarPlayPresentationExportTest {
             "media stage=presentation-rendered generation=4 codecGeneration=5\nsecret",
             "media stage=presentation-rendered generation=null codecGeneration=5",
             "media stage=video-retired secret",
+            "media stage=video-config action=duplicate receipt=1 count=1 codec=H265 bytes=secret",
+            "media stage=video-config action=accepted receipt=-1 count=1 codec=H265",
+            "media stage=video-config action=accepted receipt=1 count=1 codec=secret",
+            "media stage=video-reconfigure reason=secret receipt=1 count=1",
+            "media stage=video-recovery reason=input-timeout receipt=1 count=1\nsecret",
         ).forEach { assertNull(it, CarPlayAudioDiagnostics.sanitize(7, it)) }
     }
 }
